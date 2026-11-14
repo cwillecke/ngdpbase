@@ -163,6 +163,19 @@ describe('resource attributes from the vault (#2261 slice 5)', () => {
       expect(await attribute(DIARY, 'encrypted')).toBeUndefined();
     });
 
+    test('a vault whose encryption check throws synchronously has no encrypted attribute: missing, not an error', async () => {
+      (managers.ShareManager as { isEncryptedVault: unknown }).isEncryptedVault = () => { throw new Error('boom'); };
+      expect(await attribute(DIARY, 'encrypted')).toBeUndefined();
+      expect(await attribute(DIARY, 'vault-owner')).toBe('alice');
+    });
+
+    test('a deny that relies on vault:encrypted still applies when the check throws synchronously', async () => {
+      await boot(withDeny([{ type: 'vault', pattern: '*' }]));
+      expect(await may(alice, 'edit', DIARY)).toBe(true); // control: the check works, the vault is not encrypted
+      (managers.ShareManager as { isEncryptedVault: unknown }).isEncryptedVault = () => { throw new Error('boom'); };
+      expect(await may(alice, 'edit', DIARY)).toBe(false); // encrypted is missing, so the deny applies
+    });
+
     test('a page with no metadata has no attributes', () => {
       expect(pip.pageAttributesFrom(DIARY, null).read('vault-owner')).toBeUndefined();
     });
