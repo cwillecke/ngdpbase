@@ -30,6 +30,7 @@ import { jobContextFromRequest, jobContextFromRequestWithReason } from '../conte
 import { actorOf, type ActorAttribution, type ActorContext } from '../context/ActorContext.js';
 import { systemContext } from '../context/bootActions.js';
 import { resolveEgressPolicy } from '../http/egressPolicy.js';
+import { mayEnterVaultAtDoor, type VaultDecider } from '../utils/privateStoreAccess.js';
 import { hideDeclaredPaths, keepHiddenValues, NO_SECRETS, secretKeys, valueLevels } from '../utils/sensitiveValues.js';
 import { createPatch, diffLines } from 'diff';
 import { exec } from 'child_process';
@@ -10401,7 +10402,13 @@ ${panes}
     const pageName = formatPrivatePageName(name.owner, name.store, name.title);
     const pip = this.engine.getManager('PolicyInformationPoint');
     const subject = req.userContext ?? (await pip.currentSubject(req));
-    if (!pip.canAccessPrivateContainer(subject, name.owner, `page:${pageName}`, action)) {
+    // #2413: the owner or their delegate, else an administrator let in by
+    // ngdpbase.vaults.admin-access to a vault that is not encrypted (#2255), as
+    // at the page door. Asked quietly: the page door records the access.
+    const admitted = pip.canAccessPrivateContainer(subject, name.owner, `page:${pageName}`, action)
+      || (Boolean(subject) && await mayEnterVaultAtDoor(this.engine.getManager<VaultDecider>('PolicyDecisionPoint'), subject,
+        { owner: name.owner, vault: name.store, resource: pageName }, false));
+    if (!admitted) {
       // The same words as a private name that reads as nothing, and no echo of
       // the path asked for: one answer for a page that is not there and for one
       // this reader may not open (operator, 2026-09-23).
