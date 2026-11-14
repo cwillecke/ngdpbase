@@ -4533,7 +4533,15 @@ ${panes}
       const pageName = decodeURIComponent(req.params.page);
       const pageManager = this.engine.getManager('PageManager') as {
         getRawPageContent?: (id: string, ctx: ActorContext) => Promise<{ filePath: string; content: string } | null>;
+        checkPrivatePageAccess?: (ctx: WikiContext, name: string, adminEntry?: 'record' | 'quiet' | 'none') => Promise<boolean | null>;
       } | null;
+      // #2413: a vault page is read only by whoever the vault door admits: the
+      // owner, or an administrator let in by ngdpbase.vaults.admin-access to a
+      // vault that is not encrypted (#2255), recorded. `null` is a public name.
+      if (pageManager?.checkPrivatePageAccess && (await pageManager.checkPrivatePageAccess(wikiContext, pageName, 'record')) === false) {
+        await this.renderError(req, res, 403, 'Access Denied', 'You do not have access to this page.');
+        return;
+      }
       const raw = pageManager?.getRawPageContent ? await pageManager.getRawPageContent(pageName, wikiContext.userContext) : null;
       if (!raw) {
         await this.renderError(req, res, 404, 'Page Not Found', `No page named '${pageName}' on this instance.`);
