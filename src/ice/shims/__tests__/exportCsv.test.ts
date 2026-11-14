@@ -75,15 +75,13 @@ describe('core.csv-file', () => {
       spy.mockRestore();
     });
 
-    test('rows x columns beyond the size limit is refused before the table is built', async () => {
+    test('rows x columns is not held to a size limit (#2408)', async () => {
       limits = { maxColumns: 1000, maxBytes: 1000 };
-      const spy = vi.spyOn(exportManager, 'toCsv');
       try {
-        await expect(write(Array.from({ length: 200 }, () => record(wide(10))))).rejects.toThrow(/too large/i);
-        expect(spy).not.toHaveBeenCalled();
+        const file = await write(Array.from({ length: 200 }, () => record(wide(10))));
+        expect(textOf(file).split('\r\n')).toHaveLength(202);
       } finally {
         limits = { maxColumns: 1000, maxBytes: 26_214_400 };
-        spy.mockRestore();
       }
     });
 

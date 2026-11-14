@@ -152,18 +152,43 @@ describe('exporting an add-on\'s list as CSV', () => {
     await expect(im.startExport({ source: 'ice-export.rows', ref: 'all', format: 'core.pdf' }, ALICE)).rejects.toBeInstanceOf(IceExportRefused);
   });
 
-  test('max-items ends the list and the export says how many rows were left out', async () => {
+  // #2408: max-items and max-bytes are for pages, files and search; a records CSV has neither limit.
+  test('1,000 records are all downloaded as CSV, with no "left out" note, under the default max-items', async () => {
+    const { im, rows } = await load();
+    rows.rows.length = 0;
+    for (let n = 0; n < 1000; n++) rows.rows.push({ id: `b${n}`, owner: 'alice', properties: { memo: `row ${n}`, amount: n } });
+    const runId = await im.startExport({ source: 'ice-export.rows', ref: 'all', format: 'core.csv-file' }, ALICE);
+    const run = await finished(im, runId, ALICE);
+    expect(run.state).toBe('done');
+    expect(run.notes).toBeUndefined();
+    expect(im.exportFile(runId, ALICE)!.bytes.toString('utf8').split('\r\n')).toHaveLength(1002);
+  });
+
+  test('max-items does not cut a records CSV, even set to 1', async () => {
     const { im } = await load({ 'ngdpbase.export.engine.max-items': 1 });
     const runId = await im.startExport({ source: 'ice-export.rows', ref: 'all', format: 'core.csv-file' }, ALICE);
     const run = await finished(im, runId, ALICE);
     expect(run.state).toBe('done');
-    expect(run.notes).toEqual(['1 item was left out: this site exports at most 1 item at a time.']);
-    expect(im.exportFile(runId, ALICE)!.bytes.toString('utf8')).toBe('date,memo,amount\r\n2026-01-02,"Coffee, large",-450\r\n');
+    expect(run.notes).toBeUndefined();
+    expect(im.exportFile(runId, ALICE)!.bytes.toString('utf8').split('\r\n')).toHaveLength(4);
   });
 
-  test('max-bytes refuses an export larger than the site allows', async () => {
+  test('a records CSV larger than max-bytes downloads in full', async () => {
     const { im } = await load({ 'ngdpbase.export.engine.max-bytes': 10 });
-    await expect(im.startExport({ source: 'ice-export.rows', ref: 'all', format: 'core.csv-file' }, ALICE)).rejects.toBeInstanceOf(IceExportFailed);
+    const runId = await im.startExport({ source: 'ice-export.rows', ref: 'all', format: 'core.csv-file' }, ALICE);
+    const run = await finished(im, runId, ALICE);
+    expect(run.state).toBe('done');
+    expect(im.exportFile(runId, ALICE)!.bytes.toString('utf8')).toContain('Coffee, large');
+  });
+
+  test('csv-max-columns still refuses a records CSV, whatever max-items and max-bytes say', async () => {
+    const { im, rows } = await load({ 'ngdpbase.export.engine.max-bytes': 10, 'ngdpbase.export.engine.max-items': 1 });
+    rows.rows.length = 0;
+    rows.rows.push({ id: 'w', owner: 'alice', properties: Object.fromEntries(Array.from({ length: 1500 }, (_, k) => [`f${k}`, 'x'])) });
+    const runId = await im.startExport({ source: 'ice-export.rows', ref: 'all', format: 'core.csv-file' }, ALICE);
+    const run = await finished(im, runId, ALICE);
+    expect(run.state).toBe('failed');
+    expect(run.error).toMatch(/too many columns/i);
   });
 
   test('a site can switch the CSV format off', async () => {
