@@ -36,10 +36,10 @@ import { exec } from 'child_process';
 import { Request, Response, Application, NextFunction } from 'express';
 import SchemaGenerator from '../utils/SchemaGenerator.js';
 import {
-  evaluateSeededAddonPage,
+  shippedPageState,
+  type ShippedPageStateName,
   REQUIRED_SOURCE_HASH_KEY,
-  syncRowState,
-  type SeededAddonPageStatus
+  syncRowState
 } from '../utils/addonPageSync.js';
 import { idleRemainingMs, IDLE_STATUS_PATH, STEP_UP_STATUS_PATH, warnBeforeMs } from '../utils/sessionIdle.js';
 import { isStrayFormField } from '../utils/strayFormFields.js';
@@ -4718,39 +4718,43 @@ ${panes}
    * @param pages - Comparison rows; each gets `bulkOutdated` set
    */
   static markBulkOutdated(
-    pages: Array<{ status: string; userModified: boolean; bulkOutdated?: boolean }>
+    pages: Array<{ status: string; userModified: boolean; syncState?: string; bulkOutdated?: boolean }>
   ): { outdatedSyncable: number; outdatedUserEdited: number } {
     let outdatedSyncable = 0;
     let outdatedUserEdited = 0;
     for (const page of pages) {
-      const outdated = page.status === 'new' || page.status === 'modified';
-      page.bulkOutdated = outdated && !page.userModified;
+      // #2389: Sync All takes only Update ready. New pages keep their own button.
+      page.bulkOutdated = page.syncState === 'update-ready';
       if (page.bulkOutdated) outdatedSyncable++;
-      else if (outdated) outdatedUserEdited++;
+      else if (page.syncState === 'edited-not-confirmed' || page.syncState === 'both-changed') outdatedUserEdited++;
     }
     return { outdatedSyncable, outdatedUserEdited };
   }
 
   /**
-   * Sync status of a required page whose live copy exists (#1395): the source
-   * body, the live body and the live copy's `required-source-hash` stamp, by the
-   * same rule as addon pages (#931). Frontmatter is not compared.
+   * State of a shipped page whose live copy exists (#1395, #2389): the source
+   * body, the live body, the live copy's stamp and its `user-modified` flag, read
+   * through `shippedPageState`. Frontmatter is not compared. Core pages stamp
+   * `required-source-hash`, add-on pages `addon-source-hash`.
    *
    * @param sourceContent - Raw source file contents
    * @param liveBody - Body of the live copy
    * @param liveData - Frontmatter of the live copy
+   * @param stampKey - The stamp's front-matter key
    */
-  static requiredPageStatus(
+  static shippedState(
     sourceContent: string,
     liveBody: string,
-    liveData: Record<string, unknown>
-  ): SeededAddonPageStatus {
-    const storedHash = liveData[REQUIRED_SOURCE_HASH_KEY];
-    return evaluateSeededAddonPage({
-      sourceContent: matter(sourceContent).content,
-      liveContent: liveBody,
-      storedHash: typeof storedHash === 'string' ? storedHash : undefined
-    });
+    liveData: Record<string, unknown>,
+    stampKey: string = REQUIRED_SOURCE_HASH_KEY
+  ): ShippedPageStateName {
+    const stamp = liveData[stampKey];
+    return shippedPageState({
+      shippedBody: matter(sourceContent).content,
+      liveBody,
+      stamp: typeof stamp === 'string' ? stamp : undefined,
+      userModified: liveData['user-modified'] === true
+    }).state;
   }
 
 
@@ -13023,7 +13027,7 @@ ${panes}
             );
             const dst = matter(await fse.readFile(destPath, 'utf8')) as { data: Record<string, unknown>; content: string };
             // #1395: the same status the Required Pages Sync page shows.
-            if (WikiRoutes.requiredPageStatus(src, dst.content, dst.data) !== 'current') requiredPagesSyncNeeded++;
+            if (WikiRoutes.shippedState(src, dst.content, dst.data) !== 'same-as-shipped') requiredPagesSyncNeeded++;
           }
         }
       } catch {
@@ -15552,6 +15556,7 @@ ${panes}
         lastModified: string;
         status: 'new' | 'modified' | 'current' | 'uuid-mismatch';
         userModified: boolean;
+        syncState?: ShippedPageStateName;
         liveUuid?: string;
         titleDrift?: boolean;
         liveTitle?: string;
@@ -15596,6 +15601,7 @@ ${panes}
         const destPath = path.join(pagesDirResolved, file);
         let status: 'new' | 'modified' | 'current' | 'uuid-mismatch';
         let userModified = false;
+        let syncState: ShippedPageStateName | undefined;
         let liveUuid: string | undefined;
         let titleDrift = false;
         let liveTitle: string | undefined;
@@ -15642,8 +15648,8 @@ ${panes}
           // frontmatter is not compared — a save adds fields the source never
           // has (`created`), and a whole-file compare kept a synced page
           // 'modified' forever.
-          const seedStatus = WikiRoutes.requiredPageStatus(sourceContent, destBody, destData);
-          ({ status, userModified } = syncRowState(seedStatus, destData['user-modified'] === true));
+          syncState = WikiRoutes.shippedState(sourceContent, destBody, destData);
+          ({ status, userModified } = syncRowState(syncState));
 
           // Detect title drift: source title vs live title
           const liveTitleRaw = (destData.title as string | undefined) || '';
@@ -15656,7 +15662,7 @@ ${panes}
           }
         }
 
-        comparison.push({ source: 'required-pages', uuid, title, slug, lastModified, status, userModified, liveUuid, titleDrift, liveTitle, affectedLinks });
+        comparison.push({ source: 'required-pages', uuid, title, slug, lastModified, status, userModified, syncState, liveUuid, titleDrift, liveTitle, affectedLinks });
       }
 
       const statusOrder: Record<string, number> = { 'uuid-mismatch': 0, new: 1, modified: 2, current: 3 };
@@ -15682,6 +15688,7 @@ ${panes}
         status: 'new' | 'modified' | 'current' | 'uuid-mismatch';
         userModified: boolean;
         liveUuid?: string;
+        syncState?: ShippedPageStateName;
         bulkOutdated?: boolean;
       }> = [];
 
@@ -15734,6 +15741,7 @@ ${panes}
             const destPath = path.join(pagesDirResolved, `${uuid}.md`);
             let status: 'new' | 'modified' | 'current' | 'uuid-mismatch';
             let userModified = false;
+            let syncState: ShippedPageStateName | undefined;
             let liveUuid: string | undefined;
 
             if (!(await fse.pathExists(destPath))) {
@@ -15749,22 +15757,13 @@ ${panes}
             } else {
               const destContent: string = await fse.readFile(destPath, 'utf8');
               const destParsed = matter(destContent) as { data: Record<string, unknown>; content: string };
-              const srcParsed = matter(sourceContent) as { data: Record<string, unknown>; content: string };
-              // #931: identical evaluator + body-only hash the boot pass uses, so
-              // the sync-UI status and the on-boot reseed can never disagree.
-              // `locally-modified` (hash differs from the seed stamp) OR an explicit
-              // `user-modified` flag both mark the page as edit-protected here.
-              const seedStatus = evaluateSeededAddonPage({
-                sourceContent: srcParsed.content,
-                liveContent: destParsed.content,
-                storedHash: typeof destParsed.data['addon-source-hash'] === 'string'
-                  ? (destParsed.data['addon-source-hash'])
-                  : undefined
-              });
-              ({ status, userModified } = syncRowState(seedStatus, destParsed.data['user-modified'] === true));
+              // #2389: the same state function the core list and Sync read, with
+              // the add-on stamp, so the screen and Sync cannot disagree.
+              syncState = WikiRoutes.shippedState(sourceContent, destParsed.content, destParsed.data, 'addon-source-hash');
+              ({ status, userModified } = syncRowState(syncState));
             }
 
-            addonComparison.push({ source: `addon:${addonName}`, addonName, uuid, title, slug, lastModified, status, userModified, liveUuid });
+            addonComparison.push({ source: `addon:${addonName}`, addonName, uuid, title, slug, lastModified, status, userModified, syncState, liveUuid });
           }
         }
         addonComparison.sort((a, b) => statusOrder[a.status] - statusOrder[b.status]);

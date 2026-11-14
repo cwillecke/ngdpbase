@@ -11,5 +11,5 @@
   so a loose name could be picked up from the screen by accident.
 %>
 <% if (typeof syncCounts.new === 'number') { %><span class="badge bg-primary" data-sync-count="new"><%= syncCounts.new %> New</span><% } %>
-<span class="badge bg-warning text-dark" data-sync-count="modified"><%= syncCounts.modified %> Modified</span>
-<span class="badge bg-success" data-sync-count="current"><%= syncCounts.current %> Current</span>
+<span class="badge bg-warning text-dark" data-sync-count="modified"><%= syncCounts.modified %> Not same as shipped</span>
+<span class="badge bg-success" data-sync-count="current"><%= syncCounts.current %> Same as shipped</span>

@@ -46,14 +46,14 @@
                             <div class="col-md-6">
                                 <h6 class="text-success"><i class="fas fa-lock me-1"></i>Protected from overwrite</h6>
                                 <ul class="mb-0">
-                                    <li>Live pages in <code>data/pages/</code> that have been edited in the wiki UI are flagged <code>user-modified: true</code>. A sync will show them as <strong>Modified</strong> and will not auto-overwrite them — an admin must sync them manually.</li>
+                                    <li>Live pages in <code>data/pages/</code> that have been edited in the wiki UI are flagged <code>user-modified: true</code>. They show as <strong>Edited here, not confirmed</strong>. Sync All never replaces them — an admin must choose <strong>Use shipped version</strong> on the row. So does any page with no source stamp whose text differs from what ships.</li>
                                 </ul>
                             </div>
                             <div class="col-md-6">
                                 <h6 class="text-danger"><i class="fas fa-exclamation-triangle me-1"></i>At risk of overwrite</h6>
                                 <ul class="mb-0">
                                     <li>Files written via <strong>Push to Source</strong> exist only in the local <code>required-pages/</code> directory. A <code>git pull</code> or product upgrade will overwrite them. They are not in the repository unless manually committed and pushed by a contributor.</li>
-                                    <li>Live pages that were never edited in the wiki UI (no <code>user-modified</code> flag) will be silently replaced when a new product version ships updated source content and an admin syncs.</li>
+                                    <li>Live pages that were never edited in the wiki UI show as <strong>Update ready</strong> when a new product version ships updated source content, and Sync All replaces them. Nothing replaces a page at start-up.</li>
                                 </ul>
                             </div>
                         </div>
@@ -87,15 +87,31 @@
                     <i class="fas fa-plus-circle me-1"></i> <%= counts.new %> New
                 </span>
                 <span class="badge bg-warning text-dark fs-6 px-3 py-2">
-                    <i class="fas fa-edit me-1"></i> <%= counts.modified %> Modified
+                    <i class="fas fa-edit me-1"></i> <%= counts.modified %> Not same as shipped
                 </span>
                 <span class="badge bg-success fs-6 px-3 py-2">
-                    <i class="fas fa-check me-1"></i> <%= counts.current %> Current
+                    <i class="fas fa-check me-1"></i> <%= counts.current %> Same as shipped
                 </span>
                 <span class="text-muted"><%= comparison.length %> total source pages</span>
             </div>
         </div>
     </div>
+
+    <!-- #2389: what needs a decision, and what Sync All will do -->
+    <% const syncSummary = {
+        needDecision: (counts.outdatedUserEdited || 0) + (typeof addonCounts !== 'undefined' ? addonCounts.outdatedUserEdited || 0 : 0),
+        updateReady: (counts.outdatedSyncable || 0) + (typeof addonCounts !== 'undefined' ? addonCounts.outdatedSyncable || 0 : 0)
+    }; %>
+    <p class="mb-3" data-testid="sync-summary">
+        <% if (syncSummary.needDecision > 0) { %>
+        <strong><%= syncSummary.needDecision %> page<%= syncSummary.needDecision !== 1 ? 's need' : ' needs' %> a decision.</strong>
+        Sync All updates only pages marked Update ready (<%= syncSummary.updateReady %>). Pages edited on this site are never changed by Sync All.
+        <% } else if (syncSummary.updateReady > 0) { %>
+        Nothing needs a decision. Sync All updates the <%= syncSummary.updateReady %> page<%= syncSummary.updateReady !== 1 ? 's' : '' %> marked Update ready.
+        <% } else { %>
+        Everything matches what shipped.
+        <% } %>
+    </p>
 
     <!-- Action Buttons -->
     <% if (counts.uuidMismatch > 0 || counts.new > 0 || counts.modified > 0) { %>
@@ -119,12 +135,12 @@
                 <% } %>
                 <% if (counts.outdatedSyncable > 0) { %>
                 <button class="btn btn-warning" onclick="syncByStatus('outdated')" data-testid="sync-all-outdated"
-                        title="<%= counts.outdatedUserEdited > 0 ? `${counts.outdatedUserEdited} user-edited page${counts.outdatedUserEdited !== 1 ? 's are' : ' is'} skipped` : 'Sync all new and modified pages' %>">
-                    <i class="fas fa-sync me-1"></i> Sync All Outdated (<%= counts.outdatedSyncable %>)
+                        title="<%= counts.outdatedUserEdited > 0 ? `${counts.outdatedUserEdited} page${counts.outdatedUserEdited !== 1 ? 's edited' : ' edited'} on this site ${counts.outdatedUserEdited !== 1 ? 'are' : 'is'} not changed` : 'Update every page marked Update ready' %>">
+                    <i class="fas fa-sync me-1"></i> Sync All (<%= counts.outdatedSyncable %>)
                 </button>
                 <% } else if (counts.outdatedUserEdited > 0) { %>
                 <button class="btn btn-warning" disabled data-testid="sync-all-outdated">
-                    <i class="fas fa-sync me-1"></i> Sync All Outdated — <%= counts.outdatedUserEdited %> user-edited: use <%= counts.outdatedUserEdited !== 1 ? "their rows'" : "its row's" %> Sync or diff
+                    <i class="fas fa-sync me-1"></i> Sync All (0)
                 </button>
                 <% } %>
                 <button class="btn btn-outline-secondary" onclick="syncSelected()">
@@ -201,7 +217,7 @@
                                             </span>
                                             <br><small class="text-muted font-monospace">live: <%= page.liveUuid %></small>
                                         <% } else { %>
-                                            <%- include('_sync-status', { syncItem: { status: page.status, userModified: page.userModified } }) %>
+                                            <%- include('_sync-status', { syncItem: { status: page.status, syncState: page.syncState, userModified: page.userModified } }) %>
                                         <% } %>
                                     </td>
                                     <td><small class="text-muted"><%= page.lastModified || '—' %></small></td>
@@ -235,7 +251,7 @@
                                         </button>
                                         <% } %>
                                         <% if (page.status !== 'current' && page.status !== 'uuid-mismatch') { %>
-                                        <%- include('_sync-button', { syncItem: { userModified: page.userModified, id: page.uuid, name: page.title, forceNote: 'The edited version stays in the page history.' } }) %>
+                                        <%- include('_sync-button', { syncItem: { status: page.status, userModified: page.userModified, id: page.uuid, name: page.title } }) %>
                                         <% } %>
                                         <% if (page.userModified || page.titleDrift) { %>
                                         <button class="btn btn-sm btn-outline-warning"
@@ -333,12 +349,12 @@
                     </div>
                     <% if (addonCounts.outdatedSyncable > 0) { %>
                     <button class="btn btn-sm btn-warning" onclick="syncAddonOutdated()" data-testid="sync-addon-outdated"
-                            title="<%= addonCounts.outdatedUserEdited > 0 ? `${addonCounts.outdatedUserEdited} user-edited addon page${addonCounts.outdatedUserEdited !== 1 ? 's are' : ' is'} skipped` : 'Sync all new and modified addon pages' %>">
-                        <i class="fas fa-sync me-1"></i> Sync All Outdated (<%= addonCounts.outdatedSyncable %>)
+                            title="<%= addonCounts.outdatedUserEdited > 0 ? `${addonCounts.outdatedUserEdited} addon page${addonCounts.outdatedUserEdited !== 1 ? 's edited' : ' edited'} on this site ${addonCounts.outdatedUserEdited !== 1 ? 'are' : 'is'} not changed` : 'Update every addon page marked Update ready' %>">
+                        <i class="fas fa-sync me-1"></i> Sync All (<%= addonCounts.outdatedSyncable %>)
                     </button>
                     <% } else if (addonCounts.outdatedUserEdited > 0) { %>
                     <button class="btn btn-sm btn-warning" disabled data-testid="sync-addon-outdated">
-                        <i class="fas fa-sync me-1"></i> Sync All Outdated — <%= addonCounts.outdatedUserEdited %> user-edited: use <%= addonCounts.outdatedUserEdited !== 1 ? "their rows'" : "its row's" %> Sync or diff
+                        <i class="fas fa-sync me-1"></i> Sync All (0)
                     </button>
                     <% } %>
                 </div>
@@ -386,7 +402,7 @@
                                             <span class="badge bg-danger">UUID Mismatch</span>
                                             <br><small class="text-muted">live: <span class="font-monospace"><%= page.liveUuid %></span></small>
                                         <% } else { %>
-                                            <%- include('_sync-status', { syncItem: { status: page.status, userModified: page.userModified } }) %>
+                                            <%- include('_sync-status', { syncItem: { status: page.status, syncState: page.syncState, userModified: page.userModified } }) %>
                                         <% } %>
                                     </td>
                                     <td><small class="text-muted"><%= page.lastModified || '—' %></small></td>
@@ -405,7 +421,7 @@
                                         </button>
                                         <% } %>
                                         <% if (page.status !== 'current' && page.status !== 'uuid-mismatch') { %>
-                                        <%- include('_sync-button', { syncItem: { userModified: page.userModified, id: page.uuid, name: page.title, forceNote: 'The edited version stays in the page history.' } }) %>
+                                        <%- include('_sync-button', { syncItem: { status: page.status, userModified: page.userModified, id: page.uuid, name: page.title } }) %>
                                         <% } %>
                                         <% if (page.slug) { %>
                                         <a href="/view/<%= encodeURIComponent(page.slug) %>"

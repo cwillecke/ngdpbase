@@ -217,7 +217,7 @@ describe('Required Pages Sync status — body and source-hash stamp (#1395)', ()
     expect(savePage).not.toHaveBeenCalled();
   });
 
-  test('a stamped page edited since its sync is flagged as modified by a user, and sync skips it', async () => {
+  test('a stamped page edited since its sync, with a newer shipped version, is Both changed, and sync skips it', async () => {
     await fs.writeFile(path.join(dirs.requiredDir, `${UUID}.md`), page('new source body'), 'utf8');
     await fs.writeFile(
       path.join(dirs.pagesDir, `${UUID}.md`),
@@ -227,7 +227,7 @@ describe('Required Pages Sync status — body and source-hash stamp (#1395)', ()
     const { routes, savePage, pageManager } = await makeRoutes(dirs);
     await reload(pageManager);
 
-    expect(await listed(routes)).toMatchObject({ status: 'modified', userModified: true, syncState: 'edited-not-confirmed' });
+    expect(await listed(routes)).toMatchObject({ status: 'modified', userModified: true, syncState: 'both-changed' });
 
     const res = createMockRes();
     await routes.adminSyncRequiredPages(createMockReq({ uuids: [UUID] }), res);
@@ -348,8 +348,8 @@ describe('Required Pages Sync status — body and source-hash stamp (#1395)', ()
  */
 describe('#1871 Sync All Outdated counts only the pages it will sync', () => {
   const OTHER = '0c7a1b2e-5d4f-4e6a-9b8c-1d2e3f4a5b6c';
-  const otherPage = (body: string) =>
-    `---\ntitle: OtherExample\nuuid: ${OTHER}\nslug: otherexample\n---\n${body}\n`;
+  const otherPage = (body: string, extra = '') =>
+    `---\ntitle: OtherExample\nuuid: ${OTHER}\nslug: otherexample\n${extra}---\n${body}\n`;
   const includer = (original: string): { template: string } | undefined =>
     original === 'header' || original === 'footer' ? { template: '<!-- stub -->' } : undefined;
 
@@ -387,7 +387,7 @@ describe('#1871 Sync All Outdated counts only the pages it will sync', () => {
     return { data, doc: new JSDOM(html).window.document };
   }
 
-  test('only a user-edited page is outdated: count 0, button disabled and says why', async () => {
+  test('only an edited page differs: Sync All (0) is disabled and the summary says a decision is needed', async () => {
     await writeUserEdited();
     const { data, doc } = await renderList();
 
@@ -402,7 +402,7 @@ describe('#1871 Sync All Outdated counts only the pages it will sync', () => {
     expect(doc.querySelectorAll('#pagesTable tr[data-bulk-outdated="true"]')).toHaveLength(0);
     // #1918: the row reads and syncs through the shared partials; Force Sync asks first.
     const row = doc.querySelector(`#pagesTable tr[data-uuid="${UUID}"]`) as HTMLElement;
-    expect([...row.querySelectorAll('[data-sync-status]')].map((el) => el.getAttribute('data-sync-status'))).toEqual(['edited-not-confirmed']);
+    expect([...row.querySelectorAll('[data-sync-status]')].map((el) => el.getAttribute('data-sync-status'))).toEqual(['both-changed']);
     const force = row.querySelector('[data-action="force-sync"]') as HTMLButtonElement;
     expect(force.dataset.syncId).toBe(UUID);
     expect(force.textContent?.trim()).toBe('Use shipped version');
@@ -412,7 +412,7 @@ describe('#1871 Sync All Outdated counts only the pages it will sync', () => {
   test('a user-edited and a plain outdated page: the count is the one it will sync', async () => {
     await writeUserEdited();
     await fs.writeFile(path.join(dirs.requiredDir, `${OTHER}.md`), otherPage('new body'), 'utf8');
-    await fs.writeFile(path.join(dirs.pagesDir, `${OTHER}.md`), otherPage('old body'), 'utf8');
+    await fs.writeFile(path.join(dirs.pagesDir, `${OTHER}.md`), otherPage('old body', `${REQUIRED_SOURCE_HASH_KEY}: ${pageSourceHash('old body')}\n`), 'utf8');
     const { data, doc } = await renderList();
 
     expect(data.counts).toMatchObject({ modified: 2, outdatedSyncable: 1, outdatedUserEdited: 1 });
