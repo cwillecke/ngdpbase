@@ -76,7 +76,7 @@ import { givenNameProblem, type IceNameForm } from '../ice/givenName.js';
 import { FileIceLedger } from '../ice/ledger.js';
 import { searchExportSource, pageItem } from '../ice/searchExportSource.js';
 import { IceExportFailed, checkExportSize, exportChains, exportSize, runExportChain, type IceExportSettings } from '../ice/runExport.js';
-import { exportShims } from '../ice/shims/export.js';
+import { CSV_FILE_SHIM_ID, exportShims } from '../ice/shims/export.js';
 import { PdfUnavailableError } from '../export/pdfEngine.js';
 import type ExportManager from './ExportManager.js';
 import type {
@@ -550,10 +550,7 @@ class ImportManager extends BaseManager {
       htmlToPdf: (ctx, html) => this.exportManager().htmlToPdf(ctx, html),
       pdfAvailable: () => this.engine.getManager<ExportManager>('ExportManager')?.isPdfConfigured() ?? false,
       toCsv: (headers, rows) => this.exportManager().toCsv(headers, rows),
-      csvLimits: () => ({
-        maxColumns: this.numberSetting('ngdpbase.export.engine.csv-max-columns', 1000),
-        maxBytes: this.numberSetting('ngdpbase.export.engine.max-bytes', 26_214_400)
-      })
+      csvLimits: () => ({ maxColumns: this.numberSetting('ngdpbase.export.engine.csv-max-columns', 1000) })
     })) this.registerShim('core', shim);
 
     logger.info('[ImportManager] Initialized with converters:', this.getAvailableFormats());
@@ -1005,12 +1002,13 @@ class ImportManager extends BaseManager {
     if (this.isAddonExportSource(request.source) && !await source.mayExport(request.ref, ctx).catch(() => false)) throw new IceExportRefused();
     const chain = this.exportChainsFor(source).get(request.format);
     if (!chain) throw new IceExportRefused('That format is not offered here.');
-    const settings = this.exportSettings();
+    const settings = this.exportLimitsFor(chain);
     this.makeRoomForExport(ctx.username, settings);
     const notes: string[] = [];
     let items = await source.read(request.ref, ctx, { format: request.format, note: (text) => notes.push(text) });
     if (!items || items.length === 0) throw new IceExportRefused();
     // The site's item limit holds for every source, an add-on's included: what it leaves out is said (#2174).
+    // A records CSV has none (#2408): its settings carry no item limit.
     if (items.length > settings.maxItems) {
       const left = items.length - settings.maxItems;
       notes.push(`${left} ${left === 1 ? 'item was' : 'items were'} left out: this site exports at most ${settings.maxItems} ${settings.maxItems === 1 ? 'item' : 'items'} at a time.`);
@@ -1180,6 +1178,19 @@ class ImportManager extends BaseManager {
     const held = this.exportRuns.get(runId);
     if (held?.timer) clearTimeout(held.timer);
     this.exportRuns.delete(runId);
+  }
+
+  /**
+   * The settings for a run of `chain`. A records-to-CSV export (the chain ends
+   * in `core.csv-file`) has no row or size limit (#2408): `max-items` and
+   * `max-bytes` are for pages, files and searches. Its column limit stays,
+   * checked by the shim. This is the one place the two are told apart.
+   */
+  private exportLimitsFor(chain: readonly RegisteredShim[]): ExportRunSettings {
+    const settings = this.exportSettings();
+    return chain[chain.length - 1]?.id === CSV_FILE_SHIM_ID
+      ? { ...settings, maxItems: Number.POSITIVE_INFINITY, maxBytes: Number.POSITIVE_INFINITY }
+      : settings;
   }
 
   /** `ngdpbase.export.engine.*`: every limit an export applies is configuration (the chain's length is import's). */

@@ -6,7 +6,7 @@ import type { ExportShimTools, IceItem, IceShim } from '../../types';
 import ExportManager from '../../../managers/ExportManager';
 
 const exportManager = new ExportManager({});
-let limits = { maxColumns: 1000, maxBytes: 26_214_400 };
+const limits = { maxColumns: 1000 };
 const shim = exportShims({
   renderDocument: async () => '',
   htmlToPdf: async () => Buffer.alloc(0),
@@ -76,13 +76,8 @@ describe('core.csv-file', () => {
     });
 
     test('rows x columns is not held to a size limit (#2408)', async () => {
-      limits = { maxColumns: 1000, maxBytes: 1000 };
-      try {
-        const file = await write(Array.from({ length: 200 }, () => record(wide(10))));
-        expect(textOf(file).split('\r\n')).toHaveLength(202);
-      } finally {
-        limits = { maxColumns: 1000, maxBytes: 26_214_400 };
-      }
+      const file = await write(Array.from({ length: 5000 }, () => record(wide(10))));
+      expect(textOf(file).split('\r\n')).toHaveLength(5002);
     });
 
     test('a normal 200-row export is written', async () => {
