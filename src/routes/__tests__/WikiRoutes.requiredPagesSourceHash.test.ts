@@ -130,7 +130,7 @@ async function listed(routes: ReturnType<typeof makeRoutes>['routes']) {
   const res = createMockRes();
   await routes.adminRequiredPages(createMockReq(), res);
   expect(res.render).toHaveBeenCalledWith('admin-required-pages', expect.anything());
-  const data = res.render.mock.calls[0][1] as { comparison: Array<{ uuid: string; status: string; userModified: boolean }> };
+  const data = res.render.mock.calls[0][1] as { comparison: Array<{ uuid: string; status: string; userModified: boolean; syncState?: string }> };
   return data.comparison.find((p) => p.uuid === UUID);
 }
 
@@ -150,16 +150,16 @@ describe('Required Pages Sync status — body and source-hash stamp (#1395)', ()
   test('a synced page reads as current, although the save added a created date', async () => {
     // THE regression: sync, reload, same list.
     await fs.writeFile(path.join(dirs.requiredDir, `${UUID}.md`), page('new body'), 'utf8');
-    await fs.writeFile(path.join(dirs.pagesDir, `${UUID}.md`), page('old body'), 'utf8');
+    await fs.writeFile(path.join(dirs.pagesDir, `${UUID}.md`), page('old body', `${REQUIRED_SOURCE_HASH_KEY}: ${pageSourceHash('old body')}\n`), 'utf8');
     const { routes, pageManager } = await makeRoutes(dirs);
     await reload(pageManager);
-    expect((await listed(routes))?.status).toBe('modified');
+    expect(await listed(routes)).toMatchObject({ status: 'modified', syncState: 'update-ready' });
 
     await routes.adminSyncRequiredPages(createMockReq({ uuids: [UUID] }), createMockRes());
 
     const live = await fs.readFile(path.join(dirs.pagesDir, `${UUID}.md`), 'utf8');
     expect(live).toContain('created:');
-    expect((await listed(routes))?.status).toBe('current');
+    expect(await listed(routes)).toMatchObject({ status: 'current', syncState: 'same-as-shipped' });
   });
 
   test('a page without a stamp whose body matches the source is current — frontmatter is not compared', async () => {
@@ -169,16 +169,52 @@ describe('Required Pages Sync status — body and source-hash stamp (#1395)', ()
     const { routes, pageManager } = await makeRoutes(dirs);
     await reload(pageManager);
 
-    expect(await listed(routes)).toMatchObject({ status: 'current', userModified: false });
+    expect(await listed(routes)).toMatchObject({ status: 'current', userModified: false, syncState: 'same-as-shipped' });
   });
 
-  test('a page without a stamp whose body differs is outdated, not an edit', async () => {
+  test('a page without a stamp whose body differs is Edited here, not confirmed, and sync leaves it (R7)', async () => {
     await fs.writeFile(path.join(dirs.requiredDir, `${UUID}.md`), page('new body'), 'utf8');
     await fs.writeFile(path.join(dirs.pagesDir, `${UUID}.md`), page('old body'), 'utf8');
-    const { routes, pageManager } = await makeRoutes(dirs);
+    const { routes, savePage, pageManager } = await makeRoutes(dirs);
     await reload(pageManager);
 
-    expect(await listed(routes)).toMatchObject({ status: 'modified', userModified: false });
+    expect(await listed(routes)).toMatchObject({ status: 'modified', userModified: true, syncState: 'edited-not-confirmed' });
+
+    await routes.adminSyncRequiredPages(createMockReq({ uuids: [UUID] }), createMockRes());
+    expect(savePage).not.toHaveBeenCalled();
+    expect(await fs.readFile(path.join(dirs.pagesDir, `${UUID}.md`), 'utf8')).toContain('old body');
+  });
+
+  test('a page saved with only its title changed (user-modified, text unchanged) is Edited here, not confirmed (Q1)', async () => {
+    await fs.writeFile(path.join(dirs.requiredDir, `${UUID}.md`), page('same body'), 'utf8');
+    await fs.writeFile(
+      path.join(dirs.pagesDir, `${UUID}.md`),
+      `---\ntitle: My own title\nuuid: ${UUID}\nslug: footnoteexample\nuser-modified: true\n${REQUIRED_SOURCE_HASH_KEY}: ${pageSourceHash('same body')}\n---\nsame body\n`,
+      'utf8'
+    );
+    const { routes, savePage, pageManager } = await makeRoutes(dirs);
+    await reload(pageManager);
+
+    expect(await listed(routes)).toMatchObject({ syncState: 'edited-not-confirmed', userModified: true });
+
+    await routes.adminSyncRequiredPages(createMockReq({ uuids: [UUID] }), createMockRes());
+    expect(savePage).not.toHaveBeenCalled();
+  });
+
+  test('edited here and a newer version shipped reads Both changed, and sync leaves it', async () => {
+    await fs.writeFile(path.join(dirs.requiredDir, `${UUID}.md`), page('shipped v2'), 'utf8');
+    await fs.writeFile(
+      path.join(dirs.pagesDir, `${UUID}.md`),
+      page('edited here', `${REQUIRED_SOURCE_HASH_KEY}: ${pageSourceHash('shipped v1')}\n`),
+      'utf8'
+    );
+    const { routes, savePage, pageManager } = await makeRoutes(dirs);
+    await reload(pageManager);
+
+    expect(await listed(routes)).toMatchObject({ syncState: 'both-changed' });
+
+    await routes.adminSyncRequiredPages(createMockReq({ uuids: [UUID] }), createMockRes());
+    expect(savePage).not.toHaveBeenCalled();
   });
 
   test('a stamped page edited since its sync is flagged as modified by a user, and sync skips it', async () => {
@@ -191,7 +227,7 @@ describe('Required Pages Sync status — body and source-hash stamp (#1395)', ()
     const { routes, savePage, pageManager } = await makeRoutes(dirs);
     await reload(pageManager);
 
-    expect(await listed(routes)).toMatchObject({ status: 'modified', userModified: true });
+    expect(await listed(routes)).toMatchObject({ status: 'modified', userModified: true, syncState: 'edited-not-confirmed' });
 
     const res = createMockRes();
     await routes.adminSyncRequiredPages(createMockReq({ uuids: [UUID] }), res);
@@ -209,7 +245,7 @@ describe('Required Pages Sync status — body and source-hash stamp (#1395)', ()
     const { routes, savePage, pageManager } = await makeRoutes(dirs);
     await reload(pageManager);
 
-    expect(await listed(routes)).toMatchObject({ status: 'modified', userModified: false });
+    expect(await listed(routes)).toMatchObject({ status: 'modified', userModified: false, syncState: 'update-ready' });
 
     await routes.adminSyncRequiredPages(createMockReq({ uuids: [UUID] }), createMockRes());
     expect(savePage).toHaveBeenCalledTimes(1);
@@ -358,16 +394,19 @@ describe('#1871 Sync All Outdated counts only the pages it will sync', () => {
     expect(data.counts).toMatchObject({ modified: 1, outdatedSyncable: 0, outdatedUserEdited: 1 });
     const button = doc.querySelector('[data-testid="sync-all-outdated"]') as HTMLButtonElement;
     expect(button.disabled).toBe(true);
-    expect(button.textContent).toContain("1 user-edited: use its row's Sync or diff");
-    expect(button.textContent).not.toContain('(1)');
+    expect(button.textContent).toContain('Sync All (0)');
+    // R5: the summary line says one page needs a decision and nothing is ready.
+    const summary = doc.querySelector('[data-testid="sync-summary"]')?.textContent?.replace(/\s+/g, ' ').trim();
+    expect(summary).toBe('1 page needs a decision. Sync All updates only pages marked Update ready (0). Pages edited on this site are never changed by Sync All.');
     // What the button's sync would select: nothing.
     expect(doc.querySelectorAll('#pagesTable tr[data-bulk-outdated="true"]')).toHaveLength(0);
     // #1918: the row reads and syncs through the shared partials; Force Sync asks first.
     const row = doc.querySelector(`#pagesTable tr[data-uuid="${UUID}"]`) as HTMLElement;
-    expect([...row.querySelectorAll('[data-sync-status]')].map((el) => el.getAttribute('data-sync-status'))).toEqual(['modified', 'user-edited']);
+    expect([...row.querySelectorAll('[data-sync-status]')].map((el) => el.getAttribute('data-sync-status'))).toEqual(['edited-not-confirmed']);
     const force = row.querySelector('[data-action="force-sync"]') as HTMLButtonElement;
     expect(force.dataset.syncId).toBe(UUID);
-    expect(force.dataset.confirm).toContain('The edited version stays in the page history.');
+    expect(force.textContent?.trim()).toBe('Use shipped version');
+    expect(force.dataset.confirm).toContain('Your version stays in the page history.');
   });
 
   test('a user-edited and a plain outdated page: the count is the one it will sync', async () => {
@@ -379,20 +418,24 @@ describe('#1871 Sync All Outdated counts only the pages it will sync', () => {
     expect(data.counts).toMatchObject({ modified: 2, outdatedSyncable: 1, outdatedUserEdited: 1 });
     const button = doc.querySelector('[data-testid="sync-all-outdated"]') as HTMLButtonElement;
     expect(button.disabled).toBe(false);
-    expect(button.textContent).toContain('Sync All Outdated (1)');
+    expect(button.textContent).toContain('Sync All (1)');
+    const summary = doc.querySelector('[data-testid="sync-summary"]')?.textContent?.replace(/\s+/g, ' ').trim();
+    expect(summary).toBe('1 page needs a decision. Sync All updates only pages marked Update ready (1). Pages edited on this site are never changed by Sync All.');
     const selected = [...doc.querySelectorAll('#pagesTable tr[data-bulk-outdated="true"]')]
       .map((row) => row.getAttribute('data-uuid'));
     expect(selected).toEqual([OTHER]);
   });
 
-  test('the add-on rows use the same rule', () => {
+  test('the add-on rows use the same rule: only Update ready is taken, New keeps its own button', () => {
     const rows = [
-      { status: 'modified', userModified: true },
+      { status: 'modified', userModified: true, syncState: 'edited-not-confirmed' },
       { status: 'new', userModified: false },
-      { status: 'current', userModified: true },
+      { status: 'current', userModified: false, syncState: 'same-as-shipped' },
+      { status: 'modified', userModified: false, syncState: 'update-ready' },
+      { status: 'modified', userModified: true, syncState: 'both-changed' },
       { status: 'uuid-mismatch', userModified: false }
-    ] as Array<{ status: string; userModified: boolean; bulkOutdated?: boolean }>;
-    expect(WikiRoutes.markBulkOutdated(rows)).toEqual({ outdatedSyncable: 1, outdatedUserEdited: 1 });
-    expect(rows.map((r) => r.bulkOutdated)).toEqual([false, true, false, false]);
+    ] as Array<{ status: string; userModified: boolean; syncState?: string; bulkOutdated?: boolean }>;
+    expect(WikiRoutes.markBulkOutdated(rows)).toEqual({ outdatedSyncable: 1, outdatedUserEdited: 2 });
+    expect(rows.map((r) => r.bulkOutdated)).toEqual([false, false, false, true, false, false]);
   });
 });

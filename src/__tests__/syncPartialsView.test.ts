@@ -11,7 +11,6 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { JSDOM } from 'jsdom';
-import { syncRowState } from '../utils/addonPageSync';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '../..');
@@ -27,21 +26,22 @@ function statuses(doc: { querySelectorAll(selectors: string): ArrayLike<{ getAtt
   return Array.from(doc.querySelectorAll('[data-sync-status]')).map((el) => el.getAttribute('data-sync-status') ?? '');
 }
 
-describe('#1918 syncRowState: the one mapping to the admin screen\'s words', () => {
-  test('current, outdated and locally-modified read as Required Pages reads them', () => {
-    expect(syncRowState('current')).toEqual({ status: 'current', userModified: false });
-    expect(syncRowState('outdated')).toEqual({ status: 'modified', userModified: false });
-    expect(syncRowState('locally-modified')).toEqual({ status: 'modified', userModified: true });
-    expect(syncRowState('current', true)).toEqual({ status: 'current', userModified: true });
-  });
-});
+describe('#2389 _sync-status: the plain state words', () => {
+  const label = async (item: Record<string, unknown>) => (await partial('_sync-status', item)).body.textContent?.replace(/\s+/g, ' ').trim();
 
-describe('#1918 _sync-status', () => {
-  test('the Required Pages words: New, Modified, User Edited, Current', async () => {
+  test('New, and the four states slice 1 can tell', async () => {
     expect(statuses(await partial('_sync-status', { status: 'new', userModified: false }))).toEqual(['new']);
-    expect(statuses(await partial('_sync-status', { status: 'modified', userModified: false }))).toEqual(['modified']);
-    expect(statuses(await partial('_sync-status', { status: 'modified', userModified: true }))).toEqual(['modified', 'user-edited']);
-    expect(statuses(await partial('_sync-status', { status: 'current', userModified: false }))).toEqual(['current']);
+    expect(statuses(await partial('_sync-status', { status: 'current', syncState: 'same-as-shipped', userModified: false }))).toEqual(['same-as-shipped']);
+    expect(statuses(await partial('_sync-status', { status: 'modified', syncState: 'update-ready', userModified: false }))).toEqual(['update-ready']);
+    expect(statuses(await partial('_sync-status', { status: 'modified', syncState: 'edited-not-confirmed', userModified: true }))).toEqual(['edited-not-confirmed']);
+    expect(statuses(await partial('_sync-status', { status: 'modified', syncState: 'both-changed', userModified: true }))).toEqual(['both-changed']);
+  });
+
+  test('the labels are the design\'s words, and never Modified, Current or User Edited', async () => {
+    expect(await label({ status: 'current', syncState: 'same-as-shipped', userModified: false })).toBe('Same as shipped');
+    expect(await label({ status: 'modified', syncState: 'update-ready', userModified: false })).toBe('Update ready');
+    expect(await label({ status: 'modified', syncState: 'edited-not-confirmed', userModified: true })).toBe('Edited here, not confirmed');
+    expect(await label({ status: 'modified', syncState: 'both-changed', userModified: true })).toBe('Edited here, and a newer version is available');
   });
 });
 
@@ -51,14 +51,19 @@ describe('#1918 _sync-button', () => {
     expect(b.getAttribute('data-action')).toBe('sync');
     expect(b.getAttribute('data-sync-id')).toBe('u-1');
     expect(b.hasAttribute('data-confirm')).toBe(false);
+    expect(b.textContent?.trim()).toBe('Update');
+  });
+
+  test('a page that is not on the site yet still reads Sync', async () => {
+    const b = (await partial('_sync-button', { userModified: false, status: 'new', id: 'u-1', name: 'Page' })).querySelector('button')!;
     expect(b.textContent?.trim()).toBe('Sync');
   });
 
-  test('Force Sync for an edited copy always asks first, naming the item and the caller\'s note', async () => {
-    const b = (await partial('_sync-button', { userModified: true, id: 'u-1', name: 'Page "A"', forceNote: 'Kept in history.' })).querySelector('button')!;
+  test('Use shipped version for an edited copy always asks first, naming the item', async () => {
+    const b = (await partial('_sync-button', { userModified: true, id: 'u-1', name: 'Page "A"' })).querySelector('button')!;
     expect(b.getAttribute('data-action')).toBe('force-sync');
-    expect(b.textContent?.trim()).toBe('Force Sync');
-    expect(b.getAttribute('data-confirm')).toBe('Replace the edits made to "Page "A"" on this site with the version that ships?\n\nKept in history.');
+    expect(b.textContent?.trim()).toBe('Use shipped version');
+    expect(b.getAttribute('data-confirm')).toBe('Replace the changes made to "Page "A"" on this site with the shipped version? Your version stays in the page history.');
   });
 
   test('names are escaped and no inline handler is drawn', async () => {
