@@ -469,7 +469,7 @@ class PolicyEvaluator extends BaseManager {
    * decision starts again from nothing. The policies themselves are still read
    * live for every decision; only a condition's compiled form is reused.
    */
-  private preparedConditions: { revision: number; byCondition: WeakMap<PolicyCondition, Omit<PreparedPolicy, 'policy'>> } | null = null;
+  private preparedConditions: { revision: number; byPolicy: WeakMap<Policy, Omit<PreparedPolicy, 'policy'>> } | null = null;
 
   /**
    * The policies in force NOW. Only the PDP interprets them (#1431 step 14b);
@@ -684,18 +684,16 @@ class PolicyEvaluator extends BaseManager {
   private prepared(policies: readonly Policy[]): PreparedPolicy[] {
     const revision = typeof this.configManager?.getRevision === 'function' ? this.configManager.getRevision() : undefined;
     if (revision === undefined) return this.prepare(policies);
-    if (this.preparedConditions?.revision !== revision) this.preparedConditions = { revision, byCondition: new WeakMap() };
-    const cache = this.preparedConditions.byCondition;
-    // A condition that is not an object (a hand-written mistake) cannot be a key; it is prepared each time, and has a problem.
-    const kept = (c: unknown): c is PolicyCondition => typeof c === 'object' && c !== null && cache.has(c as PolicyCondition);
-    const missing = policies.filter((p) => p.condition !== undefined && !kept(p.condition));
-    const fresh = new Map(missing.length > 0 ? this.prepare(missing).map(({ policy, ...rest }) => [policy, rest]) : []);
-    for (const [policy, rest] of fresh) {
-      if (typeof policy.condition === 'object' && policy.condition !== null) cache.set(policy.condition, rest);
+    if (this.preparedConditions?.revision !== revision) this.preparedConditions = { revision, byPolicy: new WeakMap() };
+    // Keyed by the policy, not its condition: what a condition may read depends on the resource types the policy names (#2261), so two policies sharing one condition object are checked each.
+    const cache = this.preparedConditions.byPolicy;
+    const missing = policies.filter((p) => p.condition !== undefined && !cache.has(p));
+    if (missing.length > 0) {
+      for (const { policy, ...rest } of this.prepare(missing)) cache.set(policy, rest);
     }
     return policies.map((policy) => (policy.condition === undefined
       ? { policy, invalid: false }
-      : { policy, ...(fresh.get(policy) ?? cache.get(policy.condition)!) }));
+      : { policy, ...cache.get(policy)! }));
   }
 
   /**

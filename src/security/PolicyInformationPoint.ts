@@ -1350,9 +1350,13 @@ class PolicyInformationPoint extends BaseManager {
     let asked = known.get(key);
     if (!asked) {
       const shares = this.engine.getManager<{ isEncryptedVault?(owner: string, vault: string): Promise<boolean> }>('ShareManager');
-      asked = shares?.isEncryptedVault
-        ? shares.isEncryptedVault(owner, vault).then((encrypted) => (typeof encrypted === 'boolean' ? encrypted : undefined), () => undefined)
-        : Promise.resolve(undefined);
+      try {
+        asked = shares?.isEncryptedVault
+          ? shares.isEncryptedVault(owner, vault).then((encrypted) => (typeof encrypted === 'boolean' ? encrypted : undefined), () => undefined)
+          : Promise.resolve(undefined);
+      } catch {
+        asked = Promise.resolve(undefined); // a synchronous throw is missing too, never an error out of a decision
+      }
       known.set(key, asked);
     }
     return asked;
