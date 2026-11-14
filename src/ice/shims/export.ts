@@ -42,11 +42,12 @@ export interface ExportShimDoors {
   /** A header row and data rows as one CSV document (ExportManager.toCsv): RFC 4180, formula cells guarded. */
   toCsv(headers: readonly string[], rows: readonly (readonly unknown[])[]): string;
   /**
-   * What the CSV writer may build (#2396): the most distinct columns. Rows and
-   * bytes are not limited (#2408). Read at each export, so a change to the
-   * site's settings applies at once.
+   * What the CSV writer may build (#2396): the most distinct columns, and the
+   * most cells (rows times columns) in the table. Rows and bytes are not
+   * limited as such (#2408). Read at each export, so a change to the site's
+   * settings applies at once.
    */
-  csvLimits(): { maxColumns: number };
+  csvLimits(): { maxColumns: number; maxCells: number };
 }
 
 /** A file name from a title: the title, with what no file system takes replaced. */
@@ -177,10 +178,14 @@ export function exportShims(doors: ExportShimDoors): IceShim[] {
         });
         const headers = [...new Set(rows.flatMap(row => Object.keys(row)))];
         // A table has a cell for every column in every row, so the columns are counted before the
-        // table is built: refuse here, not after the memory is spent (#2396). Rows and bytes are not limited (#2408).
-        const { maxColumns } = doors.csvLimits();
+        // table is built: refuse here, not after the memory is spent (#2396). Rows and bytes are not limited
+        // as such (#2408), but their product is: a few long rows over many columns make a table far larger than the data (#2410).
+        const { maxColumns, maxCells } = doors.csvLimits();
         if (headers.length > maxColumns) {
           throw new IceExportFailed(`This list has too many columns for a CSV file (${headers.length}; this site allows ${maxColumns}). Export a shorter list, or ask the site administrator.`);
+        }
+        if (rows.length * headers.length > maxCells) {
+          throw new IceExportFailed(`This list is too big for a CSV file (${rows.length} records with ${headers.length} fields between them). Export fewer records or fewer fields, or ask the site administrator.`);
         }
         const has = (row: object, h: string): boolean => Object.prototype.hasOwnProperty.call(row, h);
         const text = doors.toCsv(headers, rows.map(row => headers.map(h => has(row, h) ? (row)[h] : undefined)));
