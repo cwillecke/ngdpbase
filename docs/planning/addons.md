@@ -97,6 +97,12 @@ Embedding markup in the body would also have broken the #920 reseed comparison: 
 
 ### Use frontmatter `access` — no evaluator change needed
 
+> __Superseded by [#2255](https://github.com/jwilleke/ngdpbase/issues/2255) (2026-11-05).__ The
+> `access` stamp and every reader of it are removed. An add-on's pages are authored by
+> `addon:<slug>`, and who may change them is their system-category's policy
+> (`pushed-pages-edit` on `system`, `documentation` and `addon`). The text below is kept as the
+> record of the earlier decision.
+
 `src/types/Page.ts:100` already defines per-action principal lists:
 
 ```ts
@@ -135,11 +141,11 @@ Originally considered giving domain addons their own page type/class. __Leaning 
 
 ## 5. The one-way door (unchanged by the above)
 
-Seeding is skip-if-exists, matched by UUID first (survives slug rename, #908) then slug. Operator edits are never clobbered. `ngdpbase.addons.page-reseed` (flat key, default `false`) opts into edit-preserving reseed: a page refreshes only when the source changed __and__ the live copy is byte-identical to what was last seeded.
+Seeding is skip-if-exists, matched by UUID first (survives slug rename, #908) then slug. Operator edits are never clobbered. `ngdpbase.addons.page-reseed` is retired (#2389): start-up never replaces a page. A newer source shows as Update ready in Required Pages Sync, and Sync All applies it only to a page nobody edited here.
 
-So __editing a seeded page silently opts it out of all future upstream content updates__ — it becomes `locally-modified` and is skipped thereafter.
+So __editing a seeded page silently opts it out of all future upstream content updates__ — it reads Edited here, not confirmed, and Sync All skips it thereafter; only an admin's Use shipped version replaces it. An admin can also tick __Keep edited version__ in the Review dialog: the page reads Kept for this site, and moves to Kept, needs your review if its plugin calls or behaviour settings change later.
 
-Admin-only editing narrows this to a small, informed audience, which makes it far more defensible. `evaluateSeededAddonPage` is already shared with the Required Pages Sync admin surface (#931), so boot and UI agree on status — that surface is the natural place to warn "editing this stops future addon updates".
+Admin-only editing narrows this to a small, informed audience, which makes it far more defensible. `shippedPageState` is shared by the Required Pages Sync admin surface and Sync (#931, #2389), so the screen and Sync agree on state — that surface is the natural place to warn "editing this stops future addon updates".
 
 ---
 
@@ -167,11 +173,10 @@ Live list. Tick as they settle. Recommendations are mine; override freely.
   (`/mnt/tank/jims/data/systems/geohazardwatch`, `type: DirectoryOrCreate`) mounted at `/app/data`
   on the single-node `deby` k3s cluster. Not a PVC, not an `emptyDir`. 175 pages on disk. Page
   edits persist across pod restarts and image bumps, so admin-only editing is worth building.
-- [~] __1. (OPERATOR — handled separately) Turn on `ngdpbase.addons.page-reseed` for geohazardwatch?__ Currently unset, so its 14
-  addon pages (incl. `geohazardwatch-home`, `left-menu-content`, `footer-content`) have been frozen
-  since first boot — source changes never reach the live site. Turning it on is a real content
-  change to a production site. Check `findOrphanedAddonPages` / Required Pages Sync first to see
-  which are already `locally-modified`.
+- [~] __1. (OPERATOR — handled separately) Bring geohazardwatch's 14 addon pages up to date.__ They have been frozen
+  since first boot — source changes never reach the live site. `ngdpbase.addons.page-reseed` is retired (#2389), so this is now
+  Required Pages Sync: open Admin › Required Pages Sync, read which pages are Update ready or Edited here, then press Sync All.
+  It is a real content change to a production site.
 - [~] __2. (OPERATOR — handled separately) GeoHazardWatch pod version skew.__ A stray rebuild during the v3.67.1 release staged
   3.67.1 on disk while the process runs 3.66.0. Restart deliberately, revert its `dist/`, or leave
   it to the next Renovate redeploy.
@@ -275,7 +280,7 @@ __Correct, and the shipped config already assumes exactly that model.__ Of the 9
 class distinction, and it does so by __category__:
 
 ```json
-{ "id": "deny-anonymous-system-pages", "priority": 90, "effect": "deny",
+{ "id": "deny-anonymous-system-pages", "effect": "deny",
   "subjects": [{ "type": "role", "value": "anonymous" }],
   "resources": [{ "type": "category", "value": "system" },
                 { "type": "category", "value": "admin" }] }

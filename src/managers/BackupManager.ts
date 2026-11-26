@@ -35,9 +35,11 @@ import { envFileLine, envForBackup, envKeyNames, envKeyNamesFingerprint, INSTANC
 import { readEnvLine } from '../utils/instanceEnvSecret.js';
 import { systemContext } from '../context/bootActions.js';
 import type { JobRunSince } from './BackgroundJobManager.js';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { mkdir, readFile as readFileAsync, writeFile as writeFileAsync } from 'node:fs/promises';
 import type NotificationManager from './NotificationManager.js';
+import { BackupFolderError, ensureBackupFolder, isSystemError, runningAccount } from '../utils/backupFolder.js';
+import { secretDirIsOwnerOnly } from '../utils/secretFileMode.js';
 
 const gzip = promisify(zlib.gzip);
 
@@ -141,6 +143,19 @@ export interface BackupFileInfo {
  * console.log('Backup created:', backupPath);
  */
 /** Auto-backup schedule configuration */
+/** Why the backup folder can't be used: none is set, its drive was not connected at start-up, it is not there, or the path is a file. */
+export type BackupFolderFault = 'unset' | 'unmounted' | 'missing' | 'file';
+
+/** The backup folder as Admin → Backup shows it: `exists` is true only for a folder; `fault` says why not. */
+export interface BackupFolderStatus {
+  ownerOnly: boolean | null;
+  exists: boolean;
+  fault: BackupFolderFault | null;
+  account: string | null;
+  /** For `unmounted`: the folder the setting still names, so the page can say which drive was expected. */
+  named?: string;
+}
+
 export interface AutoBackupConfig {
   enabled: boolean;
   time: string;       // HH:MM (24-hour)
@@ -363,6 +378,11 @@ export interface RestoreReport {
 
 /** BackupManager's fault, and the dashboard banner, while there is no backup key (#1561, #1912). */
 export const BACKUP_KEY_MISSING = `${BACKUP_KEY_ENV} is not set, so backups are NOT encrypted: the document (password hashes, settings with their secrets) and the file archives beside it are in the clear, and the credentials store, the databases and the instance .env are left out`;
+/**
+ * What the dashboard says while there is no backup key (#2354): plain words, one thing to do.
+ * The key is set outside the app, so there is nothing to link to.
+ */
+export const BACKUP_KEY_MISSING_PLAIN = "Backups are not encrypted, and some data (the databases and saved secrets) is left out of them, because no backup key is set. This is set in the server's settings, outside this page.";
 /** The title of the one notification about it. */
 export const BACKUP_KEY_MISSING_TITLE = 'Backups are not encrypted';
 
@@ -374,8 +394,8 @@ export const BACKUP_KEY_MISSING_TITLE = 'Backups are not encrypted';
 export const BACKUP_KEY_SAVED_KEY = 'ngdpbase.backup.key-saved-fingerprint';
 
 /** The banner while no admin has confirmed the backup key is saved off the server (#1876). */
-export function backupKeyNotSaved(fingerprint: string): string {
-  return `Save the backup key off this server: Admin → Backup shows it (fingerprint ${fingerprint}). Every backup is encrypted with it, and a restore on a new server needs it. This stays until an admin confirms it is saved`;
+export function backupKeyNotSaved(): string {
+  return 'Save the backup key somewhere other than this server. Every backup is encrypted with it, and restoring on a new server needs it. This stays until you confirm it is saved.';
 }
 
 /**
@@ -386,6 +406,8 @@ export function backupKeyNotSaved(fingerprint: string): string {
  * removed.
  */
 export const ENV_KEYS_SAVED_KEY = 'ngdpbase.backup.env-keys-saved';
+/** Where a backup-key reminder is cleared: the Backup page, not the Configuration page (#2348). */
+const BACKUP_PAGE_FIX = { fixUrl: '/admin/backup', fixLabel: 'Open Admin → Backup' };
 
 /** The title of the one notification per change of the `.env` key set (#1976). */
 export const ENV_KEYS_CHANGED_TITLE = 'Save a copy of .env';
@@ -398,22 +420,22 @@ export const ENV_KEYS_CHANGED_TITLE = 'Save a copy of .env';
  */
 export const SHARED_FOLDERS_KEY_SAVED_KEY = 'ngdpbase.backup.shared-folders-key-saved-fingerprint';
 
-const ENV_KEYS_CHANGED_PREFIX = 'The keys in .env changed since an admin last saved it';
-const KEY_NOT_SAVED_PREFIX = 'Save the backup key off this server';
-const SHARED_FOLDERS_KEY_NOT_SAVED_PREFIX = 'Save .env off this server: it holds the shared-folders key';
+const ENV_KEYS_CHANGED_PREFIX = 'The server\'s key file has changed since you last saved a copy';
+const KEY_NOT_SAVED_PREFIX = 'Save the backup key somewhere other than this server';
+const SHARED_FOLDERS_KEY_NOT_SAVED_PREFIX = 'Save a copy of the server\'s key file somewhere other than this server';
 
 /** The banner while no admin has confirmed a saved `.env` holding the current shared-folders key (#2124). */
-export function sharedFoldersKeyNotSaved(fingerprint: string): string {
-  return `${SHARED_FOLDERS_KEY_NOT_SAVED_PREFIX} (${SHARED_FOLDERS_KEY_ENV}, fingerprint ${fingerprint}), which opens every shared folder. Download .env on Admin → Backup and keep the copy off this server. This stays until an admin confirms it is saved`;
+export function sharedFoldersKeyNotSaved(): string {
+  return `${SHARED_FOLDERS_KEY_NOT_SAVED_PREFIX}: it holds the key that opens every shared folder. Download it on the Backup page. This stays until you confirm it is saved.`;
 }
 
 /** The banner while the instance `.env` sets other names than the ones an admin last confirmed saved (#1976): names only, never a value. */
 export function envKeysChanged(change: { added: readonly string[]; removed: readonly string[] }): string {
   const parts = [
-    ...(change.added.length > 0 ? [`added: ${change.added.join(', ')}`] : []),
-    ...(change.removed.length > 0 ? [`removed: ${change.removed.join(', ')}`] : [])
+    ...(change.added.length > 0 ? [`${change.added.length} added`] : []),
+    ...(change.removed.length > 0 ? [`${change.removed.length} removed`] : [])
   ];
-  return `${ENV_KEYS_CHANGED_PREFIX} (${parts.join('; ')}). Download .env on Admin → Backup and keep the copy off this server. This stays until an admin confirms it is saved`;
+  return `${ENV_KEYS_CHANGED_PREFIX} (${parts.join(', ')}). Download it on the Backup page and keep the copy somewhere other than this server. This stays until you confirm it is saved.`;
 }
 
 /** What Admin → Backup shows about the instance `.env` key set (#1976): names only, never a value. */
@@ -475,7 +497,28 @@ interface BackupHealthRecord {
   staleNotified?: string;
 }
 
+/** What the dashboard says for a health fault (#2354): plain words; the developer reason stays in the log and on the Backup page. */
+export function backupHealthPlain(health: Pick<BackupHealth, 'failure' | 'lastGood'>): string {
+  const since = health.lastGood ? localTime(health.lastGood.at) : null;
+  const last = since ? `The last good backup was ${since}.` : 'There is no good backup yet.';
+  return health.failure
+    ? `The last backup failed (${localTime(health.failure.at)}), so backups are not working. ${last} Open the Backup page to see what went wrong and make a new one.`
+    : `${since ? `There has been no good backup since ${since}` : 'This site has no backup yet'}. Open the Backup page and make one.`;
+}
+
 /** Whether backups are working, as Admin → Backup and the /admin dashboard show it (#1563). */
+/**
+ * Confirming the backup key is saved was refused, with a reason written for the
+ * administrator who pressed the button (#2494): the page they were on is out of
+ * date. Nothing was recorded.
+ */
+export class BackupKeyRefused extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BackupKeyRefused';
+  }
+}
+
 export interface BackupHealth {
   /** The newest backup in the backup directory that is not a failed one: when, how big (with the files beside it), where. */
   lastGood: { filename: string; at: string; size: number; location: string } | null;
@@ -508,19 +551,22 @@ export function formatBytes(bytes: number): string {
   return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unit]}`;
 }
 
-/** Why a backup could not be written, in words an admin can act on: the system's error codes named (#1563). */
+/**
+ * Why a backup could not be written, in words an admin can act on: the system's error codes named (#1563).
+ * The Backup page and the admin notice show this, so none of the system's own text is in it (#2492); the
+ * full error is in the log, where the backup failed.
+ */
 export function describeBackupError(err: unknown): string {
   const e = err as NodeJS.ErrnoException;
-  const message = e?.message ?? String(err);
   switch (e?.code) {
-  case 'ENOSPC': return `the backup destination is out of space (${message})`;
-  case 'EDQUOT': return `the backup destination is over its quota (${message})`;
+  case 'ENOSPC': return 'the backup destination is out of space';
+  case 'EDQUOT': return 'the backup destination is over its quota';
   case 'EACCES':
-  case 'EPERM': return `permission denied writing to the backup destination (${message})`;
-  case 'EROFS': return `the backup destination is read-only (${message})`;
-  case 'ENOENT': return `the backup destination is not there (${message})`;
-  case 'EIO': return `the backup destination reported a write error (${message})`;
-  default: return message;
+  case 'EPERM': return 'permission denied writing to the backup destination';
+  case 'EROFS': return 'the backup destination is read-only';
+  case 'ENOENT': return 'the backup destination is not there';
+  case 'EIO': return 'the backup destination reported a write error';
+  default: return isSystemError(err) ? 'the backup could not be written' : (e?.message ?? String(err));
   }
 }
 
@@ -863,8 +909,14 @@ class BackupManager extends BaseManager {
 
     try {
       if (!this.backupDirectory || !this.provider) {
-        throw new Error('Backup directory not initialized');
+        throw new BackupFolderError(
+          'Backups are switched off because the backup folder could not be reached when the site started. '
+          + 'Connect its drive again, or choose another folder under Backup directory, then restart the site.'
+        );
       }
+      // #2492: the folder was checked at start-up and can be gone since (a drive
+      // unplugged, a folder moved). Made again when its volume is there; said in plain words when not.
+      ensureBackupFolder(this.backupDirectory);
 
       // #1563: refused before anything is written, rather than half a backup.
       await this.checkFreeSpace();
@@ -1116,26 +1168,27 @@ class BackupManager extends BaseManager {
     const envReminder = await this.checkInstanceEnvKeys();
     const key = currentBackupKey();
     if (key) {
-      this.markReadyIfDegradedBy(BACKUP_KEY_MISSING);
+      this.markReadyIfDegradedBy(BACKUP_KEY_MISSING_PLAIN);
       // #1876: the banner asking an admin to save the key off the server, until one confirms;
       // then #1976's, while the .env key set differs from the one last confirmed. One at a time,
       // and one confirmation ("I have saved .env", which holds the key) can clear both.
       // #2124: then the shared-folders key's, while no saved .env holding the current one is confirmed.
       const shared = this.sharedFoldersKeyInfo();
-      const sharedReminder = shared.set && !shared.saved && shared.fingerprint ? sharedFoldersKeyNotSaved(shared.fingerprint) : null;
-      const reminder = this.backupKeyInfo().saved ? (envReminder ?? sharedReminder) : backupKeyNotSaved(backupKeyFingerprint(key));
+      const sharedReminder = shared.set && !shared.saved && shared.fingerprint ? sharedFoldersKeyNotSaved() : null;
+      const reminder = this.backupKeyInfo().saved ? (envReminder ?? sharedReminder) : backupKeyNotSaved();
       const status = this.getManagerStatus();
       const ours = status.state === 'degraded' && [KEY_NOT_SAVED_PREFIX, ENV_KEYS_CHANGED_PREFIX, SHARED_FOLDERS_KEY_NOT_SAVED_PREFIX].some((p) => status.reason?.startsWith(p));
       if (!reminder) {
         if (ours) this.markReady();
       } else if (status.state !== 'degraded' || ours) {
-        this.markNeedsAttention(reminder, reminder === envReminder ? ENV_KEYS_SAVED_KEY : reminder === sharedReminder ? SHARED_FOLDERS_KEY_SAVED_KEY : BACKUP_KEY_SAVED_KEY);
+        // The saved-key settings are records the app writes when an admin confirms, not values to edit: the fix is the Backup page, with no link to them (#2348, #2354).
+        this.markNeedsAttention(reminder, undefined, BACKUP_PAGE_FIX);
       }
       return;
     }
     // A degraded backup directory (preflight) is the worse fault, and keeps the banner.
     const status = this.getManagerStatus();
-    if (status.state !== 'degraded' || status.reason === BACKUP_KEY_MISSING) this.markNeedsAttention(BACKUP_KEY_MISSING, BACKUP_KEY_ENV);
+    if (status.state !== 'degraded' || status.reason === BACKUP_KEY_MISSING_PLAIN) this.markNeedsAttention(BACKUP_KEY_MISSING_PLAIN, BACKUP_KEY_ENV);
     if (this.alreadyNotified(BACKUP_KEY_MISSING_TITLE)) return;
     await this.notifyAdmins('error', BACKUP_KEY_MISSING_TITLE, `${BACKUP_KEY_MISSING}. Set ${BACKUP_KEY_ENV} in the environment or the instance .env, and restart. Until then the dashboard lists Backup under "Working, but needs your attention"; this is the only notification about it.`);
   }
@@ -1185,7 +1238,13 @@ class BackupManager extends BaseManager {
     }
     if (info.added.length === 0 && info.removed.length === 0) return null;
     const reminder = envKeysChanged(info);
-    const message = `${reminder}. The /admin dashboard lists Backup under "Working, but needs your attention" until then.`;
+    // The notification keeps the names (never a value); the dashboard item says only how many.
+    const names = [
+      ...(info.added.length > 0 ? [`added: ${info.added.join(', ')}`] : []),
+      ...(info.removed.length > 0 ? [`removed: ${info.removed.join(', ')}`] : [])
+    ];
+    logger.info(`[BackupManager] The instance .env key set changed since an admin last saved it (${names.join('; ')})`);
+    const message = `${reminder} Changes: ${names.join('; ')}. The /admin dashboard lists Backup under "Working, but needs your attention" until then.`;
     if (!this.alreadyNotified(ENV_KEYS_CHANGED_TITLE, message)) await this.notifyAdmins('warning', ENV_KEYS_CHANGED_TITLE, message);
     return reminder;
   }
@@ -1317,10 +1376,10 @@ class BackupManager extends BaseManager {
     const STALE_KEY = 'That is not the fingerprint of the current backup key; reload Admin → Backup and check the key you saved';
     const info = this.backupKeyInfo();
     const env = envFingerprint === undefined ? null : this.envKeysInfo();
-    if (envFingerprint !== undefined && env?.fingerprint !== envFingerprint) throw new Error('The keys in .env changed since that page was loaded; reload Admin → Backup, download .env again and confirm');
+    if (envFingerprint !== undefined && env?.fingerprint !== envFingerprint) throw new BackupKeyRefused('The keys in .env changed since that page was loaded; reload Admin → Backup, download .env again and confirm');
     // A saved .env is a saved backup key only when the file holds the key this site uses.
     const recordsKey = info.set && (env ? env.holdsBackupKey : true);
-    if (recordsKey ? info.fingerprint !== fingerprint : !env) throw new Error(STALE_KEY);
+    if (recordsKey ? info.fingerprint !== fingerprint : !env) throw new BackupKeyRefused(STALE_KEY);
     const configManager = this.engine.getManager<ConfigurationManager>('ConfigurationManager');
     if (!configManager) throw new Error('ConfigurationManager not available');
     if (recordsKey) await configManager.setProperty(BACKUP_KEY_SAVED_KEY, fingerprint, ctx);
@@ -1480,8 +1539,9 @@ class BackupManager extends BaseManager {
       if (this.provider) {
         health = await this.getBackupHealth();
         if (health.fault) {
-          this.markDegraded(health.fault, health.failure ? undefined : 'ngdpbase.backup.auto-backup');
-          this.healthFault = health.fault;
+          const plain = backupHealthPlain(health);
+          this.markDegraded(plain, health.failure ? undefined : 'ngdpbase.backup.auto-backup', BACKUP_PAGE_FIX);
+          this.healthFault = plain;
           if (!health.failure) await this.notifyStaleOnce(health);
         } else if (this.healthFault) {
           this.markReadyIfDegradedBy(this.healthFault);
@@ -2354,8 +2414,9 @@ class BackupManager extends BaseManager {
   /**
    * Return current auto-backup configuration and last backup info for the admin UI.
    */
-  async getAutoBackupStatus(): Promise<{ config: AutoBackupConfig; lastBackup: Date | null }> {
+  async getAutoBackupStatus(): Promise<{ config: AutoBackupConfig; lastBackup: Date | null; folder: BackupFolderStatus }> {
     const backups = await this.listBackups();
+    const configManager = this.engine.getManager<ConfigurationManager>('ConfigurationManager');
     return {
       config: {
         enabled: this.autoBackupEnabled,
@@ -2364,17 +2425,59 @@ class BackupManager extends BaseManager {
         maxBackups: this.maxBackups,
         directory: this.backupDirectory ?? ''
       },
-      lastBackup: backups.length > 0 ? backups[0].created : null
+      lastBackup: backups.length > 0 ? backups[0].created : null,
+      // #2492: whether the folder could be made closed to every other account (a network share may not allow it).
+      folder: this.folderStatus(configManager)
     };
+  }
+
+  /**
+   * The backup folder as the Backup page shows it (#2470): is it a folder, can it be made private to this
+   * account, and when it can't be used, why. A path that is a file is not a folder, and says so.
+   */
+  private folderStatus(configManager: ConfigurationManager | undefined): BackupFolderStatus {
+    const dir = this.backupDirectory;
+    const account = runningAccount();
+    if (!dir) {
+      // Start-up clears the folder when its drive is not connected, while the setting still names it.
+      const setting: unknown = configManager ? configManager.getProperty('ngdpbase.backup.directory', '') : '';
+      const named = typeof setting === 'string' ? setting : '';
+      return { ownerOnly: null, exists: false, fault: named ? 'unmounted' : 'unset', account, ...(named ? { named } : {}) };
+    }
+    let isFolder: boolean;
+    try {
+      isFolder = statSync(dir).isDirectory();
+    } catch {
+      // Not there, or this account can't reach it.
+      return { ownerOnly: null, exists: false, fault: 'missing', account };
+    }
+    if (!isFolder) return { ownerOnly: null, exists: false, fault: 'file', account };
+    return { ownerOnly: secretDirIsOwnerOnly(dir), exists: true, fault: null, account };
   }
 
   /**
    * Update auto-backup configuration and persist to config store.
    * Restarts the scheduler with the new settings.
    */
-  async updateAutoBackupConfig(config: Partial<AutoBackupConfig>, ctx: ActorContext): Promise<void> {
+  async updateAutoBackupConfig(config: Partial<AutoBackupConfig>, ctx: ActorContext): Promise<{ backupsLive: boolean }> {
     const configManager = this.engine.getManager<ConfigurationManager>('ConfigurationManager');
     if (!configManager) throw new Error('ConfigurationManager not available');
+
+    // #2492: the typed folder means what it means at start-up (`./data/...`, and `${SLOW_STORAGE}/...`
+    // read from the environment), so the one that is checked is the one backups go to after a restart.
+    const folder = config.directory === undefined ? undefined : configManager.resolveTypedPath(config.directory, 'ngdpbase.backup.directory');
+
+    // #2492: a new folder is made and checked before anything is saved. One the site can't
+    // reach refuses the whole save and leaves the setting, and the folder backups go to, as they were.
+    if (folder !== undefined) {
+      try {
+        ensureBackupFolder(folder);
+      } catch (err) {
+        if (!(err instanceof BackupFolderError)) throw err;
+        const kept = this.backupDirectory ? `Backups still go to ${this.backupDirectory}.` : 'Backups stay switched off.';
+        throw new BackupFolderError(`${err.message} Nothing was saved. ${kept}`, { cause: err });
+      }
+    }
 
     if (config.enabled !== undefined) {
       await configManager.setProperty('ngdpbase.backup.auto-backup', config.enabled, ctx);
@@ -2393,16 +2496,19 @@ class BackupManager extends BaseManager {
       this.maxBackups = config.maxBackups;
     }
     if (config.directory !== undefined) {
+      // The setting keeps what was typed, as start-up reads it back; the folder in use is the one it resolves to.
       await configManager.setProperty('ngdpbase.backup.directory', config.directory, ctx);
-      this.backupDirectory = config.directory;
+      this.backupDirectory = folder as string;
       // #170: re-point the storage provider at the new directory.
-      await this.provider?.setBackupDirectory(config.directory);
+      await this.provider?.setBackupDirectory(folder as string);
     }
 
     // The job takes the new settings; a changed rule counts its slots from now (#1720).
     this.scheduleAutoBackup();
 
     logger.info(`✅ Auto-backup config updated: ${this.autoBackupEnabled ? `enabled at ${this.autoBackupTime} (${this.autoBackupDays})` : 'disabled'}`);
+    // #2492: with no provider (backups were switched off at start-up) a saved folder is used after a restart.
+    return { backupsLive: this.provider !== null };
   }
 
   /**

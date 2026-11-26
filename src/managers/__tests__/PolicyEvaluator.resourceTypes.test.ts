@@ -43,10 +43,10 @@ describe('system-category resources (#1504)', () => {
     expect((await ask(undefined)).hasDecision).toBe(false);
   });
 
-  test('compile() matches them the same way', () => {
+  test('compile() matches them the same way', async () => {
     const decide = evaluatorWith([publicJournal], declared).compile(jim, 'page-public');
-    expect(decide('Diary', { 'system-category': 'journal' }).allowed).toBe(true);
-    expect(decide('Diary', { 'system-category': 'general' }).hasDecision).toBe(false);
+    expect((await decide('Diary', { 'system-category': 'journal' })).allowed).toBe(true);
+    expect((await decide('Diary', { 'system-category': 'general' })).hasDecision).toBe(false);
   });
 
   test('page resources still match by name', async () => {
@@ -91,7 +91,7 @@ describe('#1999 policy subjects: role and job', () => {
   });
 
   test('any other subject type matches nobody, a prototype key included', async () => {
-    for (const type of ['user', 'authenticated', 'constructor', 'toString']) {
+    for (const type of ['user', 'constructor', 'toString']) {
       const pe = evaluatorWith([policy([{ type, value: 'jim' }])]);
       expect((await pe.evaluateAccess({ pageName: '*', action: 'ledger-read', userContext: jim })).allowed).toBe(false);
     }

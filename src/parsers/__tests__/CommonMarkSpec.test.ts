@@ -13,7 +13,8 @@
  * `fallback` profile, which is not what a reader sees. Comparison ignores what
  * is serialisation rather than meaning: `<hr />` against `<hr>`, whitespace
  * between tags, `&#160;` and `&quot;` against the characters they stand for,
- * and the `id` our heading anchors add (R2). The spec writes a
+ * the `id` our heading anchors add (R2), and the class, target and rel an
+ * absolute http(s) link gains (#1492). The spec writes a
  * tab as `→`; it is turned back into a tab, as the spec's own runner does.
  */
 
@@ -44,10 +45,10 @@ const REASONS = {
   'html-policy': 'Raw HTML in the page goes through the HTML policy (#1623). These run with no policy configured, so author HTML is dropped; CommonMark passes it through.',
   'soft-line-break': 'A new line is a new line (R4 in the #1271 decision log, `breaks: true`); CommonMark renders a soft break as a space.',
   'reference-definition-narrowed': 'A reference definition counts only on its own line, with a link-like destination on the same line (#1491), so `[Term]: value` wiki lines keep rendering. Multi-line definitions, plain-word destinations and definitions inside other blocks are not recognised.',
-  'bug-code-extraction': 'KNOWN BUG #1726: the parser protects code spans and fences with its own pattern before markdown-it parses blocks, and disagrees with CommonMark: the internal placeholder printed into the page, a span across list items, spaces kept in multi-line spans, a fence after a quote inside a list item.',
   'wiki-link': '`[text]` is an NCM wiki link when the page defines no such reference label; in CommonMark it is literal text.',
   'fence-class-as-written': 'The code-fence class follows showdown (`showdownFenceClasses`): the bare language name beside `language-…`, and the info string as written; CommonMark decodes escapes and entities and adds only `language-…`.',
   'ncm-escape': '`[[` is NCM\'s escape for a literal `[` (kept, J1 in the #1271 decision log).',
+  'bare-address-link': 'A bare http(s) address becomes a link (#2443); CommonMark leaves one that is not written as `<url>` or `[text](url)` as text.',
   'ncm-line-break': '`\\\\` (two backslashes) is NCM\'s line break, kept from JSPWiki (#1370); CommonMark reads it as an escaped backslash.'
 } as const;
 
@@ -71,12 +72,8 @@ const EXCEPTIONS: Record<number, keyof typeof REASONS> = Object.fromEntries(([
     218, 528, 529, 533, 540, 541, 542, 543, 545, 546, 547, 549, 569, 571,
     573, 576, 577
   ]],
-  ['bug-code-extraction', [
-    134, 211, 321,
-    537
-  ]],
   ['wiki-link', [
-    182, 511, 513, 523, 629
+    182, 211, 511, 513, 523, 629
   ]],
   ['fence-class-as-written', [
     24, 34
@@ -86,11 +83,17 @@ const EXCEPTIONS: Record<number, keyof typeof REASONS> = Object.fromEntries(([
   ]],
   ['ncm-line-break', [
     12, 15, 550
+  ]],
+  ['bare-address-link', [
+    602, 608, 611
   ]]
 ] as Array<[keyof typeof REASONS, number[]]>).flatMap(([reason, numbers]) => numbers.map((n) => [n, reason])));
 
 const tabs = (s: string): string => s.replace(/\u2192/g, '\t');
 const normalise = (html: string): string => html
+  // An absolute http(s) link opens in a new tab (#1492): ours alone, not the
+  // spec's. Only there: the same attributes on any other link are a failure.
+  .replace(/(<a href="https?:\/\/[^"]*"(?: title="[^"]*")?) class="wiki-link external-link" target="_blank" rel="noopener noreferrer"/g, '$1')
   .replace(/(<h[1-6])\s+id="[^"]*"/g, '$1')
   // The same character written two ways: an entity or the character itself.
   .replace(/&#160;/g, '\u00a0')

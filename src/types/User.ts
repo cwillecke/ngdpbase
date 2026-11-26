@@ -6,7 +6,7 @@
  */
 
 /**
- * An item pinned to the user's My Links sidebar section. The shape is unified
+ * An item pinned to the user's Pinned pages sidebar section. The shape is unified
  * across wiki pages and arbitrary app-route bookmarks (e.g. /my/journal,
  * /profile, /search?q=foo). `url` is the canonical identifier; `pageName` is
  * carried for wiki pages so the rendering path can still use page-aware
@@ -49,6 +49,9 @@ export interface UserPreferences {
   /** Display page size for lists */
   'display.pagesize'?: string;
 
+  /** Page line length: "short", "full", or "site" to follow the site's setting (#2399) */
+  'display.line-length'?: string;
+
   /** Show tooltips */
   'display.tooltips'?: boolean;
 
@@ -64,12 +67,19 @@ export interface UserPreferences {
   /** Language/locale */
   locale?: string;
 
-  /** Items pinned to the My Links sidebar section (wiki pages and app-route URLs) */
+  /** Items pinned to the Pinned pages sidebar section (wiki pages and app-route URLs) */
   'nav.pinnedPages'?: PinnedItem[];
 
   /** Additional custom preferences */
   [key: string]: unknown;
 }
+
+/**
+ * The account fields whose change is recorded on `user-edit` with the field name
+ * only, and that a policy condition may never read as `account:` or `profile:`
+ * (#2261): the password, the email, the roles and the like.
+ */
+export const SENSITIVE_USER_FIELDS = ['password', 'roles', 'isActive', 'isExternal', 'isTest', 'email', 'profileLocked', 'username'] as const;
 
 /**
  * User object

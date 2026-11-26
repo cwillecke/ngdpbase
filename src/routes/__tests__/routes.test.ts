@@ -7,6 +7,8 @@ import { doorSaveResult } from './__fixtures__/pageDoor';
 import { readDoor } from './__fixtures__/pageReadDoor';
 import { type MockInstance } from 'vitest';
 import { TEST_PLUGIN_MANAGER } from '../../test-support/plugins';
+import { PageTitleConflictError } from '../../utils/pageTitleConflict';
+import logger from '../../utils/logger';
 
 // Mock LocaleUtils
 vi.mock('../../utils/LocaleUtils', () => {
@@ -378,6 +380,7 @@ vi.mock('../../WikiEngine', () => {
 
 describe('WikiRoutes - Comprehensive Route Testing', () => {
   let app;
+  let lastRender: { view: string; data: Record<string, unknown> } | undefined;
   let wikiRoutes;
   let mockEngine;
   let mockUserManager;
@@ -416,6 +419,7 @@ describe('WikiRoutes - Comprehensive Route Testing', () => {
     // Mock template rendering to avoid file system dependencies
     app.use((req, res, next) => {
       res.render = (view, data, callback) => {
+        lastRender = { view, data };
         // Return success response for template renders
         if (callback) {
           callback(null, '<html>Mock Template Content</html>');
@@ -768,7 +772,67 @@ describe('WikiRoutes - Comprehensive Route Testing', () => {
             .send({ content: '# Updated Content', 'system-category': 'general', _csrf: 'test-csrf-token' });
 
           expect(response.status).toBe(200);
-          expect(response.body).toEqual({ ok: true, redirect: '/view/TestPage' });
+          // #1815: a save that renamed nothing left no referrer unchanged.
+          expect(response.body).toEqual({ ok: true, redirect: '/view/TestPage', linksNotRewritten: [] });
+        });
+
+        describe('title conflict names the page, not its id (#2371)', () => {
+          const conflict = (title = 'Entero') => new PageTitleConflictError(title, '4e18f7b1-753a-4840-8d80-038709ef2f21');
+          const arrange = (err: Error) => {
+            mockPolicyInformationPoint.currentSubject.mockResolvedValue(createUserContext());
+            mockPolicyDecisionPoint.permits.mockReturnValue(true);
+            mockPageManager.getPage.mockResolvedValue({
+              content: '# Old Title',
+              metadata: { title: 'OldTitle', 'system-category': 'general', uuid: 'uuid-old' }
+            });
+            mockPageManager.savePage.mockRejectedValueOnce(err);
+          };
+          const save = () => request(app).post('/save/OldTitle');
+          const body = { content: '# x', title: 'Entero', 'system-category': 'general', _csrf: 'test-csrf-token' };
+
+          test('the error page gets the plain message, the page title and its link, and no id', async () => {
+            arrange(conflict());
+            const response = await save().send(body);
+            expect(response.status).toBe(409);
+            expect(lastRender?.view).toBe('error');
+            expect(lastRender?.data.title).toBe('Page Conflict');
+            expect(lastRender?.data.message).toBe('A page called "Entero" already exists.');
+            expect(lastRender?.data.conflictingPage).toEqual({ title: 'Entero', url: '/view/Entero' });
+            expect(JSON.stringify(lastRender?.data)).not.toContain('4e18f7b1');
+          });
+
+          test('the JSON reply has the same text and the link target, and no id', async () => {
+            arrange(conflict());
+            const response = await save().set('Accept', 'application/json').send(body);
+            expect(response.status).toBe(409);
+            expect(response.body).toEqual({
+              ok: false,
+              error: 'A page called "Entero" already exists.',
+              conflictingPage: { title: 'Entero', url: '/view/Entero' }
+            });
+          });
+
+          test('the link is the encoded /view/ URL of a title with special characters', async () => {
+            arrange(conflict('R&D / "Plans"'));
+            const response = await save().set('Accept', 'application/json').send(body);
+            expect(response.body.conflictingPage.url).toBe('/view/R%26D%20%2F%20%22Plans%22');
+          });
+
+          test('the log keeps the id', async () => {
+            const errorLog = vi.spyOn(logger, 'error').mockImplementation(() => logger);
+            arrange(conflict());
+            await save().send(body);
+            const logged = errorLog.mock.calls.flat().map(String).join(' ');
+            expect(logged).toContain('4e18f7b1-753a-4840-8d80-038709ef2f21');
+            errorLog.mockRestore();
+          });
+
+          test('the private-store clash stays as it is and names nothing', async () => {
+            arrange(new Error('A page with this title is already in use in this store'));
+            const response = await save().set('Accept', 'application/json').send(body);
+            expect(response.status).toBe(409);
+            expect(response.body).toEqual({ ok: false, error: 'A page with this title is already in use in this store' });
+          });
         });
 
         test('a failed save answers { ok: false, error } with its status, not an error page', async () => {
@@ -990,8 +1054,8 @@ describe('WikiRoutes - Comprehensive Route Testing', () => {
         expect(response.body.redirect).toBe('/');
       });
 
-      test('should prevent deletion of required pages', async () => {
-        // #1503: a shipped page (its uuid in the seeded-pages record) is admin-only to delete
+      test('should prevent deletion of a shipped page the page door refuses', async () => {
+        // #2255: a shipped page is decided by its system-category's policies, through the page door
         mockPageManager.getPageMetadata.mockResolvedValue({
           title: 'TestPage',
           uuid: 'shipped-uuid',
@@ -1002,11 +1066,8 @@ describe('WikiRoutes - Comprehensive Route Testing', () => {
           content: '# Test Page\nThis is a test page.',
           metadata: { title: 'TestPage', 'system-category': 'system' }
         });
-        // User does NOT have admin-system permission - permits(subject, action)
-        mockPolicyDecisionPoint.permits.mockImplementation((_subject, perm) => {
-          if (perm === 'admin-system') return false;
-          return true;
-        });
+        // The page door refuses: no policy grants pushed-pages-delete to this user.
+        mockPolicyInformationPoint.checkPagePermissionWithContext.mockResolvedValue(false);
 
         const response = await request(app)
           .post('/delete/TestPage')

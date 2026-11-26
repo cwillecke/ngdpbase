@@ -13,6 +13,7 @@ import { boundScope } from '../../ice/runImport';
 import { IdentityStoreUnavailableError } from '../../utils/identityStoreUnavailable';
 import { REFUSAL } from '../../http/ssrf';
 import { jobContextFromRequest } from '../../context/JobContext';
+import { buildAddonHost } from '../../utils/addonHost';
 import type { ActorContext } from '../../context/ActorContext';
 import type { IceShim } from '../../ice/types';
 
@@ -89,7 +90,10 @@ describe('ImportManager — ICE registry', () => {
   test('today\'s converters are shims into pages, and core registers the pages and files receivers', async () => {
     const { im } = await makeImportManager();
     const shims = im.listShims();
-    expect(shims.filter(s => s.produces !== 'record').map(s => s.id)).toEqual(['core.jspwiki', 'core.html', 'core.markdown', 'core.docx', 'core.svg']);
+    // #2118: and core.takeout, which reads a takeout for the private-store receiver.
+    expect(shims.filter(s => s.produces !== 'record' && s.direction !== 'out').map(s => s.id)).toEqual(['core.jspwiki', 'core.html', 'core.markdown', 'core.docx', 'core.svg', 'core.takeout']);
+    // #2120: and core's out shims, for export.
+    expect(shims.filter(s => s.direction === 'out').map(s => s.id)).toEqual(['core.ncm-html', 'core.ncm-file', 'core.html-file', 'core.markdown-file', 'core.csv-file', 'core.pdf']);
     // #2149: core.svg only cleans a file kept as a file; it hands to no receiver, so no run picks it.
     expect(shims.find(s => s.id === 'core.svg')).toMatchObject({ produces: 'file', receivers: [] });
     expect(shims.find(s => s.id === 'core.markdown')).toMatchObject({ owner: 'core', direction: 'in', produces: 'ncm', receivers: ['core.pages'], enabled: true });
@@ -406,6 +410,39 @@ describe('ImportManager — the name a user gives what an upload becomes (#2130)
   });
 });
 
+describe('ImportManager — who may declare a receiver that writes encrypted (#2179)', () => {
+  // Code review finding 7 of #2160: no add-on receiver can make itself confidential this way (#2110).
+  const sealed = () => ({ name: 'sealed', accepts: ['x'], writesEncrypted: true, mayUse: async () => true, receive: async () => ({ status: 'stored' as const }) });
+
+  test('the public registerReceiver refuses writesEncrypted from every caller, core\'s own name included', async () => {
+    const { im } = await makeImportManager();
+    expect(() => im.registerReceiver('acct', sealed())).toThrow(/writesEncrypted is core's only/);
+    expect(im.isConfidential('acct.sealed')).toBe(false);
+    // An add-on holds the engine, so it can name itself core: the owner is no proof.
+    expect(() => im.registerReceiver('core', sealed())).toThrow(/writesEncrypted is core's only/);
+    expect(im.isConfidential('core.sealed')).toBe(false);
+    // Core's own, registered by initialize through the private path, still is.
+    expect(im.isConfidential('core.private-store')).toBe(true);
+  });
+
+  test('the flag is read once: a getter cannot pass the check and be stored as true', async () => {
+    const { im } = await makeImportManager();
+    let reads = 0;
+    const sneaky = { ...sealed(), name: 'sneaky', get writesEncrypted() { return reads++ > 0; } };
+    expect(im.registerReceiver('acct', sneaky)).toBe('acct.sneaky');
+    expect(reads).toBe(1);
+    expect(im.isConfidential('acct.sneaky')).toBe(false);
+  });
+
+  test('an add-on registering through its host is refused too', async () => {
+    const env = await makeImportManager();
+    env.managers['ImportManager'] = env.im;
+    const host = buildAddonHost('acct', {}, undefined, env.engine, { receivers: ['sealed'] });
+    expect(() => host.registerReceiver(sealed())).toThrow(/writesEncrypted is core's only/);
+    expect(env.im.isConfidential('acct.sealed')).toBe(false);
+  });
+});
+
 describe('ImportManager — the import scope is the caller\'s (#2013)', () => {
   const IDS: Record<string, string> = { editor1: 'urn:uuid:e1', editor3: 'urn:uuid:e3' };
   GRANTS['editor3'] = ['page-create', 'asset-upload'];
@@ -548,5 +585,57 @@ describe('ImportManager — background runs', () => {
     const run = await im.runImport({ source: { type: 'upload', files: [md('As Reader.md', '# R')] }, receiver: 'core.pages' }, jobContextFromRequest(READER as never));
     expect(run.files[0].status).toBe('refused');
     expect(saved).toEqual([]);
+  });
+});
+
+describe('ImportManager — the limits a takeout has of its own (#2187)', () => {
+  type Registered = { limits?: () => { maxZipEntries?: number; maxZipBytes?: number; maxFileBytes?: number } };
+  const registered = (im: ImportManager, id: string): Registered | undefined =>
+    (im as unknown as { receiverRegistry: Map<string, Registered> }).receiverRegistry.get(id);
+  const engineSettings = (im: ImportManager): { zip: { maxEntries: number; maxTotalBytes: number }; maxFileBytes: number } =>
+    (im as unknown as { engineSettings(): { zip: { maxEntries: number; maxTotalBytes: number }; maxFileBytes: number } }).engineSettings();
+
+  test('every other import keeps the engine\'s limits: 10,000 entries a zip and 100 MB a file', async () => {
+    const { im } = await makeImportManager();
+    expect(engineSettings(im).zip.maxEntries).toBe(10_000);
+    expect(engineSettings(im).maxFileBytes).toBe(104_857_600);
+    expect(registered(im, 'core.pages')?.limits).toBeUndefined();
+    expect(registered(im, 'core.files')?.limits).toBeUndefined();
+  });
+
+  test('a takeout allows 65,534 entries a zip, 256 MB unpacked and 256 MB a file', async () => {
+    const { im } = await makeImportManager();
+    expect(registered(im, 'core.private-store')?.limits?.()).toEqual({ maxZipEntries: 65_534, maxZipBytes: 268_435_456, maxFileBytes: 268_435_456 });
+  });
+
+  test('the takeout\'s limits are the site\'s to set, and are read at each run', async () => {
+    const { im } = await makeImportManager({
+      'ngdpbase.import.engine.takeout-zip-max-entries': 7, 'ngdpbase.import.engine.takeout-zip-max-bytes': 8, 'ngdpbase.import.engine.takeout-max-file-bytes': 9
+    });
+    expect(registered(im, 'core.private-store')?.limits?.()).toEqual({ maxZipEntries: 7, maxZipBytes: 8, maxFileBytes: 9 });
+    expect(engineSettings(im).zip.maxEntries).toBe(10_000);
+  });
+
+  test('the removed ngdpbase.stores.import.maxsize changes nothing', async () => {
+    const { im } = await makeImportManager({ 'ngdpbase.stores.import.maxsize': 1 });
+    expect(registered(im, 'core.private-store')?.limits?.()).toEqual({ maxZipEntries: 65_534, maxZipBytes: 268_435_456, maxFileBytes: 268_435_456 });
+    expect(engineSettings(im).maxFileBytes).toBe(104_857_600);
+  });
+
+  test('the defaults in the shipped configuration are the ones the code uses', async () => {
+    const shipped = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../../../config/app-default-config.json'), 'utf8')) as Record<string, unknown>;
+    expect(shipped['ngdpbase.import.engine.zip-max-entries']).toBe(10_000);
+    expect(shipped['ngdpbase.import.engine.max-file-bytes']).toBe(104_857_600);
+    expect(shipped['ngdpbase.import.engine.takeout-zip-max-entries']).toBe(65_534);
+    expect(shipped['ngdpbase.import.engine.takeout-zip-max-bytes']).toBe(268_435_456);
+    expect(shipped['ngdpbase.import.engine.takeout-max-file-bytes']).toBe(268_435_456);
+    expect(shipped).not.toHaveProperty('ngdpbase.stores.import.maxsize');
+  });
+
+  test('an add-on\'s receiver cannot raise the limits, whoever it names as owner', async () => {
+    const { im } = await makeImportManager();
+    const greedy = { name: 'greedy', accepts: ['x'], limits: () => ({ maxFileBytes: 1e12 }), mayUse: async () => true, receive: async () => ({ status: 'stored' as const }) };
+    expect(() => im.registerReceiver('acct', greedy)).toThrow(/limits is core's only/);
+    expect(() => im.registerReceiver('core', greedy)).toThrow(/limits is core's only/);
   });
 });

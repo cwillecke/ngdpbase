@@ -29,6 +29,19 @@ export function grantablePermissions<T>(definitions: Record<string, T> | null | 
 }
 
 /**
+ * The names of the entries marked `"read-only": true`: actions that only let someone see something, so an
+ * allow rule that grants one to everyone is not a rule that lets many people change things. An add-on marks
+ * its own permission in its `config/default-config.json`, the way it marks `step-up`. `page-read` is read-only
+ * without a mark; this adds to it. `*` is never read-only: it stands for every action.
+ */
+export function readOnlyPermissionNames(definitions: unknown): string[] {
+  if (!definitions || typeof definitions !== 'object' || Array.isArray(definitions)) return [];
+  return Object.entries(definitions as Record<string, unknown>)
+    .filter(([name, entry]) => name !== '*' && !!entry && typeof entry === 'object' && (entry as { 'read-only'?: unknown })['read-only'] === true)
+    .map(([name]) => name);
+}
+
+/**
  * Permissions that were split into narrower ones, and what each stood for.
  *
  * A policy, an agent token or an app grant written before the split still
@@ -52,6 +65,27 @@ export function withRetiredExpanded(names: readonly string[]): string[] {
     }
   }
   return out;
+}
+
+/**
+ * The pushed-pages permission for each page write (#2255). A page in a
+ * pushed category (shipped by the system or an add-on: `system`,
+ * `documentation`, `addon` as shipped) is changed by holders of
+ * `pushed-pages-<verb>`; any other page by holders of `page-<verb>`. Which
+ * categories are which is the policies' to say — each grants one or the
+ * other on `system-category` resources — so a page write is asked as either
+ * name, and the policies on the page's category decide.
+ */
+const PUSHED_PAGE_WRITES: Readonly<Record<string, string>> = {
+  'page-edit': 'pushed-pages-edit',
+  'page-delete': 'pushed-pages-delete',
+  'page-rename': 'pushed-pages-rename'
+};
+
+/** The names a policy may grant `action` under (#2255): a page write and its pushed-pages twin, else the action alone. */
+export function pageWriteAlternatives(action: string): string[] {
+  const pushed = PUSHED_PAGE_WRITES[action];
+  return pushed ? [action, pushed] : [action];
 }
 
 /**

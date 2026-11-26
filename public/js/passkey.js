@@ -55,7 +55,7 @@
   // #1525: an action that needs a fresh sign-in answers with where to give
   // one; go there, and come back to this page after.
   function failed(body) {
-    if (body && body.reauth) window.location.href = body.reauth;
+    if (body && body.reauth && window.followReauth) window.followReauth(body);
     return new Error((body && body.error) || 'Request failed');
   }
 
@@ -129,7 +129,8 @@
           return navigator.credentials.get({ publicKey: options });
         })
         .then(function (cred) {
-          return postJSON('/auth/passkey/reauth/verify', { response: credentialJSON(cred), next: button.dataset.next || '/' });
+          // #2193: a script's prompt is named, so the page waiting on it knows it was confirmed.
+          return postJSON('/auth/passkey/reauth/verify', { response: credentialJSON(cred), next: button.dataset.next || '/', prompt: button.dataset.prompt });
         })
         .then(function (out) {
           if (!out.ok) throw new Error(out.error || 'That did not work.');

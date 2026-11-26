@@ -30,9 +30,9 @@ Workflow:
 <!-- AUTO:quick-nav BEGIN -->
 | Category | Count (src/) | Documented | Description |
 | ---------- | --- | --- | ------------- |
-| [Managers](#managers) | 45 | 50 | Core system managers |
+| [Managers](#managers) | 46 | 51 | Core system managers |
 | [Plugins](#plugins) | 32 | 36 | JSPWiki-style content plugins |
-| [Providers](#providers) | 46 | 51 | Storage and service providers |
+| [Providers](#providers) | 47 | 52 | Storage and service providers |
 | [Architecture](#architecture) | n/a | 15+ | System design and patterns |
 | [Testing](#testing) | n/a | 3 | Testing guides and strategies |
 | [API](#api-reference) | n/a | Auto-gen | TypeDoc generated API reference |
@@ -67,13 +67,13 @@ Every manager class in `src/managers/`. Quick reference docs are ~100-200 lines;
 | ConsentManager | ✅ [doc](managers/ConsentManager.md) | What each user has accepted — the site's terms and add-ons' documents — and asking them; append-only records per account (#1603) |
 | DatabaseManager | ✅ [doc](managers/DatabaseManager.md) | The one door to the application database: an optional SQLite file, encrypted with SQLCipher when a key is set, with a dated migration ledger |
 | EmailManager | ✅ [doc](managers/EmailManager.md) | Shared outbound email transport — pluggable provider (console / SMTP), with attachments |
-| ExportManager | 📘 [doc](managers/ExportManager.md) + [guide](managers/ExportManager-Complete-Guide.md) | Per-page export to HTML or Markdown, the one CSV writer for every CSV export, and HTML to PDF through a chosen provider (none, local Chromium, or a Chromium service) |
+| ExportManager | 📘 [doc](managers/ExportManager.md) + [guide](managers/ExportManager-Complete-Guide.md) | A page as a styled HTML document, the one CSV writer for every CSV export, and HTML to PDF through a chosen provider (none, local Chromium, or a Chromium service) |
 | FeedManager | ✅ [doc](managers/FeedManager.md) | Runtime of the feeds addon (#685) — one record store + CatalogSource per configured external feed; the receiver feeds.items for what the import engine fetches and reads (#2109), scheduled as the background job feeds.poll. |
 | FileManager | ✅ [doc](managers/FileManager.md) | The one door for files (epic #1851): today's attachments read as file records, the one write door (put, every file vetted by ICE) and its record, the places a user may write to, the Upload file dialog, and the migration dry run |
 | FilterManager | ✅ [doc](managers/FilterManager.md) | Owns the content-filter pipeline: registration, lifecycle, and the one chain both save and render paths use |
 | FootnoteManager | ✅ [doc](managers/FootnoteManager.md) | Sidecar storage + CRUD for page footnotes (migrated out of page body in |
 | IdentityManager | ✅ [doc](managers/IdentityManager.md) | Identity records (#617) for every user and contact — kept apart from sign-in, shared across addons |
-| ImportManager | 📘 [doc](managers/ImportManager.md) + [guide](managers/ImportManager-Complete-Guide.md) | The ICE engine — imports through shims into receivers' own doors; the folder, URL and takeout imports |
+| ImportManager | 📘 [doc](managers/ImportManager.md) + [guide](managers/ImportManager-Complete-Guide.md) | The ICE engine — imports through shims into receivers' own doors; the folder and URL imports |
 | Manager-SOT | ✅ [doc](managers/Manager-SOT.md) | Where each fact lives and which manager owns it — the standing rule, the current violations, and the plan to fix them. Starts with the access-control subject |
 | MediaManager | 📘 [doc](managers/MediaManager.md) + [guide](managers/MediaManager-Complete-Guide.md) | Read-only external photo/video library (filesystem-backed) with EXIF indexing and keyword facets |
 | MetricsManager | 📘 [doc](managers/MetricsManager.md) + [guide](managers/MetricsManager-Complete-Guide.md) | OpenTelemetry-backed metrics: route latency histograms, engine init timing, cache hit ratios |
@@ -92,10 +92,11 @@ Every manager class in `src/managers/`. Quick reference docs are ~100-200 lines;
 | SchemaManager | 📘 [doc](managers/SchemaManager.md) + [guide](managers/SchemaManager-Complete-Guide.md) | JSON Schema registration and validation for typed entities (Person, Organization, etc.) |
 | SearchManager | 📘 [doc](managers/SearchManager.md) + [guide](managers/SearchManager-Complete-Guide.md) | Full-text page search with pluggable backends (Lunr in-process, Elasticsearch); also drives the asset-picker |
 | SessionStatsManager | ✅ [doc](managers/SessionStatsManager.md) | In-process session counts and user lists from the express-session store, shared by the session routes and SessionsPlugin |
-| SharedFolderManager | ✅ [doc](managers/SharedFolderManager.md) | The organization's shared folders — each folder's own key, wrapped under the shared-folders key and sealed for the organization's recovery words, and the folders at /shared/{name}, opened by permission; the words shown once with Download and Print, typed back, and replaced by a new set (#1775, |
+| SharedFolderManager | ✅ [doc](managers/SharedFolderManager.md) | The organization's shared folders — each folder's own key, wrapped under the shared-folders key and sealed for the organization's recovery words, and the folders at /shared/{name}, opened by permission and given to roles on Admin → Shared folders; the words shown once with Download and Print, typed back, and replaced by a new set (#1775, |
 | ShareManager | ✅ [doc](managers/ShareManager.md) | Share-link capability tokens (#842) — issue/validate/revoke/list + live keyword-scope resolution |
 | TemplateManager | 📘 [doc](managers/TemplateManager.md) + [guide](managers/TemplateManager-Complete-Guide.md) | Page templates for /create and theme-driven layout templates for /view |
 | ThemeManager | ✅ [doc](managers/ThemeManager.md) | Manages theme discovery + active-theme selection + CSS path resolution for the page-render pipeline |
+| UpgradeCheckManager | ✅ [doc](managers/UpgradeCheckManager.md) | Run-once checks for each release; what an update left for an administrator to decide becomes an item on "After updating" in Admin, with one button that fixes it (#2301) |
 | UserManager | 📘 [doc](managers/UserManager.md) + [guide](managers/UserManager-Complete-Guide.md) | User CRUD, sessions, authentication, profile-page binding, contact-recipient resolution |
 | ValidationManager | ✅ [doc](managers/ValidationManager.md) | Central data-integrity enforcement: UUID-based naming, YAML frontmatter validation, slug-conflict detection |
 | VariableManager | ✅ [doc](managers/VariableManager.md) | Variable expansion in content — `[{$pagename}]`, `[{$applicationname}]`, custom user variables (JSPWiki-compatible) |
@@ -209,6 +210,7 @@ Storage and service providers in `src/providers/`. Each provider implements a `B
 | RedisCacheProvider | ✅ [doc](providers/RedisCacheProvider.md) | External Redis-backed cache — shared across multiple ngdpbase instances |
 | SqliteDatabaseProvider | ✅ [doc](providers/SqliteDatabaseProvider.md) | The application database as one SQLite file, SQLCipher-encrypted when NGDPBASE_DATABASE_KEY is set; WAL mode, fsynced, migrated at open (#1536) |
 | SqliteJobStateProvider | ✅ [doc](providers/SqliteJobStateProvider.md) | Scheduled-job state, run history, checkpoints and slot locks in the application database (job_state, job_runs, job_checkpoints, job_leases); lock by one conditional write (#1714) |
+| TotpAuthProvider | ✅ [doc](providers/TotpAuthProvider.md) | TOTP (authenticator app) on otpauth — a second factor only, amr otp at AAL1; the seed AES-GCM encrypted in the credentials store (#421) |
 | VersioningFileProvider | 📘 [doc](providers/VersioningFileProvider.md) + [guide](providers/VersioningFileProvider-Complete-Guide.md) | File-based page storage with delta-compressed version history; the default PageManager backend |
 <!-- AUTO:providers-table END -->
 
@@ -348,11 +350,11 @@ Before contributing, please review:
 Honest accounting of doc coverage. Targets are pragmatic — abstract base classes and trivial null/no-op providers don't need long-form docs, but every module should at least have a stub or appear in this index.
 
 <!-- AUTO:doc-status BEGIN -->
-__Managers:__ 45/45 with quick-reference docs (100%); 17 with Complete Guides.
+__Managers:__ 46/46 with quick-reference docs (100%); 17 with Complete Guides.
 
 __Plugins:__ 32/32 with quick-reference docs (100%).
 
-__Providers:__ 46/46 with quick-reference docs (100%); 5 with Complete Guides.
+__Providers:__ 47/47 with quick-reference docs (100%); 5 with Complete Guides.
 <!-- AUTO:doc-status END -->
 
 See [issue #178](https://github.com/jwilleke/ngdpbase/issues/178) for the doc-coverage tracking issue and [#660](https://github.com/jwilleke/ngdpbase/issues/660) for the discoverability problem this index addresses.

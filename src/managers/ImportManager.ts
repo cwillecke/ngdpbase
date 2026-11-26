@@ -51,11 +51,10 @@ import type { PageSaveResult } from './PageManager.js';
 import type AttachmentManager from './AttachmentManager.js';
 import type FileManager from './FileManager.js';
 import logger from '../utils/logger.js';
-import { readZip, type ZipReadLimits } from '../utils/zipArchive.js';
-import { freeImportTitle, linksToAttachment, readTakeout, rewriteAttachmentLinks } from '../utils/privateStoreImport.js';
-import { mayActInPrivateContainer } from '../utils/privateStoreAccess.js';
+import { TAKEOUT_FILE_INDEX } from '../utils/privateStoreExport.js';
+import { holdsInVault, mayActInPrivateContainer, permitsInVault } from '../utils/privateStoreAccess.js';
 import { assertContextCanWriteStore } from '../utils/privateStoreUnlock.js';
-import { formatPrivatePageName, isValidStoreId, privateStoreLayoutFromConfig, systemCategoryVaults } from '../utils/privateStorePath.js';
+import { formatPrivatePageName, isValidStoreId, parsePrivatePageName, privateStoreLayoutFromConfig, systemCategoryVaults, type PrivateStoreLayout } from '../utils/privateStorePath.js';
 import { jobContextFromRequest, type JobContext } from '../context/JobContext.js';
 import type PolicyDecisionPoint from '../security/PolicyDecisionPoint.js';
 import type BackgroundJobManager from './BackgroundJobManager.js';
@@ -65,13 +64,22 @@ import { IdentityStoreUnavailableError, errorClassOf } from '../utils/identitySt
 import { converterShim } from '../ice/converterShim.js';
 import { RECORD_SHIMS, VETTING_SHIMS } from '../ice/shims/index.js';
 import { vetFile } from '../ice/vet.js';
-import { boundScope, convertChain, keepOriginalsAtUpload, receiverLink, runImport, type IceEngineSettings, type IceRunDeps } from '../ice/runImport.js';
-import { mediaTypeByExtension } from '../ice/fileHandling.js';
+import { TAKEOUT_KIND, freeImportTitle, linksToAttachment, rewriteAttachmentLinks, takeoutShim, type TakeoutData } from '../ice/shims/takeout.js';
+import type { FilePlace } from '../types/File.js';
+import { recordAuditEvent, type AuditEventSink } from '../utils/auditEvents.js';
+import { AUDIT_EVENT } from '../utils/auditEventNames.js';
+import { boundScope, convertChain, isConfidentialReceiver, keepOriginalsAtUpload, receiverLink, runImport, type IceEngineSettings, type IceRunDeps } from '../ice/runImport.js';
+import { fingerprint, mediaTypeByExtension } from '../ice/fileHandling.js';
 import { givenNameProblem, type IceNameForm } from '../ice/givenName.js';
 import { FileIceLedger } from '../ice/ledger.js';
+import { searchExportSource, pageItem } from '../ice/searchExportSource.js';
+import { IceExportFailed, checkExportSize, exportChains, exportSize, runExportChain, type IceExportSettings } from '../ice/runExport.js';
+import { CSV_FILE_SHIM_ID, exportShims } from '../ice/shims/export.js';
+import { PdfUnavailableError } from '../export/pdfEngine.js';
+import type ExportManager from './ExportManager.js';
 import type {
-  IceItem, IceLedger, IceOriginalChoices, IceReceiver, IceRunReport, IceRunRequest, IceShim, IceUpload, IceVetResult, OriginalChoice, ReceiveInfo,
-  ReceiveOutcome, RecentImport, RegisteredReceiver, RegisteredShim, ShimTools
+  IceExportFormat, IceExportReport, IceExportRequest, IceExportSource, IceFileReport, IceItem, IceLedger, IceOriginalChoices, IceReceiver, IceRunReport, IceRunRequest, IceShim,
+  IceTarget, IceUpload, IceVetResult, OriginalChoice, ReceiveInfo, ReceiveOutcome, RecentImport, RegisteredExportSource, RegisteredReceiver, RegisteredShim, ShimTools
 } from '../ice/types.js';
 import { pageUrl } from '../utils/pageUrl.js';
 
@@ -274,24 +282,35 @@ export interface ImportResult {
   durationMs: number;
 }
 
-/**
- * Why a takeout import was refused before anything was written (#1472).
- * A refusal is never a partial import.
- */
-export class TakeoutImportRefused extends Error {
-  constructor(
-    readonly reason: 'not-owner' | 'no-such-store' | 'locked' | 'unreadable',
-    message: string
-  ) {
-    super(message);
-    this.name = 'TakeoutImportRefused';
-  }
-}
-
 /** A sentence without its final full stop, to be set inside another. */
 function withoutFinalStop(text: string): string {
   const said = text.trim();
   return said.endsWith('.') ? said.slice(0, -1) : said;
+}
+
+/** Why a web address could not be imported (#2494). */
+export type UrlImportRefusal =
+  /** The text is not a web address. */
+  | 'invalid-address'
+  /** A web address, but not http or https. */
+  | 'not-web-address'
+  /** The site answered 404 or 403: the page is not there, or not open to us. */
+  | 'not-found'
+  /** The address answered with something that is not a web page, such as an image. */
+  | 'not-a-page'
+  /** The site answered 5xx, 410 or 429: it is down, gone or too busy; nothing wrong with the address. */
+  | 'site-unavailable';
+
+/**
+ * An import from a web address that failed for a reason the person can act
+ * on (#2494). A route answers each `reason` with its own plain sentence; any
+ * other failure of the import is not this class and gets the general one.
+ */
+export class UrlImportRefused extends Error {
+  constructor(readonly reason: UrlImportRefusal, message: string) {
+    super(message);
+    this.name = 'UrlImportRefused';
+  }
 }
 
 /**
@@ -303,6 +322,42 @@ export class ImportUploadRefused extends Error {
   constructor(readonly file: string, readonly reason: string) {
     super(`The original of "${file}" could not be kept: ${withoutFinalStop(reason)}. Nothing was imported.`);
     this.name = 'ImportUploadRefused';
+  }
+}
+
+/**
+ * An export that is not started (#2120): the thing is not there, the user may
+ * not export it, or the format is not one offered for it. A route answers it
+ * as "not found", so it never tells the user which.
+ */
+export class IceExportRefused extends Error {
+  constructor(message = 'Nothing to export here.') {
+    super(message);
+    this.name = 'IceExportRefused';
+  }
+}
+
+/**
+ * An export not started because too much is already being made (#2120): the
+ * user's own queued exports are at `max-queued-per-user`, or every held run is
+ * still being made. A route answers it as 429; nothing was read or queued.
+ */
+export class IceExportBusy extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'IceExportBusy';
+  }
+}
+
+/**
+ * An export refused only because the user's sign-in is not fresh enough
+ * (#2120): they hold `permission` on the thing, and step-up asks for it. A
+ * route answers it with the step-up prompt, not "not found".
+ */
+export class IceExportNeedsFreshSignIn extends Error {
+  constructor(readonly permission: string) {
+    super('A fresh sign-in is needed');
+    this.name = 'IceExportNeedsFreshSignIn';
   }
 }
 
@@ -330,11 +385,6 @@ export type TakeoutImportReport = {
   unlinkedFiles: string[];
   /** Archive members that are neither a page nor a file. */
   ignored: string[];
-  /**
-   * The private page this import's report was saved as, in the target store
-   * (operator, 2026-09-25). Absent only when that save failed.
-   */
-  reportPage?: string;
 };
 
 /** The background job that drains queued ICE runs (#1979). */
@@ -346,6 +396,49 @@ const DEFAULT_NOISE = ['__MACOSX/', '.DS_Store', 'Thumbs.db', 'desktop.ini', '._
 /** D11's three choices, in the order the import screen offers them. */
 const ORIGINAL_CHOICES: readonly OriginalChoice[] = ['none', 'cite', 'keep'];
 
+/** What an export run reads from configuration (#2120): the engine's limits, and how long a made file is kept. */
+/**
+ * A takeout run's state for giving files back their ids in one store (#2188),
+ * read once per run and store.
+ */
+interface StoreRestoring {
+  /** The ids the site's files held when the run began, and each id the run stored since. */
+  held: Set<string>;
+  /** The ids this store gave a takeout's files that could not keep their own, takeout id → id here. */
+  lastIds: Map<string, string>;
+  /** This run's files stored under another id than the one the store last gave them: takeout id → id now. */
+  renumbered: Map<string, string>;
+  /** A re-import's ids the store's pages may still link, each → the id its file has now. */
+  relink: Map<string, string>;
+}
+
+interface ExportRunSettings extends IceExportSettings {
+  maxItems: number;
+  keepMinutes: number;
+  maxHeldBytes: number;
+  maxKeptRuns: number;
+  maxQueuedPerUser: number;
+}
+
+/** Why an export is not started when the site is making all it may (#2120). */
+/** The most item names an export's record to its source lists (#2411): `count` says how many there were. */
+const EXPORT_OUTCOME_NAMES = 200;
+const SITE_BUSY = 'The site is making as many exports as it can just now. Try again in a few minutes.';
+
+/**
+ * Is this a signed-in person's request (#2120)? An export is held for the
+ * user who asked, so it is theirs only when the name is theirs alone: never
+ * the anonymous visitor's, whatever a site grants anonymous.
+ */
+function signedIn(ctx: ActorContext): boolean {
+  return Boolean(ctx?.username) && !isJobContext(ctx) && ctx.isAuthenticated === true;
+}
+
+/** Is an export still being made, so never let go? */
+function isInFlight(report: IceExportReport): boolean {
+  return report.state === 'queued' || report.state === 'running';
+}
+
 /** A receiver the import screen may offer this user (#2021): its id, label and original-file choices (D11). */
 export interface UsableReceiver {
   id: string;
@@ -354,6 +447,8 @@ export interface UsableReceiver {
   originals: Required<Omit<IceOriginalChoices, 'types'>>;
   /** What a name the user gives becomes (#2130), when the receiver takes one: the screen offers the field only then. */
   names?: IceNameForm;
+  /** Where within it this user may import (#2118), for a receiver with places: the screen offers a choice of them. */
+  targets?: IceTarget[];
 }
 
 /** A media type a receiver may declare it keeps (#2061): `type/subtype`, exactly, no wildcard. */
@@ -377,6 +472,16 @@ function titleFromFileName(name: string): string {
  *
  * Manages content import with extensible format support via converter registry.
  */
+/** What the private-store receiver says of a page it did not import (#2118); its `store-import` record counts them. */
+const TAKEOUT_PAGE_UNCHANGED = 'already here, unchanged';
+/** #2171: a file deleted since an earlier import of the same takeout, put back. */
+const TAKEOUT_FILE_RESTORED = 'restored: deleted since an earlier import';
+const TAKEOUT_PAGE_CHANGED = 'changed since the download; the page here was kept';
+const TAKEOUT_PAGE_ELSEWHERE = 'already on this site';
+/** A takeout's files are under `attachments/`; its pages are not. */
+const isTakeoutFile = (f: IceFileReport): boolean => f.name.includes('/attachments/');
+const isFailedEntry = (f: IceFileReport): boolean => ['partial', 'refused', 'failed', 'unreadable'].includes(f.status);
+
 class ImportManager extends BaseManager {
   /** Registry of format converters */
   private converterRegistry: Map<string, IContentConverter>;
@@ -387,13 +492,23 @@ class ImportManager extends BaseManager {
   private readonly receiverRegistry = new Map<string, RegisteredReceiver>();
   /** ICE: runs this process knows about, oldest first. */
   private readonly iceRuns = new Map<string, IceRunReport>();
-  /** ICE: runs waiting for the background job, each with its own context. */
-  private readonly iceQueue: Array<{ request: IceRunRequest; ctx: JobContext; report: IceRunReport }> = [];
+  /** ICE (#2171): a rechecking run's store, as fingerprint → id, read once per run and store; dropped when the run ends. */
+  private readonly storeHoldings = new Map<string, Promise<Map<string, string> | null>>();
+  /** ICE (#2188): what a run gives files back their ids with, by run and store; dropped when the run ends. */
+  private readonly storeRestoring = new Map<string, Promise<StoreRestoring>>();
+  /** ICE (#2171): the fingerprints of the files a rechecking run put back into a store, by run and store; dropped when the run ends. */
+  private readonly storeRestored = new Map<string, Set<string>>();
+  /** ICE: work waiting for the background job, each with its own context: an import run or an export (#2120). */
+  private readonly iceQueue: Array<{ ctx: JobContext; run: () => Promise<unknown> }> = [];
   /** ICE: true while a background job is draining the queue. */
   private iceDraining = false;
   /** ICE: the last background run id the queue was handed to. */
   private iceLastJobRunId: string | null = null;
   private iceLedger: IceLedger | null = null;
+  /** ICE export (#2120): the owners' doors for reading what is exported, by id. */
+  private readonly exportSourceRegistry = new Map<string, RegisteredExportSource>();
+  /** ICE export: runs this process holds, oldest first, each with its file once made. Never written to disk. */
+  private readonly exportRuns = new Map<string, { report: IceExportReport; file?: Buffer; pendingBytes?: number; timer?: NodeJS.Timeout }>();
 
   constructor(engine: WikiEngine) {
     super(engine);
@@ -407,8 +522,11 @@ class ImportManager extends BaseManager {
     await super.initialize(config);
 
     // ICE's core receivers (#1979, D4): pages and files, each through its own door.
-    this.registerReceiver('core', this.pagesReceiver());
-    this.registerReceiver('core', this.filesReceiver());
+    // Through the private door: only these may declare writesEncrypted (#2179).
+    this.#registerReceiver('core', this.pagesReceiver(), true);
+    this.#registerReceiver('core', this.filesReceiver(), true);
+    // #2118: a takeout handed back into its owner's private store, read by core.takeout.
+    this.#registerReceiver('core', this.privateStoreReceiver(), true);
 
     // Register built-in converters
     this.registerConverter(new JSPWikiConverter());
@@ -421,6 +539,28 @@ class ImportManager extends BaseManager {
     for (const shim of RECORD_SHIMS) this.registerShim('core', shim);
     // #2149: shims that clean a file kept as a file (SVG); core.csv cleans CSV.
     for (const shim of VETTING_SHIMS) this.registerShim('core', shim);
+    // #2118: reads a takeout for the private-store receiver.
+    this.registerShim('core', takeoutShim);
+
+    // #2120: export starts from the thing being exported. Pages first; core's
+    // out shims make NCM, HTML, Markdown and PDF (#1974) from them.
+    this.registerExportSource('core', this.pagesExportSource());
+    this.registerExportSource('core', this.searchExportSource());
+    for (const shim of exportShims({
+      renderDocument: (item) => this.exportManager().renderPageDocument(typeof item.metadata?.['title'] === 'string' ? item.metadata['title'] : item.name, {
+        content: item.text ?? '',
+        ...(typeof item.metadata?.['lastModified'] === 'string' ? { lastModified: item.metadata['lastModified'] } : {}),
+        ...(typeof item.metadata?.['system-category'] === 'string' ? { 'system-category': item.metadata['system-category'] } : {}),
+        ...(Array.isArray(item.metadata?.['user-keywords']) ? { 'user-keywords': (item.metadata['user-keywords'] as unknown[]).map(String) } : {})
+      }),
+      htmlToPdf: (ctx, html) => this.exportManager().htmlToPdf(ctx, html),
+      pdfAvailable: () => this.engine.getManager<ExportManager>('ExportManager')?.isPdfConfigured() ?? false,
+      toCsv: (headers, rows) => this.exportManager().toCsv(headers, rows),
+      csvLimits: () => ({
+        maxColumns: this.numberSetting('ngdpbase.export.engine.csv-max-columns', 1000),
+        maxCells: this.numberSetting('ngdpbase.export.engine.csv-max-cells', 20_000_000)
+      })
+    })) this.registerShim('core', shim);
 
     logger.info('[ImportManager] Initialized with converters:', this.getAvailableFormats());
   }
@@ -470,13 +610,30 @@ class ImportManager extends BaseManager {
   /**
    * Register a receiver (D4): a door that already exists. Core's are
    * `core.pages` and `core.files`; an add-on registers its own manager's door
-   * through `host.registerReceiver`.
+   * through `host.registerReceiver`. Refuses `writesEncrypted` from every
+   * caller, whatever owner it names: core registers its own receivers
+   * through the private `#registerReceiver` (#2179).
    *
    * @returns The receiver's id, `<owner>.<name>`
    */
   registerReceiver(owner: string, receiver: IceReceiver): string {
-    const id = `${owner}.${receiver?.name}`;
-    if (!receiver || !ICE_NAME.test(receiver.name)) throw new Error(`ICE receiver '${id}': a name is lower-case letters, numbers and dashes`);
+    return this.#registerReceiver(owner, receiver, false);
+  }
+
+  /**
+   * The registration itself. Only core's own receivers, from `initialize`,
+   * come here with `mayWriteEncrypted`: the public `registerReceiver` is
+   * reachable by any add-on through the engine, whatever owner it names
+   * (#2179), so it never lets a receiver declare `writesEncrypted` (#2110).
+   * The receiver is copied once and the copy is checked and stored, so a
+   * getter cannot answer the check one way and the registry another.
+   */
+  #registerReceiver(owner: string, given: IceReceiver, mayWriteEncrypted: boolean): string {
+    const receiver: IceReceiver = { ...given };
+    const writesEncrypted = receiver.writesEncrypted === true;
+    const keepsEncrypted = receiver.keepsEncrypted === true;
+    const id = `${owner}.${receiver.name}`;
+    if (!given || !ICE_NAME.test(receiver.name)) throw new Error(`ICE receiver '${id}': a name is lower-case letters, numbers and dashes`);
     if (this.receiverRegistry.has(id)) throw new Error(`ICE receiver '${id}' is already registered`);
     if (typeof receiver.receive !== 'function' || typeof receiver.mayUse !== 'function' || !Array.isArray(receiver.accepts)) {
       throw new Error(`ICE receiver '${id}': declare accepts, mayUse() and receive()`);
@@ -484,12 +641,20 @@ class ImportManager extends BaseManager {
     if (receiver.names !== undefined && receiver.names !== 'title' && receiver.names !== 'file') {
       throw new Error(`ICE receiver '${id}': names is 'title' or 'file'`);
     }
+    // #2187: the engine's limits are the site's; a receiver raising them for itself is core's only.
+    if (receiver.limits !== undefined && !mayWriteEncrypted) {
+      throw new Error(`ICE receiver '${id}': limits is core's only; an add-on receiver is held to the engine's limits`);
+    }
+    // #2110: an add-on's receiver is confidential only by keeping originals sealed (`keepsEncrypted`).
+    if (writesEncrypted && !mayWriteEncrypted) {
+      throw new Error(`ICE receiver '${id}': writesEncrypted is core's only; an add-on receiver uses keepsEncrypted`);
+    }
     const types = receiver.originals?.types;
     if (types !== undefined && (!Array.isArray(types) || !types.every(t => typeof t === 'string' && KEPT_MEDIA_TYPE.test(t.trim().toLowerCase())))) {
       throw new Error(`ICE receiver '${id}': originals.types are media types, type/subtype exactly, with no wildcard`);
     }
     this.receiverRegistry.set(id, {
-      ...receiver, id, owner,
+      ...receiver, id, owner, writesEncrypted, keepsEncrypted,
       ...(receiver.originals && types ? { originals: { ...receiver.originals, types: types.map(t => t.trim().toLowerCase()) } } : {})
     });
     return id;
@@ -518,9 +683,14 @@ class ImportManager extends BaseManager {
     for (const r of this.receiverRegistry.values()) {
       // #2109: a receiver fed only by its owner's sources is never offered for an upload.
       if (r.uploads === false) continue;
-      if (await r.mayUse(ctx).catch(() => false)) {
-        out.push({ id: r.id, label: r.label, originals: this.originalChoices(r), ...(r.names ? { names: r.names } : {}) });
-      }
+      if (!await r.mayUse(ctx).catch(() => false)) continue;
+      // #2118: a receiver with places is offered only with somewhere this user may import.
+      const targets = r.targets ? await r.targets(ctx).catch(() => []) : undefined;
+      if (targets && targets.length === 0) continue;
+      out.push({
+        id: r.id, label: r.label, originals: this.originalChoices(r),
+        ...(r.names ? { names: r.names } : {}), ...(targets ? { targets } : {})
+      });
     }
     return out;
   }
@@ -548,6 +718,26 @@ class ImportManager extends BaseManager {
     const allowed = declared.length > 0 ? ORIGINAL_CHOICES.filter(c => declared.includes(c)) : [...ORIGINAL_CHOICES];
     const wanted = [receiver.originals?.default, this.engineSettings().defaultOriginal];
     return { allowed, default: wanted.find((c): c is OriginalChoice => !!c && allowed.includes(c)) ?? allowed[0] };
+  }
+
+  /**
+   * The request's place within the receiver, checked (#2118): one the
+   * receiver's `targets` gives this context, for a receiver with places,
+   * and none for any other. An unknown receiver is left for the run to report.
+   *
+   * @throws Error when the place is missing, not this user's, or not the receiver's
+   */
+  private async checkTarget(request: IceRunRequest, ctx: ActorContext): Promise<void> {
+    const receiver = this.receiverRegistry.get(request.receiver);
+    if (!receiver) return;
+    if (!receiver.targets) {
+      if (request.target !== undefined) throw new Error(`ICE receiver '${receiver.id}' has no places to import into`);
+      return;
+    }
+    const targets = await receiver.targets(ctx);
+    if (typeof request.target !== 'string' || !targets.some(t => t.id === request.target)) {
+      throw new Error(`ICE receiver '${receiver.id}': choose one of the places you may import into`);
+    }
   }
 
   /**
@@ -605,6 +795,7 @@ class ImportManager extends BaseManager {
   async runImport(request: IceRunRequest, ctx: ActorContext): Promise<IceRunReport> {
     if (!ctx?.username) throw new Error('ImportManager.runImport requires an ActorContext');
     const resolved = this.withOriginal(request);
+    await this.checkTarget(resolved, ctx);
     const report = this.newRunReport(resolved, ctx, await this.importScope(resolved, ctx));
     return this.executeRun(resolved, ctx, report);
   }
@@ -619,6 +810,7 @@ class ImportManager extends BaseManager {
   async enqueueImport(request: IceRunRequest, ctx: JobContext): Promise<string> {
     if (!ctx?.username) throw new Error('ImportManager.enqueueImport requires a JobContext');
     const resolved = this.withOriginal(request);
+    await this.checkTarget(resolved, ctx);
     return this.enqueueResolved(resolved, ctx, await this.importScope(resolved, ctx));
   }
 
@@ -633,16 +825,28 @@ class ImportManager extends BaseManager {
    * the store's sealed index entry written. Each is recorded in the ledger
    * as the keep-once record (#2011), so the run reuses it and needs no key.
    *
+   * A receiver whose `receive` itself may write into an encrypted store
+   * (`writesEncrypted`, #2118) has the whole run now, in this request, with
+   * `ctx` and its key, and the run's id is returned when it has ended: no
+   * key is ever carried into a job (#2034).
+   *
    * @throws ImportUploadRefused when an original could not be kept; nothing is queued
    */
   async enqueueUpload(request: IceRunRequest, ctx: ActorContext): Promise<string> {
     if (!ctx?.username) throw new Error('ImportManager.enqueueUpload requires an ActorContext');
-    if (this.receiverRegistry.get(request.receiver)?.uploads === false) {
+    const receiver = this.receiverRegistry.get(request.receiver);
+    if (receiver?.uploads === false) {
       throw new Error(`ICE receiver '${request.receiver}' takes no uploads; it is fed by its owner's own sources`);
     }
-    const jobCtx = jobContextFromRequest(ctx);
     const resolved = this.withOriginal(request);
+    await this.checkTarget(resolved, ctx);
     const scope = await this.importScope(resolved, ctx);
+    if (receiver?.writesEncrypted) {
+      const report = this.newRunReport(resolved, ctx, scope);
+      await this.executeRun(resolved, ctx, report);
+      return report.runId;
+    }
+    const jobCtx = jobContextFromRequest(ctx);
     const kept = await keepOriginalsAtUpload(this.iceDeps(), resolved, ctx, scope);
     if (kept.refused) throw new ImportUploadRefused(kept.refused.name, kept.refused.message);
     return this.enqueueResolved(resolved, jobCtx, scope);
@@ -650,7 +854,7 @@ class ImportManager extends BaseManager {
 
   private async enqueueResolved(request: IceRunRequest, ctx: JobContext, scope: string): Promise<string> {
     const report = this.newRunReport(request, ctx, scope);
-    this.iceQueue.push({ request, ctx, report });
+    this.iceQueue.push({ ctx, run: () => this.executeRun(request, ctx, report) });
     await this.kickIceQueue(ctx);
     return report.runId;
   }
@@ -687,16 +891,21 @@ class ImportManager extends BaseManager {
     const ledger = this.ledger();
     const found: Array<{ entry: RecentImport; first?: string }> = [];
     for (const r of receivers) {
-      for (const f of await ledger.files(boundScope(r.id, owner))) {
-        found.push({
-          entry: {
-            name: f.name, status: f.status, at: f.at, receiver: r.id, refs: f.refs.length,
-            ...(f.givenName ? { givenName: f.givenName } : {}),
-            ...(r.label ? { receiverLabel: r.label } : {}),
-            ...(f.message ? { message: f.message } : {})
-          },
-          ...(f.refs[0] ? { first: f.refs[0] } : {})
-        });
+      // #2118: a receiver with places keeps each place's files in a scope of its own.
+      const places: Array<IceTarget | undefined> = r.targets ?? [undefined];
+      for (const place of places) {
+        for (const f of await ledger.files(boundScope(r.id, owner, place?.id))) {
+          found.push({
+            entry: {
+              name: f.name, status: f.status, at: f.at, receiver: r.id, refs: f.refs.length,
+              ...(f.givenName ? { givenName: f.givenName } : {}),
+              ...(r.label ? { receiverLabel: r.label } : {}),
+              ...(place ? { target: place.id, ...(place.label ? { targetLabel: place.label } : {}) } : {}),
+              ...(f.message ? { message: f.message } : {})
+            },
+            ...(f.refs[0] ? { first: f.refs[0] } : {})
+          });
+        }
       }
     }
     found.sort((a, b) => (a.entry.at < b.entry.at ? 1 : a.entry.at > b.entry.at ? -1 : 0));
@@ -713,18 +922,314 @@ class ImportManager extends BaseManager {
   /**
    * Is an import into this receiver confidential (#2110)? Only when its
    * destination is encrypted: a receiver that keeps into a sealed store
-   * (`keepsEncrypted`). No receiver can declare itself so otherwise. A
+   * (`keepsEncrypted`), or whose own door writes into one
+   * (`writesEncrypted`, #2118). No receiver can declare itself so otherwise. A
    * confidential import's file names are shown to the uploader and kept in
-   * the audit log, and never written to application logs, notices or admin
-   * screens; every other import logs them as before.
+   * the audit log, and never written to application logs, notices, admin
+   * screens or the import ledger (#2161); every other import logs them as before.
    */
   isConfidential(receiverId: string): boolean {
-    return this.receiverRegistry.get(receiverId)?.keepsEncrypted === true;
+    return isConfidentialReceiver(this.receiverRegistry.get(receiverId));
   }
 
   /** Use this ledger instead of the file one: a test's, or a database table's. */
   setImportLedger(ledger: IceLedger): void {
     this.iceLedger = ledger;
+  }
+
+  // ── ICE: export (#2120) ──────────────────────────────────────────────────
+
+  /**
+   * Register an export source (#2120): the owner's door for reading what is
+   * exported, checking its existing read permission (D5). Core's is
+   * `core.pages`.
+   *
+   * @returns The source's id, `<owner>.<name>`
+   * @throws Error when the source is malformed or its id is taken
+   */
+  registerExportSource(owner: string, source: IceExportSource): string {
+    const id = `${owner}.${source?.name}`;
+    if (!source || !ICE_NAME.test(source.name)) throw new Error(`ICE export source '${id}': a name is lower-case letters, numbers and dashes`);
+    if (this.exportSourceRegistry.has(id)) throw new Error(`ICE export source '${id}' is already registered`);
+    if (!source.yields || typeof source.mayExport !== 'function' || typeof source.read !== 'function') {
+      throw new Error(`ICE export source '${id}': declare yields, mayExport() and read()`);
+    }
+    this.exportSourceRegistry.set(id, { ...source, id, owner });
+    return id;
+  }
+
+  /** Is this an export source an add-on registered (#2174)? Core's own sources are not: pages and searches have their own routes and permission. */
+  isAddonExportSource(sourceId: string): boolean {
+    const source = this.exportSourceRegistry.get(sourceId);
+    return !!source && source.owner !== 'core';
+  }
+
+  /** The label an add-on's export source is shown under (#2174); empty when there is none. */
+  exportSourceLabel(sourceId: string): string {
+    const source = this.exportSourceRegistry.get(sourceId);
+    return source ? source.label ?? source.name : '';
+  }
+
+  /**
+   * The formats the Export action offers this context for one thing (#2120):
+   * none when the source's owner would not let it export the thing (asked
+   * as an affordance, recording nothing), else each `out` shim, switched on,
+   * that can make a file from what the source yields.
+   */
+  async exportFormatsFor(sourceId: string, ref: string, ctx: ActorContext): Promise<IceExportFormat[]> {
+    const source = this.exportSourceRegistry.get(sourceId);
+    if (!source || !signedIn(ctx)) return [];
+    if (!await source.mayExport(ref, ctx).catch(() => false)) return [];
+    return [...this.exportChainsFor(source)].map(([id, chain]) => ({
+      id, label: chain[chain.length - 1].label ?? id, chain: chain.map(s => s.id)
+    }));
+  }
+
+  /**
+   * Start an export (#2120), from the request that asked: the source reads
+   * the thing now, with the request's own context, so its owner's door
+   * decides with everything the request carries (step-up, a vault's key)
+   * and records the export. The shims run off the request path, in the ICE
+   * background job, as the user's own job context. Returns the run id at once.
+   *
+   * Before anything is read, the user may have at most
+   * `max-queued-per-user` exports queued or running, and a held run must be
+   * free to make room under `max-kept-runs`. Once read, the items count
+   * toward `max-held-bytes` until their file is made.
+   *
+   * @throws IceExportRefused when the thing is not there, the user may not
+   *   export it, or the format is not one offered for it
+   * @throws IceExportNeedsFreshSignIn when the user holds the permission but
+   *   step-up asks for a fresh sign-in
+   * @throws IceExportBusy when the user, or the site, is making as many
+   *   exports as it may
+   * @throws IceExportFailed when the thing is larger than this site exports
+   */
+  async startExport(request: IceExportRequest, ctx: ActorContext): Promise<string> {
+    if (!ctx?.username) throw new Error('ImportManager.startExport requires an ActorContext');
+    const source = this.exportSourceRegistry.get(request.source);
+    if (!source || !signedIn(ctx)) throw new IceExportRefused();
+    // An add-on's own rule is asked here too, so a `read` that forgot it still cannot hand rows to
+    // someone `mayExport` refuses (#2174). Core's sources check as they read: step-up needs the
+    // request's own read.
+    if (this.isAddonExportSource(request.source) && !await source.mayExport(request.ref, ctx).catch(() => false)) throw new IceExportRefused();
+    const chain = this.exportChainsFor(source).get(request.format);
+    if (!chain) throw new IceExportRefused('That format is not offered here.');
+    const settings = this.exportLimitsFor(chain);
+    this.makeRoomForExport(ctx.username, settings);
+    const notes: string[] = [];
+    let items = await source.read(request.ref, ctx, { format: request.format, note: (text) => notes.push(text) });
+    if (!items || items.length === 0) throw new IceExportRefused();
+    // The site's item limit holds for every source, an add-on's included: what it leaves out is said (#2174).
+    // A records CSV has none (#2408): its settings carry no item limit.
+    if (items.length > settings.maxItems) {
+      const left = items.length - settings.maxItems;
+      notes.push(`${left} ${left === 1 ? 'item was' : 'items were'} left out: this site exports at most ${settings.maxItems} ${settings.maxItems === 1 ? 'item' : 'items'} at a time.`);
+      items = items.slice(0, settings.maxItems);
+    }
+
+    const jobCtx = jobContextFromRequest(ctx);
+    const report: IceExportReport = {
+      runId: uuidv4(), source: source.id, ref: request.ref, format: request.format, chain: chain.map(s => s.id),
+      username: ctx.username, state: 'queued', ...(notes.length ? { notes } : {})
+    };
+    // Counted once for the run (#2412): measuring walks every record.
+    const size = exportSize(items);
+    try {
+      checkExportSize(items, settings.maxBytes, size);
+      this.holdExportRun(report, size, settings);
+    } catch (err) {
+      // Read, but not exported: recorded as a failure (#2120).
+      await this.recordExportOutcome(source, report, items, jobCtx, err);
+      throw err;
+    }
+    this.iceQueue.push({ ctx: jobCtx, run: () => this.executeExport(source, report, items, size, chain, jobCtx, settings) });
+    await this.kickIceQueue(jobCtx);
+    return report.runId;
+  }
+
+  /** An export's status, to the user it runs as; null to anyone else, and once it is let go. */
+  getExportRun(runId: string, ctx: ActorContext): IceExportReport | null {
+    const held = this.exportRuns.get(runId);
+    return held && ctx?.username && held.report.username === ctx.username ? held.report : null;
+  }
+
+  /** An export's file, to the user it runs as, while it is kept; null otherwise. */
+  exportFile(runId: string, ctx: ActorContext): { name: string; mediaType: string; bytes: Buffer } | null {
+    const held = this.exportRuns.get(runId);
+    if (!held?.file || !held.report.file || !ctx?.username || held.report.username !== ctx.username) return null;
+    return { name: held.report.file.name, mediaType: held.report.file.mediaType, bytes: held.file };
+  }
+
+  /** The source's formats now: the enabled out shims' chains from what it yields. */
+  private exportChainsFor(source: RegisteredExportSource): Map<string, RegisteredShim[]> {
+    return exportChains(this.enabledShims(), source.yields, this.exportSettings().maxChainDepth);
+  }
+
+  private async executeExport(
+    source: RegisteredExportSource, report: IceExportReport, items: IceItem[], size: number, chain: RegisteredShim[], ctx: JobContext, settings: ExportRunSettings
+  ): Promise<void> {
+    report.state = 'running';
+    report.startedAt = new Date().toISOString();
+    let failure: unknown = null;
+    try {
+      const file = await runExportChain(items, chain, (shim) => ({ ...this.shimTools(shim), ctx }), settings, source.zipAs, size);
+      const bytes = file.bytes ?? Buffer.alloc(0);
+      // The file is counted, not only the items it was made from: a sparse list makes a file many times their size (#2410).
+      if (bytes.length > settings.maxHeldBytes) {
+        throw new IceExportFailed('This export came out too big for this site to hold. Export fewer records or fewer fields, or ask the site administrator.');
+      }
+      report.file = { name: path.basename(file.name), mediaType: file.mediaType ?? 'application/octet-stream', size: bytes.length };
+      report.expiresAt = new Date(Date.now() + settings.keepMinutes * 60_000).toISOString();
+      report.state = 'done';
+      this.keepExportFile(report.runId, bytes, settings);
+    } catch (err) {
+      failure = err;
+      report.state = 'failed';
+      // What the user is shown: our own reasons as they are, anything else in general terms.
+      report.error = err instanceof IceExportFailed ? err.message
+        : err instanceof PdfUnavailableError ? 'PDF export is not available on this site right now.'
+          : 'The export could not be made.';
+      // What is exported may be private: the log gives the run and the error's class, never its message.
+      logger.error(`[ImportManager] export run ${report.runId} (${report.format}) failed (${errorClassOf(err)})`);
+      const held = this.exportRuns.get(report.runId);
+      if (held) delete held.pendingBytes;
+    } finally {
+      report.finishedAt = new Date().toISOString();
+    }
+    // Recorded once the run has ended, as what happened (#2120).
+    await this.recordExportOutcome(source, report, items, ctx, failure);
+  }
+
+  /** The source's own record of how an export ended, if it keeps one; a record that fails is logged, never thrown. */
+  private async recordExportOutcome(source: RegisteredExportSource, report: IceExportReport, items: IceItem[], ctx: ActorContext, failure: unknown): Promise<void> {
+    if (typeof source.recordExport !== 'function') return;
+    const reason = failure === null ? undefined
+      : report.error ?? (failure instanceof IceExportFailed || failure instanceof IceExportBusy ? failure.message : 'The export could not be made.');
+    await source.recordExport(report.ref, ctx, {
+      format: report.format, runId: report.runId, count: items.length, items: items.slice(0, EXPORT_OUTCOME_NAMES).map(i => i.name), result: failure === null ? 'success' : 'failure', ...(reason ? { reason } : {})
+    }).catch((err: unknown) => logger.warn(`[ImportManager] the export record for run ${report.runId} failed (${errorClassOf(err)})`));
+  }
+
+  /**
+   * Before a new export is read (#2120): refuse when the user already has
+   * `max-queued-per-user` exports queued or running, and let finished runs go
+   * until there is room under `max-kept-runs`. A queued or running run is
+   * never let go.
+   *
+   * @throws IceExportBusy when there is no room
+   */
+  private makeRoomForExport(username: string, settings: ExportRunSettings): void {
+    const inFlight = [...this.exportRuns.values()].filter(r => r.report.username === username && isInFlight(r.report)).length;
+    if (inFlight >= settings.maxQueuedPerUser) {
+      throw new IceExportBusy(`You already have ${inFlight} export${inFlight === 1 ? '' : 's'} being made. Wait for one to finish, then try again.`);
+    }
+    for (const id of this.finishedExportRuns(username)) {
+      if (this.exportRuns.size < settings.maxKeptRuns) break;
+      this.dropExportRun(id);
+    }
+    if (this.exportRuns.size >= settings.maxKeptRuns) throw new IceExportBusy(SITE_BUSY);
+  }
+
+  /**
+   * Hold a new run with the bytes its items take until its file is made,
+   * which count toward `max-held-bytes` (#2120). Finished files are let go
+   * to make room, the user's own first ({@link finishedExportRuns}).
+   *
+   * @throws IceExportFailed when the items alone are more than it may hold
+   * @throws IceExportBusy when queued and running exports alone hold too much
+   */
+  private holdExportRun(report: IceExportReport, bytes: number, settings: ExportRunSettings): void {
+    if (bytes > settings.maxHeldBytes) throw new IceExportFailed('This export is larger than this site can hold at once.');
+    this.letFilesGo(report.username, settings.maxHeldBytes - bytes);
+    if (this.heldExportBytes() + bytes > settings.maxHeldBytes) throw new IceExportBusy(SITE_BUSY);
+    this.exportRuns.set(report.runId, { report, pendingBytes: bytes });
+  }
+
+  /**
+   * Keep a made file in memory until `keep-minutes` have passed, never on
+   * disk: an export of a sealed vault's page must not rest unencrypted. Its
+   * items' bytes are released for the file's. Other finished files are let
+   * go when all would hold more than `ngdpbase.export.engine.max-held-bytes`,
+   * the user's own first.
+   */
+  private keepExportFile(runId: string, bytes: Buffer, settings: ExportRunSettings): void {
+    const held = this.exportRuns.get(runId);
+    if (!held) return;
+    delete held.pendingBytes;
+    held.file = bytes;
+    held.timer = setTimeout(() => this.dropExportRun(runId), settings.keepMinutes * 60_000);
+    held.timer.unref();
+    this.letFilesGo(held.report.username, settings.maxHeldBytes, runId);
+  }
+
+  /** Let finished files go, `username`'s own first, until all held bytes are at most `limit`. */
+  private letFilesGo(username: string, limit: number, except?: string): void {
+    let total = this.heldExportBytes();
+    for (const id of this.finishedExportRuns(username)) {
+      if (total <= limit) break;
+      const file = this.exportRuns.get(id)?.file;
+      if (!file || id === except) continue;
+      total -= file.length;
+      this.dropExportRun(id);
+    }
+  }
+
+  /** Every byte exports hold: made files, and the items of runs not yet made. */
+  private heldExportBytes(): number {
+    return [...this.exportRuns.values()].reduce((sum, r) => sum + (r.file?.length ?? r.pendingBytes ?? 0), 0);
+  }
+
+  /**
+   * The runs that may be let go, in the order they are: done or failed only,
+   * `username`'s own oldest first, then everyone else's oldest first, so one
+   * user's exports push out their own before anyone else's (#2120).
+   */
+  private finishedExportRuns(username: string): string[] {
+    const finished = [...this.exportRuns].filter(([, r]) => !isInFlight(r.report));
+    return [
+      ...finished.filter(([, r]) => r.report.username === username),
+      ...finished.filter(([, r]) => r.report.username !== username)
+    ].map(([id]) => id);
+  }
+
+  private dropExportRun(runId: string): void {
+    const held = this.exportRuns.get(runId);
+    if (held?.timer) clearTimeout(held.timer);
+    this.exportRuns.delete(runId);
+  }
+
+  /**
+   * The settings for a run of `chain`. A records-to-CSV export (the chain ends
+   * in `core.csv-file`) has no row or size limit (#2408): `max-items` and
+   * `max-bytes` are for pages, files and searches. Its column limit stays,
+   * checked by the shim, with the most cells a table may have (`csv-max-cells`,
+   * #2410). This is the one place the two are told apart.
+   */
+  private exportLimitsFor(chain: readonly RegisteredShim[]): ExportRunSettings {
+    const settings = this.exportSettings();
+    return chain[chain.length - 1]?.id === CSV_FILE_SHIM_ID
+      ? { ...settings, maxItems: Number.POSITIVE_INFINITY, maxBytes: Number.POSITIVE_INFINITY }
+      : settings;
+  }
+
+  /** `ngdpbase.export.engine.*`: every limit an export applies is configuration (the chain's length is import's). */
+  private exportSettings(): ExportRunSettings {
+    return {
+      maxBytes: this.numberSetting('ngdpbase.export.engine.max-bytes', 26_214_400),
+      maxItems: this.numberSetting('ngdpbase.export.engine.max-items', 200),
+      maxChainDepth: this.numberSetting('ngdpbase.import.engine.max-chain-depth', 5),
+      keepMinutes: this.numberSetting('ngdpbase.export.engine.keep-minutes', 30),
+      maxHeldBytes: this.numberSetting('ngdpbase.export.engine.max-held-bytes', 268_435_456),
+      maxKeptRuns: this.numberSetting('ngdpbase.export.engine.max-kept-runs', 100),
+      maxQueuedPerUser: this.numberSetting('ngdpbase.export.engine.max-queued-per-user', 3)
+    };
+  }
+
+  private exportManager(): ExportManager {
+    const exportManager = this.engine.getManager<ExportManager>('ExportManager');
+    if (!exportManager) throw new Error('ExportManager unavailable — cannot export');
+    return exportManager;
   }
 
   /**
@@ -742,7 +1247,7 @@ class ImportManager extends BaseManager {
     if (request.scope !== undefined && (typeof request.scope !== 'string' || !request.scope)) {
       throw new Error('ImportManager: a request scope is a non-empty string');
     }
-    return boundScope(request.receiver, await this.scopeOwner(ctx), request.scope);
+    return boundScope(request.receiver, await this.scopeOwner(ctx), request.target, request.scope);
   }
 
   /**
@@ -770,6 +1275,7 @@ class ImportManager extends BaseManager {
     const report: IceRunReport = {
       runId: uuidv4(),
       receiver: request.receiver,
+      ...(request.target !== undefined ? { target: request.target } : {}),
       scope,
       username: ctx.username,
       state: 'queued',
@@ -796,6 +1302,10 @@ class ImportManager extends BaseManager {
         ? `[ImportManager] ICE run ${report.runId} failed (${errorClassOf(err)})`
         : `[ImportManager] ICE run ${report.runId} failed: ${report.error}`);
       return report;
+    } finally {
+      for (const key of this.storeHoldings.keys()) if (key.startsWith(`${report.runId}\0`)) this.storeHoldings.delete(key);
+      for (const key of this.storeRestoring.keys()) if (key.startsWith(`${report.runId}\0`)) this.storeRestoring.delete(key);
+      for (const key of this.storeRestored.keys()) if (key.startsWith(`${report.runId}\0`)) this.storeRestored.delete(key);
     }
   }
 
@@ -817,7 +1327,7 @@ class ImportManager extends BaseManager {
 
   /**
    * Hand the queue to the background job. One job run drains every queued
-   * import, each under its own context. A job run that has finished draining
+   * import and export, each under its own context. A job run that has finished draining
    * but is not yet marked done answers `enqueue` with its old run id; then
    * try again shortly, so nothing queued is stranded.
    */
@@ -825,15 +1335,15 @@ class ImportManager extends BaseManager {
     if (this.iceDraining) return;
     const jobs = this.engine.getManager<BackgroundJobManager>('BackgroundJobManager');
     if (typeof jobs?.enqueue !== 'function' || typeof jobs.registerJob !== 'function') {
-      throw new Error('ImportManager.enqueueImport: BackgroundJobManager unavailable');
+      throw new Error('ImportManager: BackgroundJobManager unavailable');
     }
     if (!jobs.getRegisteredJobIds().includes(ICE_JOB_ID)) {
       jobs.registerJob({
         id: ICE_JOB_ID,
-        displayName: 'Import (ICE engine)',
+        displayName: 'Import and export (ICE engine)',
         // An import must not be repeated unchecked after a restart (#1746).
         persist: false,
-        // Each job run takes only the imports of the person it runs as, so its
+        // Each job run takes only the work of the person it runs as, so its
         // record names who the work was for (P1); the next person's get a job
         // run of their own.
         run: async (_progress, jobCtx) => {
@@ -845,7 +1355,7 @@ class ImportManager extends BaseManager {
               break;
             }
             const [next] = this.iceQueue.splice(at, 1);
-            await this.executeRun(next.request, next.ctx, next.report);
+            await next.run();
             done++;
           }
           const waiting = this.iceQueue[0];
@@ -854,7 +1364,7 @@ class ImportManager extends BaseManager {
               this.kickIceQueue(waiting.ctx).catch((err: unknown) => logger.error('[ImportManager] ICE queue could not be handed to its job:', err));
             }, 0).unref();
           }
-          return { success: true, summary: `${done} import run(s)` };
+          return { success: true, summary: `${done} import or export run(s)` };
         }
       });
     }
@@ -997,6 +1507,112 @@ class ImportManager extends BaseManager {
   }
 
   /**
+   * `page-export` for this page (#2120). For a page in a vault, asked about
+   * the page as the route door asks it (`hasPermissionOn`, #1539): the
+   * container rule, then the capability with the page's vault, so a
+   * site-wide role does not reach in. For any other page, the capability.
+   * An affordance asks whether it is held (no step-up); the door whether it
+   * is permitted, and a refusal to someone who holds it is step-up's.
+   */
+  private async mayExportPage(ctx: ActorContext, pageName: string, affordance: true): Promise<boolean>;
+  private async mayExportPage(ctx: ActorContext, pageName: string, affordance: false): Promise<'permit' | 'step-up' | 'refuse'>;
+  private async mayExportPage(ctx: ActorContext, pageName: string, affordance: boolean): Promise<boolean | 'permit' | 'step-up' | 'refuse'> {
+    const pdp = this.engine.getManager<PolicyDecisionPoint>('PolicyDecisionPoint');
+    const vault = parsePrivatePageName(pageName);
+    const where = vault ? { owner: vault.owner, vault: vault.store, resource: pageName } : null;
+    const holds = (): Promise<boolean> => (where ? holdsInVault(pdp, ctx, 'page-export', where)
+      : typeof pdp?.holds === 'function' ? pdp.holds(ctx, 'page-export') : Promise.resolve(false));
+    if (affordance) return holds();
+    if (await (where ? permitsInVault(pdp, ctx, 'page-export', where) : this.permits(ctx, 'page-export'))) return 'permit';
+    return await holds() ? 'step-up' : 'refuse';
+  }
+
+  /**
+   * `core.search` as an export source: a search's pages and files as one zip
+   * ({@link searchExportSource}). Like a page, a search is offered to a user
+   * who holds `page-export`, and read as the user who asked, each page and
+   * file by its own read check. Recorded as one `page-export` of the search.
+   */
+  private searchExportSource(): IceExportSource {
+    const source = searchExportSource({
+      engine: this.engine,
+      limits: () => this.exportSettings(),
+      offered: (ctx) => this.mayExportPage(ctx, '', true),
+      mayExportPage: async (ctx, pageName) => (await this.mayExportPage(ctx, pageName, false)) === 'permit',
+      allowed: async (ctx) => {
+        const may = await this.mayExportPage(ctx, '', false);
+        if (may === 'step-up') throw new IceExportNeedsFreshSignIn('page-export');
+        return may === 'permit';
+      },
+      permits: (ctx, permission) => this.permits(ctx, permission)
+    });
+    return {
+      ...source,
+      recordExport: async (_ref: string, ctx: ActorContext, outcome): Promise<void> => {
+        const who = actorOf(ctx);
+        await recordAuditEvent(this.engine.getManager<AuditEventSink>('AuditManager'), {
+          eventType: AUDIT_EVENT.PAGE_EXPORT,
+          ...who,
+          action: 'page-export',
+          result: outcome.result,
+          severity: ctx.viaToken ? 'medium' : 'low',
+          resource: 'search',
+          resourceType: 'search',
+          ...(outcome.reason ? { reason: outcome.reason } : {}),
+          metadata: { ...who.metadata, count: outcome.count, items: outcome.items, format: outcome.format, runId: outcome.runId }
+        }, (err) => logger.warn('[ImportManager] the search-export audit record failed:', err));
+      }
+    };
+  }
+
+  /**
+   * `core.pages` as an export source (#2120, D5: pages export checks
+   * `page-export`). A page is offered for export when its reader may see it
+   * and holds `page-export` (affordances, recording nothing). Reading it
+   * for export asks `page-export` ({@link mayExportPage}), then reads through the page
+   * door (`readPage`), which decides `page-read` on the page and records a
+   * refusal. The export is recorded as `page-export`, with the format and
+   * the run, once the run has ended: a success only when the file was made.
+   */
+  private pagesExportSource(): IceExportSource {
+    return {
+      name: 'pages',
+      label: 'Pages',
+      yields: 'ncm',
+      mayExport: async (ref: string, ctx: ActorContext): Promise<boolean> => {
+        const pdp = this.engine.getManager<PolicyDecisionPoint>('PolicyDecisionPoint');
+        const pageManager = this.engine.getManager<PageManager>('PageManager');
+        if (typeof pdp?.holds !== 'function' || typeof pageManager?.mayShowPage !== 'function') return false;
+        return await this.mayExportPage(ctx, ref, true) && await pageManager.mayShowPage(ref, ctx);
+      },
+      read: async (ref: string, ctx: ActorContext): Promise<IceItem[] | null> => {
+        const may = await this.mayExportPage(ctx, ref, false);
+        if (may === 'step-up') throw new IceExportNeedsFreshSignIn('page-export');
+        if (may !== 'permit') return null;
+        const pageManager = this.engine.getManager<PageManager>('PageManager');
+        if (typeof pageManager?.readPage !== 'function') return null;
+        const read = await pageManager.readPage(ref, ctx);
+        if (!read.ok) return null;
+        return [pageItem(read.name, read.value.content, read.metadata)];
+      },
+      recordExport: async (ref: string, ctx: ActorContext, outcome): Promise<void> => {
+        const who = actorOf(ctx);
+        await recordAuditEvent(this.engine.getManager<AuditEventSink>('AuditManager'), {
+          eventType: AUDIT_EVENT.PAGE_EXPORT,
+          ...who,
+          action: 'page-export',
+          result: outcome.result,
+          severity: ctx.viaToken ? 'medium' : 'low',
+          resource: outcome.items[0] ?? ref,
+          resourceType: 'page',
+          ...(outcome.reason ? { reason: outcome.reason } : {}),
+          metadata: { ...who.metadata, pageName: outcome.items[0] ?? ref, format: outcome.format, runId: outcome.runId }
+        }, (err) => logger.warn('[ImportManager] the page-export audit record failed:', err));
+      }
+    };
+  }
+
+  /**
    * `core.files` (D4): a file into the public place through FileManager's
    * write door, `put` (#2149), which asks `asset-upload` itself and vets the
    * file. Also where a kept original goes (D11) when the chosen receiver does
@@ -1055,6 +1671,375 @@ class ImportManager extends BaseManager {
         }
       }
     };
+  }
+
+  /**
+   * `core.private-store` (#2118): a takeout (#1387) handed back into one of
+   * its owner's own private stores, read by the shim `core.takeout`. It
+   * replaced the takeout import's own door (#1472, retired in #2187). Each page goes through
+   * PageManager's save door and each file through FileManager's write door
+   * (`put`), the doors an edit and an upload use, so a sealed store
+   * encrypts on write with no new crypto.
+   *
+   * - No new permission (D5): the rule the takeout import always had, the
+   *   `account-security` permission and the user's own private container.
+   * - Its places (`targets`) are the user's own stores this context can
+   *   write now: those on disk and the default one, an encrypted one only
+   *   while it is unlocked in this session.
+   * - Its writes may be sealed (`writesEncrypted`): the engine runs an
+   *   upload into it in the request, with the request's key, and an import
+   *   into it is confidential (#2110): no file or page name is logged.
+   * - Importing the same takeout again leaves the store as the first import
+   *   did (operator, 2026-09-25), except that a page or a file deleted since
+   *   comes back (operator, 2026-10-30; #2171). The engine skips a file it
+   *   already took (fingerprints), but a page with a uuid and a file are read
+   *   again (`rechecks`): the uuid check below decides for a page, and for a
+   *   file whether the store still holds its bytes (`ownStoreFingerprints`, read once a run),
+   *   so one still held is `duplicate` and not put again (no second upload
+   *   record). On a first import the file door returns a file the store
+   *   already holds. A page whose uuid the store holds is `duplicate`: unchanged, or
+   *   changed since the download, and then the page here is kept. A uuid
+   *   used elsewhere on the site is `duplicate`, the page named only when
+   *   the user may view it. A title held by a DIFFERENT page lands beside
+   *   it as `Title (imported)`.
+   * - The original is the file itself: none is kept or cited (D11), as for `core.files`.
+   * - The run is recorded as one act, `store-import`, with counts only, and
+   *   kept as a report page in the store, sealed when the store is (operator,
+   *   2026-09-25 and 2026-10-30): see {@link keepRunReport}.
+   */
+  private privateStoreReceiver(): IceReceiver {
+    return {
+      name: 'private-store',
+      label: 'Your private store, from a download of it',
+      accepts: [TAKEOUT_KIND],
+      originals: { allowed: ['none'] },
+      writesEncrypted: true,
+      // A zip the store held is one of its files: brought back as it was, not unpacked.
+      innerZipsAsFiles: true,
+      // A takeout keeps the limits the old takeout import had: its own settings, next to the engine's.
+      limits: () => ({
+        maxZipEntries: this.numberSetting('ngdpbase.import.engine.takeout-zip-max-entries', 65_534),
+        maxZipBytes: this.numberSetting('ngdpbase.import.engine.takeout-zip-max-bytes', 268_435_456),
+        maxFileBytes: this.numberSetting('ngdpbase.import.engine.takeout-max-file-bytes', 268_435_456)
+      }),
+      // A page by its uuid, a file by its bytes, not the fingerprint: one deleted since an earlier import comes back.
+      rechecks: (item) => { const data = item.data as TakeoutData | undefined; return data?.entry === 'file' || (data?.entry === 'page' && !!data.uuid); },
+      mayUse: (ctx) => this.mayImportIntoOwnStore(ctx),
+      targets: async (ctx) => (await this.ownStoresWritable(ctx)).map(id => ({ id, label: id })),
+      receive: (item, ctx, info) => this.receiveTakeoutEntry(item, ctx, info),
+      runDone: async (ctx, report) => {
+        // #2188: a file stored under a new id: the store remembers it, and the store's pages that link
+        // an id it had and that now opens nothing are pointed at it.
+        const restoring = await this.storeRestoring.get(`${report.runId}\0${report.target ?? ''}`)?.catch(() => undefined);
+        const renumbered = restoring?.renumbered ?? new Map<string, string>();
+        if (renumbered.size > 0) {
+          await this.engine.getManager<AttachmentManager>('AttachmentManager')?.noteOwnStoreRenumbered(ctx, report.target ?? '', renumbered).catch((err: unknown) => {
+            logger.warn(`[ImportManager] the new ids of run ${report.runId} could not be kept for the next import (${errorClassOf(err)})`);
+          });
+        }
+        const relinked = restoring && restoring.relink.size > 0
+          ? await this.relinkStorePages(ctx, report.target ?? '', restoring.relink).catch((err: unknown) => {
+            logger.warn(`[ImportManager] the links of run ${report.runId} could not be pointed at its renumbered files (${errorClassOf(err)})`);
+            return { relinked: [], failed: [] };
+          })
+          : { relinked: [], failed: [] };
+        // A failure here costs the report page, never the import or its audit record.
+        const unlinked = await this.keepRunReport(ctx, report).catch((err: unknown) => {
+          logger.warn(`[ImportManager] the import report for run ${report.runId} could not be kept (${errorClassOf(err)})`);
+          return 0;
+        });
+        await this.recordStoreImport(ctx, report, unlinked, { renumbered, ...relinked });
+      },
+      // #2110: a page the user may read, by PageManager's own read decision. A file's id is not linked.
+      linkFor: async (ref: string, ctx: ActorContext): Promise<string | null> => {
+        const pageManager = this.engine.getManager<PageManager>('PageManager');
+        if (!ref.includes('/') || typeof pageManager?.mayShowPage !== 'function') return null;
+        return await pageManager.mayShowPage(ref, ctx) ? pageUrl(ref) : null;
+      }
+    };
+  }
+
+  /** The takeout import's rule, unchanged (#1472): `account-security`, and only into the user's own container. */
+  private async mayImportIntoOwnStore(ctx: ActorContext): Promise<boolean> {
+    if (!ctx?.username || !mayActInPrivateContainer(ctx, ctx.username)) return false;
+    return this.permits(ctx, 'account-security');
+  }
+
+  /** Where the private-store receiver writes, from configuration. */
+  private privateStoreSetup(): { pageManager: PageManager; configManager: ConfigurationManager; pagesDirectory: string; layout: PrivateStoreLayout } {
+    const pageManager = this.engine.getManager<PageManager>('PageManager');
+    const configManager = this.engine.getManager<ConfigurationManager>('ConfigurationManager');
+    const pagesDirectory = configManager?.getResolvedDataPath?.('ngdpbase.page.provider.filesystem.storagedir', './data/pages');
+    if (!pageManager || !configManager || !pagesDirectory) {
+      throw new Error('ImportManager: page or configuration manager unavailable — cannot import into a private store');
+    }
+    const layout = privateStoreLayoutFromConfig((key, fallback) => configManager.getProperty(key, fallback));
+    return { pageManager, configManager, pagesDirectory, layout };
+  }
+
+  /**
+   * The user's own stores this context can write now (#2118): each store on
+   * disk and the default one, which a user on a new site has before they
+   * wrote anything; an encrypted one only while unlocked in this session.
+   * Making a store is its own door (#1414): an encrypted one needs keys.
+   */
+  private async ownStoresWritable(ctx: ActorContext): Promise<string[]> {
+    if (!await this.mayImportIntoOwnStore(ctx)) return [];
+    const { pageManager, pagesDirectory, layout } = this.privateStoreSetup();
+    const owner = ctx.username;
+    const out: string[] = [];
+    for (const store of new Set([layout.defaultStoreId, ...await pageManager.listOwnStoreIds(ctx)])) {
+      if (!isValidStoreId(store)) continue;
+      try {
+        await assertContextCanWriteStore(ctx, { pagesDirectory, owner, store, layout });
+        out.push(store);
+      } catch {
+        // Encrypted and locked in this session: not offered until unlocked.
+      }
+    }
+    return out;
+  }
+
+  /**
+   * One page or file of a takeout into the store `info.target` (#2118, as
+   * #1472 did). A file through FileManager's `put`; a page after the files
+   * it links to, its links pointed at their ids here, through PageManager's
+   * save door. Nothing here logs a page's or a file's name (#1461, #2110).
+   */
+  private async receiveTakeoutEntry(item: IceItem, ctx: ActorContext, info: ReceiveInfo): Promise<ReceiveOutcome> {
+    const store = info.target;
+    if (!store || !isValidStoreId(store)) return { status: 'refused', message: 'No store was named.' };
+    if (!await this.mayImportIntoOwnStore(ctx)) return { status: 'refused', message: 'Only the owner can import into their store.' };
+    // The door's own check, not only the engine's: one of the user's stores this context can write now.
+    if (!(await this.ownStoresWritable(ctx)).includes(store)) return { status: 'refused', message: 'That is not one of your stores you can write now.' };
+    const files = this.engine.getManager<FileManager>('FileManager');
+    const attachments = this.engine.getManager<AttachmentManager>('AttachmentManager');
+    if (!files || !attachments) throw new Error('FileManager or AttachmentManager unavailable — cannot store a file');
+    const owner = ctx.username;
+    const place: FilePlace = { kind: 'vault', owner, vault: store };
+    // #2171: read again after an earlier import, a file the store still holds is not put again: no second upload record.
+    // The store's index is read once a run, and learns each file this run puts.
+    const holdings = async (): Promise<Map<string, string> | null> => {
+      if (!info.rechecked) return null;
+      const key = `${info.runId}\0${store}`;
+      let held = this.storeHoldings.get(key);
+      if (!held) {
+        held = attachments.ownStoreFingerprints(ctx, store);
+        this.storeHoldings.set(key, held);
+        held.catch(() => this.storeHoldings.delete(key));
+      }
+      return held;
+    };
+    const heldAgain = async (bytes: Buffer): Promise<string | null> => (await holdings())?.get(fingerprint(bytes)) ?? null;
+    // #2171: a file this run put back, deleted since an earlier import. A page linking it may put it back
+    // before the run reads the file itself, which then reports it restored, not unchanged.
+    const restoredKey = `${info.runId}\0${store}`;
+    const restored = (): Set<string> => {
+      let set = this.storeRestored.get(restoredKey);
+      if (!set) this.storeRestored.set(restoredKey, set = new Set<string>());
+      return set;
+    };
+    // #2188: what a run needs to give a file back an id it had, read once a run and store: the ids the
+    // site's files hold, and the ids this store gave files of a takeout that could not keep their own.
+    const restoring = (): Promise<StoreRestoring> => {
+      const key = `${info.runId}\0${store}`;
+      let state = this.storeRestoring.get(key);
+      if (!state) {
+        state = (async () => ({
+          held: await attachments.heldFileIds(),
+          lastIds: await attachments.ownStoreRenumbered(ctx, store) ?? new Map<string, string>(),
+          renumbered: new Map<string, string>(),
+          relink: new Map<string, string>()
+        }))();
+        this.storeRestoring.set(key, state);
+        state.catch(() => this.storeRestoring.delete(key));
+      }
+      return state;
+    };
+    // #2188: a file keeps the id this store last gave it, or else the id it had in the takeout, when no
+    // file holds it now, so a page linking either finds it. When neither is free it gets a new one: the
+    // store remembers it for the next import, and a re-import's end points the store's pages at it.
+    const put = async (bytes: Buffer, name: string, mimeType: string | undefined, description: string | undefined, oldId: string | undefined): Promise<string | undefined> => {
+      const state = oldId ? await restoring() : null;
+      const lastId = oldId ? state?.lastIds.get(oldId) : undefined;
+      const tried = oldId ? [...new Set([lastId ?? oldId, oldId])] : [];
+      const stored = await files.put(
+        ctx, place,
+        { bytes, info: { originalName: name, mimeType: mimeType || mediaTypeByExtension(name), size: bytes.length } },
+        { description: description ?? '', ...(state ? { restoreIds: tried, heldIds: state.held } : {}) }
+      );
+      if (stored.identifier) (await holdings())?.set(fingerprint(bytes), stored.identifier);
+      if (stored.identifier && info.rechecked) restored().add(fingerprint(bytes));
+      if (state && oldId && stored.identifier && stored.identifier !== (lastId ?? oldId)) {
+        state.renumbered.set(oldId, stored.identifier);
+        if (info.rechecked) for (const id of tried) if (id !== stored.identifier) state.relink.set(id, stored.identifier);
+      }
+      return stored.identifier;
+    };
+    const data = item.data as TakeoutData | undefined;
+
+    try {
+      if (data?.entry === 'file') {
+        const bytes = item.bytes ?? Buffer.alloc(0);
+        const held = await heldAgain(bytes);
+        if (held && restored().has(fingerprint(bytes))) return { status: 'stored', ref: held, message: TAKEOUT_FILE_RESTORED };
+        if (held) return { status: 'duplicate', ref: held };
+        const id = await put(bytes, data.name, data.encodingFormat || item.mediaType, data.description, data.oldId);
+        return { status: 'stored', ...(id ? { ref: id } : {}), ...(info.rechecked ? { message: TAKEOUT_FILE_RESTORED } : {}) };
+      }
+      if (data?.entry !== 'page') return { status: 'refused', message: 'Neither a page nor a file of a takeout.' };
+
+      // The files the page links to first, so its links can be pointed at them.
+      const ids = new Map<string, string>();
+      for (const linked of data.files) {
+        const bytes = item.archive?.read(linked.path);
+        if (!bytes) continue;
+        const id = await heldAgain(bytes) ?? await put(bytes, linked.name, linked.encodingFormat, linked.description, linked.oldId);
+        if (id) ids.set(linked.oldId, id);
+      }
+      return await this.saveTakeoutPage(rewriteAttachmentLinks(item.text ?? '', ids), data, store, ctx);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (/permission denied/i.test(message)) return { status: 'refused', message };
+      throw err;
+    }
+  }
+
+  /**
+   * Point every page of the user's store `store` that links a file by an id
+   * in `ids` at the file's id now (#2188), through the page door. Only an id
+   * no store of the user's holds is repointed: a link that opens their own
+   * file, say one that moved to another of their stores keeping its id, is
+   * left. An id held only by the shared pool or someone else's store is not
+   * the page's file, so it is repointed.
+   * A page that cannot be saved is passed over and named in `failed`; the
+   * rest are still done. Pages are named by uuid, never by title.
+   */
+  private async relinkStorePages(ctx: ActorContext, store: string, ids: ReadonlyMap<string, string>): Promise<{ relinked: string[]; failed: string[] }> {
+    const { pageManager } = this.privateStoreSetup();
+    const attachments = this.engine.getManager<AttachmentManager>('AttachmentManager');
+    const broken = new Map<string, string>();
+    for (const [from, to] of ids) if (!await attachments?.isOwnPrivateStoreFile(from, ctx)) broken.set(from, to);
+    const relinked: string[] = [];
+    const failed: string[] = [];
+    if (broken.size === 0) return { relinked, failed };
+    for (const { name } of await pageManager.listVaultPages(ctx, ctx.username, store)) {
+      let uuid = '';
+      try {
+        const page = await pageManager.getPage(name, ctx);
+        if (!page) continue;
+        uuid = typeof page.metadata?.uuid === 'string' ? page.metadata.uuid : '';
+        const body = rewriteAttachmentLinks(page.content ?? '', broken);
+        if (body === (page.content ?? '')) continue;
+        await pageManager.savePage(name, body, page.metadata ?? {}, ctx);
+        relinked.push(uuid);
+      } catch (err) {
+        failed.push(uuid);
+        logger.warn(`[ImportManager] a page (${uuid || 'no uuid'}) could not be pointed at its renumbered files (${errorClassOf(err)})`);
+      }
+    }
+    return { relinked, failed };
+  }
+
+  /** A takeout's page into the store, as #1472 decided: see {@link privateStoreReceiver}. */
+  private async saveTakeoutPage(body: string, page: Extract<TakeoutData, { entry: 'page' }>, store: string, ctx: ActorContext): Promise<ReceiveOutcome> {
+    const { pageManager, configManager } = this.privateStoreSetup();
+    const owner = ctx.username;
+    const nameIn = (s: string, key: string): string => formatPrivatePageName(owner, s, key);
+
+    if (page.uuid) {
+      const here = await pageManager.getPage(nameIn(store, page.uuid), ctx);
+      if (here) {
+        const same = (here.content ?? '').trim() === body.trim();
+        // Named, so the run's report can read which files it links to.
+        return { status: 'duplicate', ref: nameIn(store, page.uuid), message: same ? TAKEOUT_PAGE_UNCHANGED : TAKEOUT_PAGE_CHANGED };
+      }
+      const ownStores = await pageManager.listOwnStoreIds(ctx);
+      const elsewhere = await this.whereUuidLives(pageManager, ctx, page.uuid, ownStores.filter(s => s !== store), nameIn);
+      if (elsewhere) {
+        return { status: 'duplicate', message: `${TAKEOUT_PAGE_ELSEWHERE}${elsewhere.where ? ` as ${elsewhere.where}` : ' elsewhere'}; not imported` };
+      }
+    }
+
+    // #1503: only an administrator sets a page's system-category. Anyone
+    // else's imported page is the system-category whose vault this store is.
+    const storeCategory = systemCategoryVaults(configManager.getProperty('ngdpbase.system-category', null))
+      .find((v) => v.vaultId === store)?.key;
+    const categoryForWrite = await pageManager.systemCategoryForWrite(ctx, page.metadata['system-category'], null, storeCategory);
+    if (!categoryForWrite.ok) return { status: 'refused', message: categoryForWrite.reason };
+
+    const title = await freeImportTitle(page.title, async (t) => !!await pageManager.getPage(nameIn(store, t), ctx));
+    const metadata: Record<string, unknown> = {
+      ...page.metadata, title, private: true, store,
+      ...(categoryForWrite.category ? { 'system-category': categoryForWrite.category } : {})
+    };
+    for (const key of Object.keys(metadata)) {
+      if (metadata[key] === undefined) delete metadata[key];
+    }
+    const saved = await pageManager.savePage(nameIn(store, title), body, metadata, ctx, { normaliseTitle: true });
+    return {
+      status: 'stored', ref: saved.name,
+      ...(title !== page.title ? { message: `a page here already had its title, so it was imported as "${title}"` } : {})
+    };
+  }
+
+  /**
+   * The run as one act (#1472's `store-import`): who, which store, and how
+   * each file went, as counts. Never a page's or a file's name (#1461); each
+   * file's own record is its door's (`asset-upload`, a sealed store's by id).
+   * The counts are `pagesImported`, `pagesFailed`, `files`, `fileErrors`
+   * and the rest of the event's metadata, one shape for whatever reads it.
+   */
+  private async recordStoreImport(
+    ctx: ActorContext, report: IceRunReport, filesUnlinked: number,
+    relink: { renumbered: ReadonlyMap<string, string>; relinked: string[]; failed: string[] } = { renumbered: new Map(), relinked: [], failed: [] }
+  ): Promise<void> {
+    const sink = this.engine.getManager<AuditEventSink>('AuditManager');
+    const who = actorOf(ctx);
+    const owner = ctx.username;
+    const store = report.target ?? '';
+    const count = (status: string): number => report.files.filter(f => f.status === status).length;
+    const pages = report.files.filter(f => !isTakeoutFile(f) && f.status !== 'noise');
+    const files = report.files.filter(isTakeoutFile);
+    const pagesSaying = (start: string): number => pages.filter(p => p.status === 'duplicate' && p.message?.startsWith(start)).length;
+    const ownerId = await this.engine.getManager<IdentityManager>('IdentityManager')
+      ?.identityIdOf(systemContext(this.engine, 'record a takeout import: the owner identity @id (#2041)'), owner);
+    await recordAuditEvent(sink, {
+      eventType: AUDIT_EVENT.STORE_IMPORT,
+      ...who,
+      action: 'store-import',
+      // The import ran; what failed within it is counted below.
+      result: 'success',
+      severity: 'high',
+      resource: `private/${owner}/${store}`,
+      resourceType: 'private-store',
+      metadata: {
+        ...who.metadata,
+        owner: ownerId ?? owner,
+        ownerUser: owner,
+        store,
+        runId: report.runId,
+        // Unpacked: the engine does not hand on the archive's own size.
+        bytes: report.files.reduce((sum, f) => sum + f.size, 0),
+        pagesImported: pages.filter(p => p.status === 'imported').length,
+        pagesUnchanged: pages.filter(p => p.status === 'unchanged').length + pagesSaying(TAKEOUT_PAGE_UNCHANGED),
+        pagesChanged: pagesSaying(TAKEOUT_PAGE_CHANGED),
+        pagesElsewhere: pagesSaying(TAKEOUT_PAGE_ELSEWHERE),
+        pagesFailed: pages.filter(isFailedEntry).length,
+        files: files.filter(f => f.status === 'imported' || f.status === 'duplicate').length,
+        fileErrors: files.filter(isFailedEntry).length,
+        filesUnlinked,
+        // #2188: a file stored under a new id, both ids, and the pages pointed at it and those that could not be. Ids only, never a name.
+        ...(relink.renumbered.size > 0
+          ? {
+            filesRenumbered: [...relink.renumbered].filter(([from, to]) => from !== to).map(([from, to]) => ({ from, to })),
+            pagesRelinked: relink.relinked,
+            ...(relink.failed.length > 0 ? { pagesNotRelinked: relink.failed } : {})
+          }
+          : {}),
+        leftOut: count('noise')
+      }
+    }, (err) => logger.warn('[ImportManager] the store-import audit record failed:', err));
   }
 
   /**
@@ -1757,7 +2742,7 @@ class ImportManager extends BaseManager {
     try {
       parsedUrl = new URL(url);
     } catch {
-      throw new Error(`Invalid URL: ${url}`);
+      throw new UrlImportRefused('invalid-address', `Invalid URL: ${url}`);
     }
 
     // #1133: an exact allow-list, not startsWith('http') — which accepts
@@ -1765,7 +2750,7 @@ class ImportManager extends BaseManager {
     // schemes. guardedFetch checks this too; keeping it here preserves the
     // specific error an operator sees for a mistyped scheme.
     if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
-      throw new Error('Only HTTP and HTTPS URLs are supported');
+      throw new UrlImportRefused('not-web-address', 'Only HTTP and HTTPS URLs are supported');
     }
 
     // Fetch the page
@@ -1788,13 +2773,18 @@ class ImportManager extends BaseManager {
     });
 
     if (response.status < 200 || response.status >= 300) {
-      throw new Error(`Failed to fetch URL: HTTP ${response.status}`);
+      const message = `Failed to fetch URL: HTTP ${response.status}`;
+      // 404 and 403 are the site's answer about this address. A site that is down, gone or too busy (5xx, 410, 429) is
+      // not something to fix in the address either. Any other status is not one of these and gets the general sentence.
+      if (response.status === 404 || response.status === 403) throw new UrlImportRefused('not-found', message);
+      if (response.status >= 500 || response.status === 410 || response.status === 429) throw new UrlImportRefused('site-unavailable', message);
+      throw new Error(message);
     }
 
     const contentTypeHeader = response.headers['content-type'];
     const contentType = (Array.isArray(contentTypeHeader) ? contentTypeHeader[0] : contentTypeHeader) || '';
     if (!contentType.includes('text/html') && !contentType.includes('application/xhtml')) {
-      throw new Error(`URL did not return HTML content (got ${contentType})`);
+      throw new UrlImportRefused('not-a-page', `URL did not return HTML content (got ${contentType})`);
     }
 
     const html = response.body.toString('utf8');
@@ -2301,155 +3291,74 @@ class ImportManager extends BaseManager {
   }
 
   /**
-   * Import a takeout into one of the requester's OWN private stores (#1472).
+   * An engine run into `core.private-store` as the takeout report the old
+   * door keeps (code review of #2160, finding 3; operator, 2026-10-30), from
+   * the run's per-file status. Only a run that read a takeout keeps one.
+   * A file the run skipped as already imported is in neither count.
    *
-   * The mirror of `PageManager.buildOwnStoreTakeout`, and not `importPages`:
-   * that reads a directory on the server, so a decrypted takeout would have to
-   * be staged on disk, and it converts every page, which would rewrite bodies
-   * that are already this system's own markdown. Here the archive is read in
-   * memory and each page and file goes through the same doors an edit and an
-   * upload use, so a sealed store encrypts on write with no new crypto.
-   *
-   * Refused before anything is written — never a partial import — when the
-   * requester is not the owner, the store is not theirs, or it is encrypted
-   * and locked in this session.
-   *
-   * Idempotent (operator, 2026-09-25): importing the same takeout twice leaves
-   * the store as the first import did.
-   *
-   *   - Files first, so page links can be pointed at them. The store's upload
-   *     finds a file whose bytes it already holds and returns that one, so a
-   *     second import stores nothing new.
-   *   - A page whose uuid the target store already holds is skipped:
-   *     `unchanged` when its body matches, `changed-since-takeout` when not —
-   *     the live page wins.
-   *   - A page whose uuid is used elsewhere on the site is skipped as
-   *     `uuid-elsewhere`, naming the page only when the requester may view it.
-   *   - A title held by a DIFFERENT page lands beside it as `Title (imported)`.
-   *
-   * This is not a restore: a takeout carries no history and no trash.
-   *
-   * @param ctx - Who is importing; only into their own container
+   * @returns How many files no page links to
    */
-  async importOwnStoreTakeout(
-    ctx: ActorContext,
-    options: {
-      store: string;
-      archive: Buffer;
-      limits: ZipReadLimits;
-      /** The uploaded file's name, for the report page. */
-      sourceName?: string;
-    }
-  ): Promise<TakeoutImportReport> {
-    if (!ctx) throw new Error('ImportManager.importOwnStoreTakeout requires an ActorContext');
-    const owner = ctx.username;
-    if (!owner || !mayActInPrivateContainer(ctx, owner)) {
-      throw new TakeoutImportRefused('not-owner', 'Only the owner can import into their store.');
-    }
-
-    const pageManager = this.engine.getManager<PageManager>('PageManager');
-    const attachmentManager = this.engine.getManager<AttachmentManager>('AttachmentManager');
-    const configManager = this.engine.getManager<ConfigurationManager>('ConfigurationManager');
-    const pagesDirectory = configManager?.getResolvedDataPath?.('ngdpbase.page.provider.filesystem.storagedir', './data/pages');
-    if (!pageManager || !attachmentManager || !configManager || !pagesDirectory) {
-      throw new Error('ImportManager.importOwnStoreTakeout: page, attachment or configuration manager unavailable');
-    }
-    const layout = privateStoreLayoutFromConfig((key, fallback) => configManager.getProperty(key, fallback));
-
-    // Only a store that exists, or the default one every person has. Making a
-    // store is its own door (#1414): an encrypted one needs keys made for it.
-    const { store } = options;
-    const ownStores = await pageManager.listOwnStoreIds(ctx);
-    if (!isValidStoreId(store) || !(ownStores.includes(store) || store === layout.defaultStoreId)) {
-      throw new TakeoutImportRefused('no-such-store', 'You have no store of that name.');
-    }
-    try {
-      await assertContextCanWriteStore(ctx, { pagesDirectory, owner, store, layout });
-    } catch {
-      throw new TakeoutImportRefused('locked', 'That store is encrypted and locked in this session. Unlock it, then import again.');
-    }
-
-    let takeout;
-    try {
-      takeout = readTakeout(readZip(options.archive, options.limits));
-    } catch (err) {
-      throw new TakeoutImportRefused('unreadable', `That file could not be read as a takeout: ${(err as Error).message}`);
-    }
-
-    const report: TakeoutImportReport = {
-      store, pages: [], files: 0, fileErrors: [], unlinkedFiles: [], ignored: takeout.ignored
-    };
-
-    // ── Files ──────────────────────────────────────────────────────────────
-    const newIds = new Map<string, string>();
+  private async keepRunReport(ctx: ActorContext, run: IceRunReport): Promise<number> {
+    // A takeout's member is `{upload}/{path in the zip}`; an upload not read as a zip has no `/`.
+    const members = run.files.filter(f => f.name.includes('/'));
+    if (!run.target || members.length === 0) return 0;
+    const { pageManager } = this.privateStoreSetup();
+    const inZip = (f: IceFileReport): string => f.name.slice(f.name.indexOf('/') + 1);
+    const elsewhere = new RegExp(`^${TAKEOUT_PAGE_ELSEWHERE} as (.+); not imported$`);
+    const report: TakeoutImportReport = { store: run.target, pages: [], files: 0, fileErrors: [], unlinkedFiles: [], ignored: [] };
     const storedFiles: Array<{ name: string; id: string }> = [];
-    for (const file of takeout.files) {
-      try {
-        const stored = await attachmentManager.uploadAttachment(
-          file.bytes,
-          { originalName: file.name, mimeType: file.encodingFormat || mediaTypeByExtension(file.name), size: file.bytes.length },
-          ctx,
-          { private: true, store, description: file.description ?? '' }
-        );
-        if (file.oldId && stored.identifier) newIds.set(file.oldId, stored.identifier);
-        if (stored.identifier) storedFiles.push({ name: file.name, id: stored.identifier });
-        report.files++;
-      } catch (err) {
-        report.fileErrors.push({ name: file.name, message: (err as Error).message });
-      }
-    }
-
-    // ── Pages ──────────────────────────────────────────────────────────────
-    const nameIn = (s: string, key: string): string => formatPrivatePageName(owner, s, key);
-    // #1503: only an administrator sets a page's system-category. Anyone
-    // else's imported page is the system-category whose vault this store is.
-    const storeCategory = systemCategoryVaults(configManager.getProperty('ngdpbase.system-category', null))
-      .find((v) => v.vaultId === store)?.key;
-    // The bodies of this takeout's pages as they now stand in the store —
-    // what decides whether a file is linked from anything.
     const bodiesInStore: string[] = [];
-    for (const page of takeout.pages) {
-      try {
-        const body = rewriteAttachmentLinks(page.body, newIds);
-
-        if (page.uuid) {
-          const here = await pageManager.getPage(nameIn(store, page.uuid), ctx);
-          if (here) {
-            bodiesInStore.push(here.content ?? '');
-            report.pages.push({
-              title: page.title,
-              outcome: (here.content ?? '').trim() === body.trim() ? 'unchanged' : 'changed-since-takeout'
-            });
-            continue;
-          }
-          const elsewhere = await this.whereUuidLives(pageManager, ctx, page.uuid, ownStores.filter(s => s !== store), nameIn);
-          if (elsewhere) {
-            report.pages.push({ title: page.title, outcome: 'uuid-elsewhere', ...(elsewhere.where ? { where: elsewhere.where } : {}) });
-            continue;
-          }
-        }
-
-        const categoryForWrite = await pageManager.systemCategoryForWrite(ctx, page.metadata['system-category'], null, storeCategory);
-        if (!categoryForWrite.ok) {
-          report.pages.push({ title: page.title, outcome: 'failed', message: categoryForWrite.reason });
-          continue;
-        }
-        const title = await freeImportTitle(page.title, async (t) => !!await pageManager.getPage(nameIn(store, t), ctx));
-        const metadata: Record<string, unknown> = {
-          ...page.metadata, title, private: true, store,
-          ...(categoryForWrite.category ? { 'system-category': categoryForWrite.category } : {})
-        };
-        for (const key of Object.keys(metadata)) {
-          if (metadata[key] === undefined) delete metadata[key];
-        }
-        const saved = await pageManager.savePage(nameIn(store, title), body, metadata, ctx, { normaliseTitle: true });
-        bodiesInStore.push(body);
-        report.pages.push({ title: page.title, outcome: 'imported', importedAs: saved.name });
-      } catch (err) {
-        report.pages.push({ title: page.title, outcome: 'failed', message: (err as Error).message });
+    for (const f of members) {
+      if (f.status === 'noise') {
+        // The file index is read with the files it names (`core.takeout`), so it is not a file left out.
+        if (path.posix.basename(f.name) !== TAKEOUT_FILE_INDEX) report.ignored.push(inZip(f));
+        continue;
       }
+      const name = path.posix.basename(f.name);
+      if (isTakeoutFile(f)) {
+        if (isFailedEntry(f)) report.fileErrors.push({ name, message: f.message ?? f.status });
+        else if (f.status === 'imported' || f.status === 'duplicate') {
+          report.files++;
+          if (f.refs[0]) storedFiles.push({ name, id: f.refs[0] });
+        }
+        continue;
+      }
+      // A takeout names a page's file by its title.
+      const title = name.replace(/\.md$/i, '');
+      if (isFailedEntry(f)) {
+        report.pages.push({ title, outcome: 'failed', message: f.message ?? f.status });
+        continue;
+      }
+      const ref = f.refs[0];
+      if (ref) bodiesInStore.push((await pageManager.getPage(ref, ctx))?.content ?? '');
+      const where = f.message?.match(elsewhere)?.[1];
+      if (f.status === 'imported' && ref) report.pages.push({ title, outcome: 'imported', importedAs: ref });
+      else if (f.message === TAKEOUT_PAGE_CHANGED) report.pages.push({ title, outcome: 'changed-since-takeout' });
+      else if (f.message?.startsWith(TAKEOUT_PAGE_ELSEWHERE)) report.pages.push({ title, outcome: 'uuid-elsewhere', ...(where ? { where } : {}) });
+      else report.pages.push({ title, outcome: 'unchanged' });
     }
+    const sources = [...new Set(members.map(f => f.name.slice(0, f.name.indexOf('/'))))];
+    await this.keepTakeoutReport(ctx, report, storedFiles, bodiesInStore, sources.join(', '));
+    return report.unlinkedFiles.length;
+  }
 
+  /**
+   * A takeout import's report, kept (operator, 2026-09-25): which files no
+   * page now in the store links to, counted in the log, and a page in the
+   * store it is about, sealed exactly when the store is, so it can name what
+   * a log may not. A failure to save it costs the record, never the import.
+   */
+  private async keepTakeoutReport(
+    ctx: ActorContext,
+    report: TakeoutImportReport,
+    storedFiles: ReadonlyArray<{ name: string; id: string }>,
+    bodiesInStore: readonly string[],
+    sourceName?: string
+  ): Promise<void> {
+    const { pageManager } = this.privateStoreSetup();
+    const owner = ctx.username;
+    const { store } = report;
+    const nameIn = (s: string, key: string): string => formatPrivatePageName(owner, s, key);
     report.unlinkedFiles = storedFiles
       .filter(f => !bodiesInStore.some(b => linksToAttachment(b, f.id)))
       .map(f => f.name);
@@ -2459,25 +3368,20 @@ class ImportManager extends BaseManager {
       + `${report.pages.filter(p => p.outcome === 'imported').length} page(s), ${report.files} file(s)`
       + (report.unlinkedFiles.length ? `, ${report.unlinkedFiles.length} file(s) no page in the store links to` : ''));
 
-    // The report, kept (operator, 2026-09-25): a page in the store it is about,
-    // sealed exactly when the store is, so it can name what a log may not. A
-    // failure here costs the record, never the import.
     try {
       const when = new Date();
       const stamp = `${when.getFullYear()}-${String(when.getMonth() + 1).padStart(2, '0')}-${String(when.getDate()).padStart(2, '0')}`
         + ` ${when.toTimeString().slice(0, 8)}`;
       const title = await freeImportTitle(`${stamp}-import-report`, async (t) => !!await pageManager.getPage(nameIn(store, t), ctx));
-      const saved = await pageManager.savePage(
+      await pageManager.savePage(
         nameIn(store, title),
-        this.takeoutReportMarkdown(report, { owner, when, sourceName: options.sourceName }),
+        this.takeoutReportMarkdown(report, { owner, when, ...(sourceName ? { sourceName } : {}) }),
         { title, private: true, store },
         ctx
       );
-      report.reportPage = saved.name;
     } catch (err) {
       logger.warn(`[ImportManager] the import report for ${owner}'s store '${store}' could not be saved: ${(err as Error).message}`);
     }
-    return report;
   }
 
   /** The import report page's markdown. Private links are `[Title|store/Title]` (#1457). */

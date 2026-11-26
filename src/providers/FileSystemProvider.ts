@@ -1,4 +1,5 @@
 import BasePageProvider, { WikiEngine, ProviderInfo } from './BasePageProvider.js';
+import { PageTitleConflictError } from '../utils/pageTitleConflict.js';
 import type { ActorContext } from '../context/ActorContext.js';
 import {
   isPrivateStoreAttachmentsRel,
@@ -14,11 +15,12 @@ import {
   privateUserIndexPath,
   privateUserDir,
   resolvePrivateStoreLayout,
+  storePageIndexPath,
   type PrivatePageName
 } from '../utils/privateStorePath.js';
 import { collectUser, listPrivateOwners } from '../utils/privateStoreTakeout.js';
 import { kindIsSealed, storeDirectoryIsEncrypted } from '../utils/privateStoreMeta.js';
-import type { SavedPage, StoreFileLocation, StorePageEntry, PrivateStorePageRef } from '../types/Provider.js';
+import type { SavedPage, StoreFileLocation, StorePageEntry, PrivateStorePageRef, PrivateStorePageInfoList } from '../types/Provider.js';
 import {
   PLAIN_FILE_IO,
   storeFileIO,
@@ -850,7 +852,7 @@ class FileSystemProvider extends BasePageProvider {
     } else if (this.titleExistsForDifferentPage(finalTitle, uuid)) {
       const conflictKey = this.titleIndex.get(finalTitle.toLowerCase());
       const conflictInfo = conflictKey ? this.pageCache.get(conflictKey) : null;
-      throw new Error(`Title "${finalTitle}" is already in use by page ${conflictInfo?.uuid || 'unknown'}`);
+      throw new PageTitleConflictError(conflictInfo?.title || finalTitle, conflictInfo?.uuid || 'unknown', finalTitle);
     }
 
     // Check for duplicate UUID (different page already has this UUID)
@@ -1029,8 +1031,7 @@ class FileSystemProvider extends BasePageProvider {
     const now = {
       ...(outcome.author ? { author: outcome.author } : {}),
       ...(outcome.editor ? { editor: outcome.editor } : {}),
-      ...(outcome.audience ? { audience: outcome.audience } : {}),
-      ...(outcome.access ? { access: outcome.access } : {})
+      ...(outcome.audience ? { audience: outcome.audience } : {})
     };
 
     if (info.fromStore && this.pagesDirectory) {
@@ -1049,7 +1050,7 @@ class FileSystemProvider extends BasePageProvider {
       }
     } else {
       const cached = this.pageCache.get(info.title);
-      if (cached) cached.metadata = { ...cached.metadata, ...now } as PageFrontmatter;
+      if (cached) cached.metadata = { ...cached.metadata, ...now };
     }
     return {
       file: 'changed', uuid: info.uuid,
@@ -1063,7 +1064,7 @@ class FileSystemProvider extends BasePageProvider {
 
   /**
    * One page file's frontmatter `author` and `editor` through `convert`, and
-   * the entries of its `audience` and `access[action]` lists through
+   * the entries of its `audience` list through
    * `convertPrincipal` (#2097), rewritten line by line
    * ({@link rewriteFrontmatterFields}) and nothing else; the values it holds
    * afterwards. A file that is not there is `missing`; one whose lines cannot
@@ -1077,7 +1078,7 @@ class FileSystemProvider extends BasePageProvider {
   ): Promise<{
     file: 'changed' | 'unchanged' | 'refused' | 'missing';
     author?: string; editor?: string; category?: string; addon?: string;
-    audience?: string[]; access?: Record<string, unknown>;
+    audience?: string[];
   }> {
     let raw: string;
     try {
@@ -1100,18 +1101,13 @@ class FileSystemProvider extends BasePageProvider {
       now[field] = to;
       if (to !== stored) changes[field] = { from: stored, to };
     }
-    // The user entries of the access lists (#2097): a role or other kind is kept by `convertPrincipal`.
+    // The user entries of `audience` (#2097): a role or other kind is kept by `convertPrincipal`.
     const entries = new Map<string, string>();
-    if (convertPrincipal) {
-      const lists: unknown[] = [data.audience];
-      if (data.access && typeof data.access === 'object' && !Array.isArray(data.access)) lists.push(...Object.values(data.access as Record<string, unknown>));
-      for (const list of lists) {
-        if (!Array.isArray(list)) continue;
-        for (const entry of list) {
-          if (typeof entry !== 'string' || entries.has(entry)) continue;
-          const to = await convertPrincipal(entry);
-          if (to !== entry) entries.set(entry, to);
-        }
+    if (convertPrincipal && Array.isArray(data.audience)) {
+      for (const entry of data.audience) {
+        if (typeof entry !== 'string' || entries.has(entry)) continue;
+        const to = await convertPrincipal(entry);
+        if (to !== entry) entries.set(entry, to);
       }
     }
     if (Object.keys(changes).length === 0 && entries.size === 0) return { file: 'unchanged', ...now, ...origin };
@@ -1128,8 +1124,7 @@ class FileSystemProvider extends BasePageProvider {
     const written = parsePageFrontmatter(rewritten).data;
     return {
       file: 'changed', ...now, ...origin,
-      ...(Array.isArray(written.audience) ? { audience: written.audience as string[] } : {}),
-      ...(written.access && typeof written.access === 'object' ? { access: written.access as Record<string, unknown> } : {})
+      ...(Array.isArray(written.audience) ? { audience: written.audience as string[] } : {})
     };
   }
 
@@ -1266,6 +1261,49 @@ class FileSystemProvider extends BasePageProvider {
     const out: PrivateStorePageRef[] = [];
     for (const who of owner ? [owner] : await this.privateOwners()) {
       for (const pages of (await this.readablePrivateStores(who, ctx)).values()) out.push(...pages);
+    }
+    return out;
+  }
+
+  /**
+   * {@link listPrivateStorePages} with each page read for its frontmatter
+   * (#2514), for the upgrade clean-up. One vault whose index is damaged, one
+   * encrypted vault `ctx` holds no key for, or one page whose file cannot be
+   * read is counted in `unreadable` and skipped; the rest are still listed.
+   * Nothing is logged here: a page's name and path are the owner's.
+   *
+   * @param ctx - Whose reading this is (#1179)
+   * @param owner - One user's container, or every user's when omitted
+   */
+  async listPrivateStorePageInfo(ctx: ActorContext, owner?: string): Promise<PrivateStorePageInfoList> {
+    const out: PrivateStorePageInfoList = { pages: [], unreadable: 0 };
+    const pagesDirectory = this.pagesDirectory;
+    if (!pagesDirectory) return out;
+    for (const who of owner ? [owner] : await this.privateOwners()) {
+      for (const store of await this.storeIdsOf(who)) {
+        let pages: Record<string, StorePageEntry> | null;
+        try {
+          pages = this.readStorePagesSync(pagesDirectory, who, store, ctx);
+        } catch {
+          out.unreadable++;
+          continue;
+        }
+        if (pages === null) {
+          // No index at all is an empty vault; an index that cannot be opened is a closed one.
+          if (fs.existsSync(storePageIndexPath(pagesDirectory, who, store, this.privateStoreLayout))) out.unreadable++;
+          continue;
+        }
+        for (const entry of Object.values(pages)) {
+          const filePath = privatePageFilePath(pagesDirectory, who, entry.filename ?? entry.uuid, store, this.privateStoreLayout);
+          try {
+            const io = await this.fileIOFor(ctx, filePath);
+            const { data } = parsePageFrontmatter(await io.readText(filePath, this.encoding));
+            out.pages.push({ title: formatPrivatePageName(who, store, entry.title), uuid: entry.uuid, filePath, metadata: data });
+          } catch {
+            out.unreadable++;
+          }
+        }
+      }
     }
     return out;
   }

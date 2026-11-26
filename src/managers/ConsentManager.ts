@@ -55,6 +55,8 @@ import {
 export const CONSENT_DOCUMENTS_KEY = 'ngdpbase.consent.documents';
 const CONSENT_STORAGE_KEY = 'ngdpbase.consent.storagedir';
 const DEFAULT_DOCUMENTS = ['terms-of-service', 'privacy-policy'];
+/** Where a missing consent page is restored (#2354). */
+const SYNC_FIX = { fixUrl: '/admin/required-pages', fixLabel: 'Open Admin → Required Pages Sync' };
 
 /** Refused: not this person, not signed in themselves, or not allowed. Nothing was recorded. */
 export class ConsentRefusedError extends Error {
@@ -108,8 +110,9 @@ class ConsentManager extends BaseManager {
   private readonly addons = new Map<string, { documents: string[]; paths: string[] }>();
   /** Username → their records, read once and dropped on every write. */
   private readonly cache = new Map<string, ConsentRecord[]>();
-  /** Document id → why it cannot be asked for; the needs-attention reason is made from these. */
-  private readonly problems = new Map<string, string>();
+  /** Document id → why it cannot be asked for (the needs-attention reason is made from these), and whether it comes with an add-on (core's Required Pages Sync does not restore those). */
+  /** `setting`: the consent documents setting is part of the fix. `fix`: where in the app it is done (none for an add-on's page). */
+  private readonly problems = new Map<string, { text: string; setting: boolean; fix?: { fixUrl: string; fixLabel: string } }>();
   private attentionReason: string | null = null;
 
   constructor(engine: WikiEngine) {
@@ -225,16 +228,30 @@ class ConsentManager extends BaseManager {
       logger.warn(`[ConsentManager] could not read the page '${id}': ${(err as Error).message}`);
     }
     const whose = scope === CORE_CONSENT_SCOPE ? '' : ` (${scope})`;
+    const core = scope === CORE_CONSENT_SCOPE;
+    const addon = !core && !SUBJECT_CONSENT_SCOPES.includes(scope);
     if (!meta) {
-      const fix = SUBJECT_CONSENT_SCOPES.includes(scope)
-        ? 'Restore it (Admin → Required Pages Sync)'
-        : `Restore it (Admin → Required Pages Sync for core's) or remove it from ${scope === CORE_CONSENT_SCOPE ? CONSENT_DOCUMENTS_KEY : 'the add-on\'s registration'}`;
-      this.problems.set(id, `No '${id}' page${whose}: nobody is asked to accept it. ${fix}.`);
+      const fix = addon
+        ? 'It comes with an add-on; update or reinstall that add-on.'
+        : core
+          ? 'Restore it with Required Pages Sync, or remove it from the consent documents setting.'
+          : 'Restore it with Required Pages Sync.';
+      logger.warn(`[ConsentManager] No '${id}' page${whose}: nobody is asked to accept it. ${addon ? "Restore it (Admin → Required Pages Sync restores core's pages only; update or reinstall the add-on) or remove it from the add-on's registration" : core ? `Restore it (Admin → Required Pages Sync) or remove it from ${CONSENT_DOCUMENTS_KEY}` : 'Restore it (Admin → Required Pages Sync)'}`);
+      this.problems.set(id, { text: `The '${id}' page is missing, so nobody is asked to accept it. ${fix}`, setting: core, fix: addon ? undefined : SYNC_FIX });
       return null;
     }
     const version = versionOf(meta['version']);
     if (!version) {
-      this.problems.set(id, `The '${id}' page${whose} has no version: in its front matter, so nobody is asked to accept it.`);
+      logger.warn(`[ConsentManager] The '${id}' page${whose} has no version in its front matter, so nobody is asked to accept it. Add a version: to its front matter`);
+      const fix = addon
+        ? 'It comes with an add-on; update or reinstall that add-on.'
+        : core
+          ? 'Open this page in the raw editor and add the line version: 1 at the top, between the --- lines, so the site knows which version of the page people have accepted.'
+          : 'Restore it with Required Pages Sync.';
+      // #2385: the ordinary editor has no version field, and Required Pages Sync does not add one to a page the site already holds.
+      // Only the raw editor can set it. It needs the page-raw-edit permission; without it the editor opens read-only.
+      const edit = { fixUrl: `/admin/edit-raw/${encodeURIComponent(id)}`, fixLabel: `Open the '${id}' page in the raw editor` };
+      this.problems.set(id, { text: `The '${id}' page has no version number, so nobody is asked to accept it. ${fix}`, setting: false, fix: addon ? undefined : core ? edit : SYNC_FIX });
       return null;
     }
     this.problems.delete(id);
@@ -249,9 +266,13 @@ class ConsentManager extends BaseManager {
 
   /** Needs attention while any document cannot be asked for; ready again once none is (warn, never force). */
   private reportProblems(): void {
-    const reason = this.problems.size > 0 ? [...this.problems.values()].join(' ') : null;
+    const all = [...this.problems.values()];
+    const reason = all.length > 0 ? all.map((p) => p.text).join(' ') : null;
     if (reason === this.attentionReason) return;
-    if (reason) this.markNeedsAttention(reason, CONSENT_DOCUMENTS_KEY);
+    // A missing page is restored by Required Pages Sync and a core page with no version is edited; an add-on's are neither, so with only add-on problems there is no link.
+    // One link: the first problem's. Once it is fixed the next shows.
+    // The setting is named only when a core page is missing; the subject pages' documents are fixed, not configured.
+    if (reason) this.markNeedsAttention(reason, all.some((p) => p.setting) ? CONSENT_DOCUMENTS_KEY : undefined, all.find((p) => p.fix)?.fix ?? {});
     else if (this.attentionReason) this.markReadyIfDegradedBy(this.attentionReason);
     this.attentionReason = reason;
   }
@@ -281,6 +302,13 @@ class ConsentManager extends BaseManager {
     return created ? records.filter((r) => !r.account || r.account === created) : records;
   }
 
+  /** The acceptances still standing: each `accept` line with no later `withdraw` of the same document, version and subject. */
+  private async standingOf(username: string): Promise<ConsentRecord[]> {
+    const records = await this.recordsOf(username);
+    const same = (a: ConsentRecord, b: ConsentRecord): boolean => a.document === b.document && a.version === b.version && a.subject === b.subject;
+    return records.filter((r, i) => r.kind !== 'withdraw' && !records.slice(i + 1).some((w) => w.kind === 'withdraw' && same(w, r)));
+  }
+
   private async accountOf(username: string): Promise<{ username?: string; createdAt?: string; isActive?: boolean } | null> {
     return (await this.engine.getManager<AccountReader>('UserManager')?.getUser(username)) ?? null;
   }
@@ -300,7 +328,7 @@ class ConsentManager extends BaseManager {
     if (bound && !subject) return [];
     const docs = await this.documents(scope);
     if (docs.length === 0) return [];
-    const records = await this.recordsOf(username);
+    const records = await this.standingOf(username);
     return docs.filter((d) => !records.some((r) => r.document === d.id && r.version === d.version && (!bound || r.subject === subject)));
   }
 
@@ -310,7 +338,7 @@ class ConsentManager extends BaseManager {
    * (or none) and their latest of any version.
    */
   async statusFor(ctx: ActorContext): Promise<ConsentScopeStatus[]> {
-    const records = await this.recordsOf(ctx.username);
+    const records = await this.standingOf(ctx.username);
     const latestOf = (pred: (r: ConsentRecord) => boolean): ConsentRecord | null =>
       [...records].reverse().find(pred) ?? null;
     const out: ConsentScopeStatus[] = [];
@@ -407,6 +435,51 @@ class ConsentManager extends BaseManager {
       written.push(record);
     }
     if (written.length > 0) logger.info(`📜 [ConsentManager] ${ctx.username} accepted ${written.map((r) => `${r.document} v${r.version}`).join(', ')} (${how})`);
+    return written;
+  }
+
+  /**
+   * Withdraw `username`'s acceptances in `scope` about `subject` (#1523 slice
+   * 1c, Q5: a remembered browser is withdrawn by removing it). Recorded first
+   * as `consent-withdraw` (on-failure refuse: nothing is withdrawn), then a
+   * `withdraw` line is appended for each acceptance, so the history keeps
+   * both. Called by the code that removed the thing the acceptance was
+   * about, which has already decided the caller may; nothing to withdraw is
+   * not an error.
+   *
+   * @param why Why, for the record: `removed`, `expired`, `password-changed`
+   * @returns The `withdraw` lines written
+   */
+  async withdraw(username: string, scope: ConsentScope, subject: string, ctx: ActorContext, why: string): Promise<ConsentRecord[]> {
+    if (!this.provider || !subject) return [];
+    const standing = (await this.standingOf(username)).filter((r) => r.scope === scope && r.subject === subject);
+    if (standing.length === 0) return [];
+    const who = actorOf(ctx);
+    await recordAuditEvent(this.engine.getManager<AuditEventSink>('AuditManager'), {
+      eventType: AUDIT_EVENT.CONSENT_WITHDRAW,
+      ...who,
+      action: 'consent-withdraw',
+      result: 'success',
+      severity: 'low',
+      resource: username,
+      resourceType: 'account',
+      reason: why,
+      metadata: { ...who.metadata, account: username, scope, subject, accepted: standing.map((r) => ({ document: r.document, version: r.version, acceptedAt: r.acceptedAt })) }
+    });
+    const withdrawnAt = new Date().toISOString();
+    const written: ConsentRecord[] = [];
+    for (const r of standing) {
+      const line: ConsentRecord = {
+        ...r,
+        kind: 'withdraw',
+        withdrawnAt,
+        context: { by: ctx.username, how: why, origin: isJobContext(ctx) ? ctx.origin : 'request', ...(ctx.ipAddress ? { ipAddress: ctx.ipAddress } : {}) }
+      };
+      this.cache.delete(username);
+      await this.provider.append(username, line);
+      written.push(line);
+    }
+    logger.info(`📜 [ConsentManager] ${username} withdrew ${written.map((r) => `${r.document} v${r.version}`).join(', ')} in ${scope} (${why})`);
     return written;
   }
 

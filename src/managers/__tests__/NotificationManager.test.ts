@@ -2,6 +2,7 @@ import { fakeIdentityManager } from '../../test-support/identities';
 import { promises as fs } from 'fs';
 import path from 'path';
 import NotificationManager from '../NotificationManager';
+import { formatters as pluginFormatters } from '../PluginManager';
 import type { WikiEngine } from '../../types/WikiEngine';
 import { loggedText } from './__fixtures__/loggedText';
 
@@ -585,7 +586,7 @@ describe('NotificationManager', () => {
       const m = await managerWithIdentities(dir, IDS, opts);
       // Sabotage check: rethrowing in the conversion's catch stops initialize.
       expect((await saved(dir)).targetUsers).toEqual(['john']);
-      expect(m.getManagerStatus()).toMatchObject({ state: 'degraded', reason: expect.stringContaining('identity store unavailable, conversion postponed') });
+      expect(m.getManagerStatus()).toMatchObject({ state: 'degraded', reason: expect.stringMatching(/^Some notifications still name their recipients the old way.*Restart the site to try again\.$/) });
       const id = await m.createNotification({ title: 'still works', targetUsers: ['john'] });
       const stored = (m as unknown as { notifications: Map<string, { targetUsers: string[] }> }).notifications.get(id);
       expect(stored?.targetUsers).toEqual(['john']);
@@ -708,6 +709,61 @@ describe('NotificationManager', () => {
     });
   });
 
+  describe('removeByTitles (#2468)', () => {
+    const SLOW = 'MarkupParser Performance Alert: SLOW_PARSING';
+    const LOW = 'MarkupParser Performance Alert: LOW_CACHE_HIT_RATIO';
+    const past = () => new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+    test('removes only notifications whose whole title is one of those given, expired ones included', async () => {
+      await notificationManager.createNotification({ type: 'system', title: SLOW, message: 'a' });
+      await notificationManager.createNotification({ type: 'system', title: LOW, message: 'b', expiresAt: past() });
+      await notificationManager.createNotification({ type: 'maintenance', title: 'Maintenance tonight', message: 'c' });
+      await notificationManager.createNotification({ type: 'user', title: 'For you', message: 'd', targetUsers: ['testuser'] });
+      await notificationManager.createNotification({ type: 'system', title: `About ${SLOW}`, message: 'e' });
+      await notificationManager.createNotification({ type: 'system', title: `${SLOW} (copy)`, message: 'f' });
+      await notificationManager.createNotification({ type: 'system', title: 'MarkupParser Performance Alert: ', message: 'g' });
+      await notificationManager.createNotification({ type: 'system', title: 'MarkupParser Performance Alert: SOMETHING_ELSE', message: 'h' });
+
+      const removed = await notificationManager.removeByTitles([SLOW, LOW]);
+
+      expect(removed).toBe(2);
+      expect(notificationManager.getAllNotifications(true).map((n) => n.title).sort()).toEqual([
+        'About MarkupParser Performance Alert: SLOW_PARSING',
+        'For you',
+        'Maintenance tonight',
+        'MarkupParser Performance Alert: ',
+        'MarkupParser Performance Alert: SOMETHING_ELSE',
+        'MarkupParser Performance Alert: SLOW_PARSING (copy)'
+      ].sort());
+    });
+
+    test('an empty list, or an empty title in the list, throws and removes nothing', async () => {
+      await notificationManager.createNotification({ type: 'system', title: 'Keep me', message: 'x' });
+
+      await expect(notificationManager.removeByTitles([])).rejects.toThrow();
+      await expect(notificationManager.removeByTitles([''])).rejects.toThrow();
+
+      expect(notificationManager.getAllNotifications(true)).toHaveLength(1);
+    });
+
+    test('returns 0 and changes nothing when no title matches', async () => {
+      await notificationManager.createNotification({ type: 'system', title: 'Keep me', message: 'x' });
+
+      expect(await notificationManager.removeByTitles([SLOW])).toBe(0);
+      expect(notificationManager.getAllNotifications(true)).toHaveLength(1);
+    });
+
+    test('the saved file no longer holds the removed notifications', async () => {
+      await notificationManager.createNotification({ type: 'system', title: SLOW, message: 'a' });
+      await notificationManager.createNotification({ type: 'system', title: 'Keep me', message: 'x' });
+
+      await notificationManager.removeByTitles([SLOW]);
+
+      const saved = JSON.parse(await fs.readFile(path.join(tempDir, 'notifications.json'), 'utf8')) as { notifications: Record<string, { title: string }> };
+      expect(Object.values(saved.notifications).map((n) => n.title)).toEqual(['Keep me']);
+    });
+  });
+
   describe('statistics', () => {
     test('should return correct statistics', async () => {
       const pastDate = new Date(Date.now() - 24 * 60 * 60 * 1000);
@@ -768,10 +824,13 @@ describe('NotificationManager', () => {
 // engine mocks without touching the shared beforeEach/afterEach above.
 // ---------------------------------------------------------------------------
 
+const DEFAULT_ROLE_PERMISSIONS: Record<string, string[]> = { admin: ['admin-system'] };
+
 function makeEscalationEngine({
   escalationEnabled = false,
   levels = ['error'],
-  recipientRole = 'admin',
+  // Which permissions each role grants; the PDP mock below answers from it.
+  rolePermissions = DEFAULT_ROLE_PERMISSIONS,
   mailEnabled = true,
   providerName = 'smtp',
   from = 'wiki@example.com',
@@ -786,7 +845,6 @@ function makeEscalationEngine({
       if (key === 'ngdpbase.notifications.auto-save-interval') return 60000;
       if (key === 'ngdpbase.notifications.escalation.enabled') return escalationEnabled;
       if (key === 'ngdpbase.notifications.escalation.levels') return levels;
-      if (key === 'ngdpbase.notifications.escalation.recipient-role') return recipientRole;
       return defaultValue;
     }),
     getResolvedDataPath: vi.fn((key, defaultValue) => {
@@ -803,7 +861,15 @@ function makeEscalationEngine({
   };
 
   const userManager = {
+    getUsers: vi.fn().mockResolvedValue(adminUsers),
     searchUsers: vi.fn().mockResolvedValue(adminUsers)
+  };
+
+  // Holders of a permission by what their roles grant, never by a role's name.
+  const pdp = {
+    usersHolding: vi.fn(async (action: string) => adminUsers
+      .filter(u => u.roles.some(r => (rolePermissions[r] ?? []).includes(action)))
+      .map(u => u.username))
   };
 
   return {
@@ -812,6 +878,8 @@ function makeEscalationEngine({
         if (name === 'ConfigurationManager') return configManager;
         if (name === 'EmailManager') return emailManager;
         if (name === 'UserManager') return userManager;
+        if (name === 'PolicyDecisionPoint') return pdp;
+        if (name === 'PluginManager') return { formatters: pluginFormatters };
         return undefined;
       })
     },
@@ -871,7 +939,6 @@ describe('NotificationManager — email escalation', () => {
     const loggerInstance = (mgr as any).logger;
     expect(loggerInstance.info).toHaveBeenCalledWith(
       expect.stringContaining('Email escalation active'),
-      expect.anything(),
       expect.anything()
     );
     await mgr.shutdown();
@@ -926,6 +993,83 @@ describe('NotificationManager — email escalation', () => {
     expect(sendTo).toHaveBeenCalledTimes(2);
     expect(sendTo).toHaveBeenCalledWith(expect.objectContaining({ origin: 'schedule' }), 'jim@example.com', expect.stringContaining('[ERROR]'), expect.any(String), expect.any(String));
     expect(sendTo).toHaveBeenCalledWith(expect.objectContaining({ origin: 'schedule' }), 'alice@example.com', expect.stringContaining('[ERROR]'), expect.any(String), expect.any(String));
+    await mgr.shutdown();
+  });
+
+  // #2196: the email goes to the people the notice goes to, holders of
+  // admin-system, whatever their roles are named.
+  test('an admin notice is emailed to holders of admin-system, not to the admin role', async () => {
+    const sendTo = vi.fn().mockResolvedValue(undefined);
+    const { engine, userManager } = makeEscalationEngine({
+      dataDir: tempDir,
+      escalationEnabled: true,
+      sendTo,
+      rolePermissions: { operator: ['admin-system'], admin: ['page-read'] },
+      adminUsers: [
+        { username: 'olga', email: 'olga@example.com', roles: ['operator'] },
+        { username: 'jim', email: 'jim@example.com', roles: ['admin'] }
+      ]
+    });
+    const mgr = new NotificationManager(engine as any);
+    await mgr.initialize({});
+
+    const id = await mgr.notifyAdmins({ level: 'error', title: 'Disk full', message: 'Storage at 100%' });
+    await vi.waitFor(() => expect(sendTo).toHaveBeenCalled());
+    await new Promise(r => setTimeout(r, 20));
+
+    expect(mgr.getAllNotifications().find(n => n.id === id)?.targetUsers).toEqual(['olga']);
+    expect(sendTo).toHaveBeenCalledTimes(1);
+    expect(sendTo).toHaveBeenCalledWith(expect.anything(), 'olga@example.com', expect.any(String), expect.any(String), expect.any(String));
+    expect(sendTo).not.toHaveBeenCalledWith(expect.anything(), 'jim@example.com', expect.anything(), expect.anything(), expect.anything());
+    expect(userManager.searchUsers).not.toHaveBeenCalled();
+    await mgr.shutdown();
+  });
+
+  test('an inactive holder of admin-system is not emailed', async () => {
+    const sendTo = vi.fn().mockResolvedValue(undefined);
+    const { engine } = makeEscalationEngine({
+      dataDir: tempDir,
+      escalationEnabled: true,
+      sendTo,
+      adminUsers: [
+        { username: 'jim', email: 'jim@example.com', roles: ['admin'] },
+        { username: 'gone', email: 'gone@example.com', roles: ['admin'], isActive: false } as { username: string; email: string; roles: string[] }
+      ]
+    });
+    const mgr = new NotificationManager(engine as any);
+    await mgr.initialize({});
+
+    await mgr.createNotification({ level: 'error', title: 'Disk full', message: 'Storage at 100%' });
+    await vi.waitFor(() => expect(sendTo).toHaveBeenCalled());
+    await new Promise(r => setTimeout(r, 20));
+
+    expect(sendTo).toHaveBeenCalledTimes(1);
+    expect(sendTo).toHaveBeenCalledWith(expect.anything(), 'jim@example.com', expect.any(String), expect.any(String), expect.any(String));
+    await mgr.shutdown();
+  });
+
+  test('the HTML email escapes the title and message and keeps one path per line (#2191)', async () => {
+    const sendTo = vi.fn().mockResolvedValue(undefined);
+    const { engine } = makeEscalationEngine({
+      dataDir: tempDir,
+      escalationEnabled: true,
+      sendTo,
+      adminUsers: [{ username: 'jim', email: 'jim@example.com', roles: ['admin'] }]
+    });
+    const mgr = new NotificationManager(engine as any);
+    await mgr.initialize({});
+
+    const evil = '<a href="https://evil.example/login">Sign in to fix dates</a>.jpg';
+    await mgr.createNotification({ level: 'error', title: `Bad <b>${evil}`, message: `Files:\n\na/one.jpg\n${evil}\nand 3 more` });
+    await new Promise(r => setTimeout(r, 20));
+
+    const [, , , text, html] = sendTo.mock.calls[0] as unknown as [unknown, string, string, string, string];
+    expect(html).not.toContain('<a href');
+    expect(html).not.toContain('<b>');
+    expect(html).toContain('&lt;a href=&quot;https://evil.example/login&quot;&gt;');
+    expect(html).toContain('a/one.jpg<br>&lt;a href');
+    expect(html).toContain('<br>and 3 more');
+    expect(text).toContain(evil);
     await mgr.shutdown();
   });
 
@@ -1007,7 +1151,9 @@ describe('NotificationManager — email escalation', () => {
 
     expect(sendTo).toHaveBeenCalledTimes(2);
     const text = loggedText((mgr as any).logger);
-    expect(text).not.toContain('550');
+    // The SMTP error text, not the bare code: the temp dir name carries
+    // Date.now(), which can contain "550" and is logged with the storage path.
+    expect(text).not.toContain('Recipient address rejected');
     expect(text).not.toContain('jim@example.com');
     expect(text).not.toContain('alice@example.com');
     expect(text).toContain('Escalation email sent to alice (an address at example.com)');

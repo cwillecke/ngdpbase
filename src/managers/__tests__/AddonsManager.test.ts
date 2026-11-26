@@ -1097,7 +1097,21 @@ describe('AddonsManager', () => {
       // #1037: seeded content is shipped by the addon, not user input, so it
       // must bypass save-time validation — startup cannot depend on a content
       // rule aimed at page authors.
-      expect(pageManager.savePage).toHaveBeenCalledWith('Home', expect.stringContaining('Page content.'), expect.objectContaining({ uuid, addon: 'seed-addon' }), expect.objectContaining({ origin: 'boot' }), { skipValidation: true });
+      expect(pageManager.savePage).toHaveBeenCalledWith('Home', expect.stringContaining('Page content.'), expect.objectContaining({ uuid, addon: 'seed-addon' }), expect.objectContaining({ origin: 'boot' }), { skipValidation: true, shippedSeed: true, shippedAuthor: 'addon:seed-addon' });
+    });
+
+    test('#2389 slice 3: a seeded page carries the add-on\'s own version as its release label', async () => {
+      const uuid = '550e8400-e29b-41d4-a716-446655440002';
+      await makeAddonWithSeedPages('seed-addon', [
+        { filename: 'home.md', uuid, slug: 'home', title: 'Home' }
+      ]);
+
+      const configManager = makeConfigManager({ enabledAddons: ['seed-addon'] });
+      const pageManager = makePageManager();
+      const manager = new AddonsManager(makeEngineWithPageManager(configManager, pageManager));
+      await manager.initialize();
+
+      expect(pageManager.savePage).toHaveBeenCalledWith('Home', expect.any(String), expect.objectContaining({ uuid, 'addon-source-release': '1.0.0' }), expect.anything(), expect.anything());
     });
 
     test('#908 B1: skips re-seed when UUID already exists under a different slug', async () => {
@@ -1114,9 +1128,7 @@ describe('AddonsManager', () => {
       const pageManager = makePageManager(
         [],                                            // no slug match
         {},
-        // `access` present so the #971 backfill is a no-op — this case is about
-        // UUID collision detection, not access stamping.
-        { [uuid]: { title: 'About', uuid, metadata: { slug: 'about', access: { edit: ['admin'] } } } } // UUID already in use
+        { [uuid]: { title: 'About', uuid, metadata: { slug: 'about' } } } // UUID already in use
       );
       const manager = new AddonsManager(makeEngineWithPageManager(configManager, pageManager));
       await manager.initialize();
@@ -1130,17 +1142,13 @@ describe('AddonsManager', () => {
     const RESEED_UUID = '550e8400-e29b-41d4-a716-4466554400aa';
     // storedHashBody: pass null to simulate a LEGACY page (seeded before #920,
     // no addon-source-hash stamp).
-    const setupReseed = async ({ sourceBody, pageBody, storedHashBody, pageReseed }) => {
+    const setupReseed = async ({ sourceBody, pageBody, storedHashBody, pageReseed, release = null }) => {
       await makeAddonWithSeedPages('reseed-addon', [
         { filename: 'about.md', uuid: RESEED_UUID, slug: 'about', title: 'About', body: sourceBody }
       ]);
-      // `access` present so the #971 backfill is a no-op here: these cases are
-      // about RESEED behaviour (does addon content overwrite the page?), and a
-      // metadata-only backfill save would muddy the "savePage never called"
-      // assertions without testing anything they exist to test. Backfill has
-      // its own coverage in AddonsManager-AccessStamp.test.ts.
-      const metadata = { slug: 'about', uuid: RESEED_UUID, access: { edit: ['admin'] } };
+      const metadata = { slug: 'about', uuid: RESEED_UUID };
       if (storedHashBody !== null) metadata['addon-source-hash'] = bodyHash(storedHashBody);
+      if (release !== null) metadata['addon-source-release'] = release;
       const existingPage = { title: 'About', uuid: RESEED_UUID, content: pageBody, metadata };
       const configManager = makeConfigManager({ enabledAddons: ['reseed-addon'], pageReseed });
       const pageManager = makePageManager(['about'], { about: existingPage }, { [RESEED_UUID]: existingPage });
@@ -1149,57 +1157,54 @@ describe('AddonsManager', () => {
       return pageManager;
     };
 
-    test('#920: reseeds an unmodified page when source changed and reseed enabled', async () => {
-      const pm = await setupReseed({ sourceBody: 'New content v2', pageBody: 'Old content v1', storedHashBody: 'Old content v1', pageReseed: true });
-      expect(pm.savePage).toHaveBeenCalledWith(
-        'about',
-        expect.stringContaining('New content v2'),
-        expect.objectContaining({ 'addon-source-hash': bodyHash('New content v2') }),
-        expect.objectContaining({ origin: 'boot' }),
-        { skipValidation: true }
-      );
+    // #2389 (Q2): start-up never replaces the body of a page the site holds, with
+    // `page-reseed` on or off. Replacing is Required Pages Sync's job.
+    describe.each([true, false])('#2389 a changed source is not saved at start-up (page-reseed: %s)', (pageReseed) => {
+      test('an unedited page (stamp matches the live body)', async () => {
+        const pm = await setupReseed({ sourceBody: 'New content v2', pageBody: 'Old content v1', storedHashBody: 'Old content v1', pageReseed });
+        expect(pm.savePage).not.toHaveBeenCalled();
+      });
+
+      test('an edited page', async () => {
+        const pm = await setupReseed({ sourceBody: 'New content v2', pageBody: 'Operator edited this', storedHashBody: 'Old content v1', pageReseed });
+        expect(pm.savePage).not.toHaveBeenCalled();
+      });
+
+      test('a legacy page with no stamp', async () => {
+        const pm = await setupReseed({ sourceBody: 'New content v2', pageBody: 'Old content v1', storedHashBody: null, pageReseed });
+        expect(pm.savePage).not.toHaveBeenCalled();
+      });
     });
 
-    test('#920: does NOT reseed when the flag is off (default)', async () => {
-      const pm = await setupReseed({ sourceBody: 'New content v2', pageBody: 'Old content v1', storedHashBody: 'Old content v1', pageReseed: false });
+    test('#2389: a user-modified page whose text matches its stamp is not saved either', async () => {
+      await makeAddonWithSeedPages('reseed-addon', [
+        { filename: 'about.md', uuid: RESEED_UUID, slug: 'about', title: 'About', body: 'New content v2' }
+      ]);
+      const existingPage = {
+        title: 'About', uuid: RESEED_UUID, content: 'Old content v1',
+        metadata: { slug: 'about', uuid: RESEED_UUID, 'user-modified': true, 'addon-source-hash': bodyHash('Old content v1') }
+      };
+      const configManager = makeConfigManager({ enabledAddons: ['reseed-addon'], pageReseed: true });
+      const pm = makePageManager(['about'], { about: existingPage }, { [RESEED_UUID]: existingPage });
+      await new AddonsManager(makeEngineWithPageManager(configManager, pm)).initialize();
       expect(pm.savePage).not.toHaveBeenCalled();
     });
 
-    test('#920: skips reseed when the page was locally modified', async () => {
-      // Live content no longer matches the stored seed hash → operator-edited.
-      const pm = await setupReseed({ sourceBody: 'New content v2', pageBody: 'Operator edited this', storedHashBody: 'Old content v1', pageReseed: true });
-      expect(pm.savePage).not.toHaveBeenCalled();
-    });
+    test('#2389: page-reseed: true logs the retirement warning once; false logs nothing about it', async () => {
+      const warn = vi.spyOn(logger, 'warn');
+      await setupReseed({ sourceBody: 'New content v2', pageBody: 'Old content v1', storedHashBody: 'Old content v1', pageReseed: true });
+      const retired = warn.mock.calls.filter(([m]) => String(m).includes('page-reseed is retired'));
+      expect(retired).toHaveLength(1);
+      expect(String(retired[0][0])).toContain('Admin › Required Pages Sync');
 
-    test('#920: reseeds a LEGACY page (no source-hash) when source differs', async () => {
-      // Pre-#920 seed: no addon-source-hash. Addon-owned content the operator
-      // opted to sync → reseeded from source (revertable via version history).
-      const pm = await setupReseed({ sourceBody: 'New content v2', pageBody: 'Old content v1', storedHashBody: null, pageReseed: true });
-      expect(pm.savePage).toHaveBeenCalledWith(
-        'about',
-        expect.stringContaining('New content v2'),
-        expect.objectContaining({ 'addon-source-hash': bodyHash('New content v2') }),
-        expect.objectContaining({ origin: 'boot' }),
-        { skipValidation: true }
-      );
-    });
-
-    test('#920: legacy page that already matches source is not reseeded — #1408 only stamps it', async () => {
-      const pm = await setupReseed({ sourceBody: 'Same body', pageBody: 'Same body', storedHashBody: null, pageReseed: true });
-      expect(pm.savePage).toHaveBeenCalledTimes(1);
-      const [, content, meta, , options] = pm.savePage.mock.calls[0];
-      expect(content).toBe('Same body');
-      expect(meta['addon-source-hash']).toBe(bodyHash('Same body'));
-      expect(options).toMatchObject({ skipValidation: true, preserveLastModified: true });
-    });
-
-    test('#920: legacy page not reseeded when the flag is off', async () => {
-      const pm = await setupReseed({ sourceBody: 'New content v2', pageBody: 'Old content v1', storedHashBody: null, pageReseed: false });
-      expect(pm.savePage).not.toHaveBeenCalled();
+      warn.mockClear();
+      await setupReseed({ sourceBody: 'New content v2', pageBody: 'Old content v1', storedHashBody: 'Old content v1', pageReseed: false });
+      expect(warn.mock.calls.filter(([m]) => String(m).includes('page-reseed is retired'))).toHaveLength(0);
+      warn.mockRestore();
     });
 
     test('#920: no-op when the source is unchanged', async () => {
-      const pm = await setupReseed({ sourceBody: 'Same body', pageBody: 'Same body', storedHashBody: 'Same body', pageReseed: true });
+      const pm = await setupReseed({ sourceBody: 'Same body', pageBody: 'Same body', storedHashBody: 'Same body', pageReseed: true , release: '1.0.0' });
       expect(pm.savePage).not.toHaveBeenCalled();
     });
 
@@ -1217,8 +1222,8 @@ describe('AddonsManager', () => {
       await manager.initialize();
 
       expect(pageManager.savePage).toHaveBeenCalledTimes(2);
-      expect(pageManager.savePage).toHaveBeenCalledWith('Page 1', expect.any(String), expect.objectContaining({ uuid: uuid1 }), expect.objectContaining({ origin: 'boot' }), { skipValidation: true });
-      expect(pageManager.savePage).toHaveBeenCalledWith('Page 2', expect.any(String), expect.objectContaining({ uuid: uuid2 }), expect.objectContaining({ origin: 'boot' }), { skipValidation: true });
+      expect(pageManager.savePage).toHaveBeenCalledWith('Page 1', expect.any(String), expect.objectContaining({ uuid: uuid1 }), expect.objectContaining({ origin: 'boot' }), { skipValidation: true, shippedSeed: true, shippedAuthor: 'addon:multi-seed-addon' });
+      expect(pageManager.savePage).toHaveBeenCalledWith('Page 2', expect.any(String), expect.objectContaining({ uuid: uuid2 }), expect.objectContaining({ origin: 'boot' }), { skipValidation: true, shippedSeed: true, shippedAuthor: 'addon:multi-seed-addon' });
     });
 
     test('sets addon field on seeded pages', async () => {
@@ -1274,9 +1279,7 @@ describe('AddonsManager', () => {
 
       const configManager = makeConfigManager({ enabledAddons: ['idem-addon'] });
       // The site already holds this page (same uuid), edited by a user.
-      // `access` present so the #971 backfill is a no-op — this asserts that
-      // CONTENT is never overwritten, which the backfill does not do.
-      const edited = { content: 'existing content', metadata: { title: 'User Edited', slug: 'idem-home', 'system-category': 'addon', access: { edit: ['admin'] } } };
+      const edited = { content: 'existing content', metadata: { title: 'User Edited', slug: 'idem-home', 'system-category': 'addon' } };
       const pageManager = makePageManager(['idem-home'], { 'idem-home': edited }, { [uuid]: edited });
       const manager = new AddonsManager(makeEngineWithPageManager(configManager, pageManager));
       await manager.initialize();
@@ -1317,9 +1320,7 @@ describe('AddonsManager', () => {
       ]);
 
       const configManager = makeConfigManager({ enabledAddons: ['reindex-addon'] });
-      // `access` present so the #971 backfill is a no-op — this is about search
-      // re-indexing, not access stamping.
-      const existingPage = { content: 'existing content', metadata: { title: 'Test', 'system-category': 'addon', access: { edit: ['admin'] } } };
+      const existingPage = { content: 'existing content', metadata: { title: 'Test', 'system-category': 'addon' } };
       const pageManager = makePageManager(['reindex-page'], { 'reindex-page': existingPage }, { [uuid]: existingPage });
       const searchManager = makeSearchManager();
       const manager = new AddonsManager(makeEngineWithPageManager(configManager, pageManager, searchManager));

@@ -26,6 +26,7 @@ function makeManager(accounts: Array<Record<string, unknown>>) {
   };
   const pageManager = {
     pageExists: vi.fn(() => false),
+    getPageMetadata: vi.fn(() => Promise.resolve(null)),
     savePage: vi.fn(() => Promise.resolve(undefined)),
     deleteTestArtifacts: vi.fn(() => Promise.resolve({ deleted: [{ title: 'Profile: x', uuid: 'u' }], failed: [] }))
   };
@@ -65,10 +66,15 @@ describe('A test account\'s profile page (#2008)', () => {
     expect(metadata['system-keywords']).toEqual(['general']);
   });
 
-  test('is deleted with the test account, as the subject who deleted it', async () => {
+  test('is deleted with the test account by a system job, naming who deleted the account (#1815, decision 6)', async () => {
     const { manager, pageManager } = makeManager([account('e2e-ann', true)]);
     await manager.deleteUser('e2e-ann', ADMIN);
-    expect(pageManager.deleteTestArtifacts).toHaveBeenCalledWith(ADMIN, { author: 'e2e-ann', systemCategory: 'user-profile' });
+    expect(pageManager.deleteTestArtifacts).toHaveBeenCalledWith(
+      expect.objectContaining({ origin: 'boot', reason: expect.stringContaining(`user-delete by ${ADMIN.username}`) }),
+      { author: 'e2e-ann', systemCategory: 'user-profile' }
+    );
+    // A user admin's own context is not the one that deletes the page: it holds no page-delete.
+    expect(pageManager.deleteTestArtifacts.mock.calls[0][0]).not.toBe(ADMIN);
   });
 
   test('an ordinary account\'s profile is kept when the account is deleted', async () => {

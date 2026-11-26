@@ -11,7 +11,7 @@ import { hashPassword, verifyPassword } from '../utils/passwordHash.js';
 import LocaleUtils from '../utils/LocaleUtils.js';
 import { WikiEngine } from '../types/WikiEngine.js';
 import { UserProvider, ProviderInfo } from '../types/Provider.js';
-import { User, UserPreferences, UserSession } from '../types/User.js';
+import { SENSITIVE_USER_FIELDS, User, UserPreferences, UserSession } from '../types/User.js';
 import type ConfigurationManager from './ConfigurationManager.js';
 import type IdentityManager from './IdentityManager.js';
 import type OrganizationManager from './OrganizationManager.js';
@@ -48,7 +48,6 @@ import type NotificationManager from './NotificationManager.js';
 /** The role whose accounts never share an email (#2073, operator 2026-10-25). */
 const ADMIN_ROLE = 'admin';
 
-const SENSITIVE_USER_FIELDS = ['password', 'roles', 'isActive', 'isExternal', 'isTest', 'email', 'profileLocked', 'username'] as const;
 
 /**
  * An account record as UserManager hands it out: never the password hash, and
@@ -82,6 +81,12 @@ export interface AgentTokenGrant {
   id: string;
   name: string;
   scopes: string[];
+  /**
+   * The assurance level stored with the token when it was made (#2261): the
+   * level of the minting session at that moment, never higher. Absent on a
+   * token made before it was stored, which then has no `subject:aal`.
+   */
+  aal?: 1 | 2 | 3;
 }
 
 /**
@@ -203,6 +208,12 @@ export interface PermissionSubject {
    * account's cap, since it is the actor who signs in (#1762).
    */
   aalCap?: import('../providers/BaseAuthProvider.js').Aal;
+  /**
+   * Set by the bearer middleware on a subject authenticated by a JWT that
+   * records no sign-in level (Authentik, #2287): its `subject:aal` is missing,
+   * not AAL 1. Set from the verified result, never from a request field.
+   */
+  bearerWithoutLevel?: true;
 }
 
 /**
@@ -226,6 +237,8 @@ export interface JobSubject {
   viaProxy?: ProxyClaim;
   /** #1999: the scheduled job a run acts as (`JobContext.job`). */
   job?: string;
+  /** #2261: the level stored with the job's request (`JobContext.aal`); absent when it stored none. */
+  grantedAal?: 1 | 2 | 3;
 }
 
 
@@ -534,7 +547,8 @@ class UserManager extends BaseManager {
     if (this.sessionCookieWithheldReported) return;
     this.sessionCookieWithheldReported = true;
     logger.error(`🔐 ${SESSION_COOKIE_WITHHELD_MESSAGE}`);
-    if (this.markNeedsAttention(SESSION_COOKIE_WITHHELD_MESSAGE, 'ngdpbase.session.secure')) {
+    // #2354: the dashboard says it in plain words; the developer message stays in the log and the notification.
+    if (this.markNeedsAttention('Nobody can sign in over a plain http connection. Serve the site over https, or turn off secure cookies in the settings.', 'ngdpbase.session.secure')) {
       void this.engine.getManager<NotificationManager>('NotificationManager')?.notifyAdmins({
         level: 'error', title: 'Nobody can sign in over plain http', message: SESSION_COOKIE_WITHHELD_MESSAGE
       }).catch((err: unknown) => logger.warn('🔐 Could not post the session-cookie notification:', err));
@@ -931,11 +945,11 @@ class UserManager extends BaseManager {
   /**
    * Create a user page for a new user.
    *
-   * The page is written AS the new user (#1462): it is their page, and the
-   * door takes a new page's author from who is acting. Written as the admin
-   * who created the account — or as whoever ran self-registration — the
-   * profile would be authored by them, and `author-lock` would leave the
-   * account's own owner unable to edit it.
+   * The page is the new user's (#1462): they are its author. Authored by the
+   * admin who created the account — or by whoever ran self-registration —
+   * `author-lock` would leave the account's own owner unable to edit it.
+   * It is written by a system job through the write door (#1815), with the
+   * new user named as the one it is made for.
    *
    * @param {User} user - User object
    * @param ctx - Who created the account, for the log line only
@@ -962,6 +976,21 @@ class UserManager extends BaseManager {
       }
 
       const profileTitle = `Profile: ${user.displayName}`;
+      const job = systemContext(this.engine, `create the profile page of new account ${user.username} (#1815)`);
+
+      // #2255: an ordinary account's profile page outlives the account (#2008),
+      // so a new account with the same username finds it here. Theirs by
+      // author, it is kept as it is; one by anybody else is left alone. The
+      // system job only ever creates (security review M2), never edits.
+      const kept = await pageManager.getPageMetadata(profileTitle, job);
+      if (kept) {
+        if (kept.author === user.username) {
+          logger.info(`User page '${profileTitle}' already exists for ${user.username}; kept`);
+          return true;
+        }
+        logger.warn(`Cannot create the user page for ${user.username}: '${profileTitle}' already exists and is not theirs`);
+        return false;
+      }
 
       // Apply user page template with user data
       const populatedContent = templateManager.applyTemplate('user-page', {
@@ -995,15 +1024,18 @@ class UserManager extends BaseManager {
         metadata['system-keywords'] = [...current, 'test-artifact'];
       }
 
-      // The new account's own subject — never a rebuilt or ambient one (#1399).
+      // The page is the new account's: refused for one that is not active.
       const owner = await this.policyInformationPoint().subjectFor(user.username);
       if (!owner) {
         logger.warn(`Cannot create a user page for ${user.username}: the account is not active`);
         return false;
       }
 
-      // Save the user page, as its owner
-      await pageManager.savePage(profileTitle, populatedContent, metadata, owner, { skipValidation: true });
+      // #1815 (operator, 2026-11-04, decision 3): made by a system job,
+      // through the write door, whose `page-create` comes from policy — a new
+      // account is given no `page-create` of its own. The new user is its
+      // author (`createdFor`), so author-lock still leaves it to them.
+      await pageManager.savePage(profileTitle, populatedContent, metadata, job, { skipValidation: true, createdFor: user.username });
       logger.info(`✅ Created user page for ${user.displayName} by ${actorOf(ctx).user}`);
       return true;
     } catch (error) {
@@ -1500,9 +1532,13 @@ class UserManager extends BaseManager {
     // #2008: a test account's profile page goes with it; an ordinary
     // account's is kept (operator, 2026-10-23). Only pages stamped
     // test-artifact are reached. A failure is logged: the account is gone.
+    // #1815 (operator, 2026-11-04, decision 6): deleted by a system job,
+    // through the write door, now that `user-delete` has passed; a user admin
+    // is given no `page-delete` of their own. The reason names who asked.
     if (user.isTest === true) {
+      const job = systemContext(this.engine, `delete the profile page of test account ${username}, after user-delete by ${actorOf(ctx).user} (#2008, #1815)`);
       await this.engine.getManager<PageManager>('PageManager')
-        ?.deleteTestArtifacts(ctx, { author: username, systemCategory: 'user-profile' })
+        ?.deleteTestArtifacts(job, { author: username, systemCategory: 'user-profile' })
         .catch((err: unknown) => logger.error(`[UserManager] The profile page of test account ${username} was not deleted:`, err));
     }
 
@@ -1809,7 +1845,7 @@ class UserManager extends BaseManager {
       if (typeof session.username !== 'string' || session.username === '') continue;
       const reason = await which(session as Record<string, unknown> & { username: string });
       if (!reason) continue;
-      endSession(this.engine, session, reason, from);
+      endSession(this.engine, { ...session, id: sid }, reason, from);
       await store.destroy(sid);
       ended++;
     }

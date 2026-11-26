@@ -58,6 +58,9 @@ vi.mock('../../context/ApiContext', async () => ({
 // ── mock manager objects ──────────────────────────────────────────────────────
 
 const mockPageManager = {
+  // #1815: the door's affordances, asked of each referrer of a rename.
+  mayEditPage: vi.fn(async () => true),
+  mayShowPage: vi.fn(async () => true),
   getPage: vi.fn(),
   getPageContent: vi.fn(),
   getPageMetadata: vi.fn(),
@@ -260,6 +263,8 @@ const existingPageData = {
 
 function resetMocks() {
   mockPageManager.provider = null;
+  mockPageManager.mayEditPage.mockImplementation(async () => true);
+  mockPageManager.mayShowPage.mockImplementation(async () => true);
   mockPageManager.getPage.mockImplementation((name: string) => {
     if (['LeftMenu', 'Footer', 'left-menu-content', 'footer-content'].includes(name)) return Promise.resolve(null);
     return Promise.resolve({ ...existingPageData });
@@ -983,20 +988,18 @@ describe('WikiRoutes — coverage batch 15', () => {
       expect(mockPageManager.savePage).not.toHaveBeenCalled();
     });
 
-    test('#1504: moving a page out of its vault asks page-public for its system-category, and goes ahead when policy allows', async () => {
+    test('#1504: moving a page out of its vault asks page-public about the page, and goes ahead when policy allows', async () => {
       const res = await request(app)
         .post('/vaults/adminuser/default/TestPage/save')
         .set('x-csrf-token', 'test-csrf-token')
         .send({ content: '# Hello', title: 'TestPage', 'system-category': 'general', 'private-present': '1', private: 'false' });
       expect(res.status).toBe(302);
-      expect(mockPolicyDecisionPoint.decide).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.objectContaining({ action: 'page-public', attributes: { 'system-category': 'general' } })
-      );
+      // #2255: asked about the page (hasPermissionOn); the PDP reads its system-category from the PIP.
+      expect(mockPolicyDecisionPoint.permits).toHaveBeenCalledWith(expect.anything(), 'page-public');
     });
 
     test('#1504: moving a page out of its vault is refused when policy does not allow page-public for its system-category', async () => {
-      mockPolicyDecisionPoint.decide.mockResolvedValue({ permit: false, applicable: true, reason: 'test' });
+      mockPolicyDecisionPoint.permits.mockImplementation(async (_s: unknown, action: string) => action !== 'page-public');
       const res = await request(app)
         .post('/vaults/adminuser/default/TestPage/save')
         .set('x-csrf-token', 'test-csrf-token')
@@ -1018,6 +1021,22 @@ describe('WikiRoutes — coverage batch 15', () => {
       expect(res.headers.location).toBe('/view/Renamed%20Page');
       expect(rewrite).toHaveBeenCalledWith(expect.anything(), ['Alpha', 'Beta'], 'TestPage', 'Renamed Page');
       expectNoRouteIndexWork();
+      rewrite.mockRestore();
+    });
+
+    test('a rename leaves a referrer the renamer may not edit unchanged, and names it on the page (#1815)', async () => {
+      const rewrite = vi.spyOn(WikiRoutes.prototype as unknown as { rewriteInboundLinksAfterRename: () => Promise<void> }, 'rewriteInboundLinksAfterRename')
+        .mockResolvedValue(undefined);
+      mockPageManager.mayEditPage.mockImplementation(async (name: string) => name !== 'Beta');
+      mockPageManager.savePage.mockImplementation(async (name: string, content: string, metadata?: Record<string, unknown>) =>
+        doorSaveResult(name, content, metadata, { name: 'TestPage', referrers: ['Alpha', 'Beta'] }));
+      const res = await request(app)
+        .post('/save/TestPage')
+        .set('x-csrf-token', 'test-csrf-token')
+        .send({ content: '# Hello', title: 'Renamed Page', 'system-category': 'general' });
+      expect(res.status).toBe(302);
+      expect(res.headers.location).toBe('/view/Renamed%20Page?links-not-rewritten=Beta');
+      expect(rewrite).toHaveBeenCalledWith(expect.anything(), ['Alpha'], 'TestPage', 'Renamed Page');
       rewrite.mockRestore();
     });
 

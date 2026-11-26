@@ -291,6 +291,15 @@ export interface PrivatePageName {
  */
 export const SHARED_FOLDER_OWNER = 'shared-folders';
 
+/**
+ * Whether `id` has the shape a store gives a file (`crypto.randomUUID()`), so
+ * a takeout's file can be stored under it again (#2188). Anything else, a
+ * path or a pool's content hash among them, is never reused as a file name.
+ */
+export function isRestorableFileId(id: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id);
+}
+
 /** A shared folder page's name, and its URL without the leading slash: `shared/{folder}/{title}`. */
 export const SHARED_PAGE_NAME_PREFIX = 'shared/';
 
@@ -327,6 +336,23 @@ export function parsePrivatePageName(name: unknown): PrivatePageName | null {
   const [owner, store, title] = parts;
   if (!owner || !isSafePathSegment(owner) || isSharedFolderOwner(owner) || !isValidStoreId(store) || !title.trim()) return null;
   return { owner, store, title };
+}
+
+/**
+ * A page's name for a log line (#1461, #2118, #2178): a private page's title
+ * stays out of logs, so it goes by its uuid, from its `metadata` — with its
+ * owner and store when its name holds them, and as "uuid unknown" before it
+ * has one. A private page saved under its bare title (#1520) is known only by
+ * its `metadata`. A public page goes by its name, and its uuid when known.
+ * The audit record is not a log line: it keeps the page's name.
+ */
+export function nameForLog(pageName: string, metadata?: { private?: unknown; uuid?: unknown } | null): string {
+  const uuid = typeof metadata?.uuid === 'string' && metadata.uuid ? metadata.uuid : null;
+  const byUuid = `(uuid ${uuid ?? 'unknown'})`;
+  const vault = parsePrivatePageName(pageName);
+  if (vault) return `a page in ${vault.owner}'s store '${vault.store}' ${byUuid}`;
+  if (metadata?.private === true || metadata?.private === 'true') return `a private page ${byUuid}`;
+  return uuid ? `'${pageName}' ${byUuid}` : `'${pageName}'`;
 }
 
 /**

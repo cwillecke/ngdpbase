@@ -7,7 +7,7 @@
 
 /** Every permission core declares. Addons generate their own union. */
 export type CorePermission =
-  /** Change what protects your own account — password, email, sign-in methods (passkeys), vault takeout and import, approving a device (#1525). Granted wherever profile-manage is; asks for a fresh sign-in when listed in ngdpbase.auth.step-up */
+  /** Change what protects your own account — password, email, sign-in methods (passkeys), vault takeout and import, approving a device (#1525). Granted wherever profile-manage is; asks for a fresh sign-in, because the entry carries "step-up": true (#1638) */
   | 'account-security'
   /** View administration screens (read-only, no changes) */
   | 'admin-read'
@@ -27,7 +27,7 @@ export type CorePermission =
   | 'audit-export'
   /** Add a comment, and delete your own; deleting anyone's is admin-system (#1198) */
   | 'comment-create'
-  /** Change any configuration setting, and download a backup (#1525). Admin only by default; asks for a fresh sign-in when listed in ngdpbase.auth.step-up */
+  /** Change any configuration setting, and download a backup (#1525). Admin only by default; asks for a fresh sign-in, because the entry carries "step-up": true (#1638) */
   | 'config-manage'
   /** Open the Executive Hub (/executive): the organization's summary cards and the requests waiting for the board (#2093). Held by the executive role; deciding a request still needs that request's own permission */
   | 'executive-read'
@@ -37,6 +37,8 @@ export type CorePermission =
   | 'identity-read'
   /** Browse and view the media library (not delegated to anonymous visitors) */
   | 'media-read'
+  /** Set or change a page's system-category (#2255). A page created in a shared folder gets the shared category without it */
+  | 'page-categorize'
   /** Create new pages */
   | 'page-create'
   /** Delete pages */
@@ -57,11 +59,17 @@ export type CorePermission =
   | 'profile-manage'
   /** Let another person act for you, within permissions you hold, and revoke it (#1762). Every signed-in role except demo-admin; an administrator making or revoking a grant for someone else also needs user-edit, and that grant never carries a copy of the person's vault key. A grant that includes proxy-grant lets the proxy give others access too. Asks for a fresh sign-in */
   | 'proxy-grant'
+  /** Delete pushed pages (#2255) */
+  | 'pushed-pages-delete'
+  /** Edit pushed pages: pages shipped by the system or an add-on (the categories a policy grants it on; system, documentation and addon as shipped) (#2255) */
+  | 'pushed-pages-edit'
+  /** Rename pushed pages (#2255) */
+  | 'pushed-pages-rename'
   /** Search pages */
   | 'search-page'
   /** Search users */
   | 'search-user'
-  /** Unmask a configuration secret (#1525). Admin only by default; asks for a fresh sign-in when listed in ngdpbase.auth.step-up. Hashed credentials (agent tokens) and shown-once secrets can never be revealed */
+  /** Unmask a configuration secret (#1525). Admin only by default; asks for a fresh sign-in, because the entry carries "step-up": true (#1638). Hashed credentials (agent tokens) and shown-once secrets can never be revealed */
   | 'secret-reveal'
   /** End another person's signed-in session (#1638) */
   | 'session-revoke'
@@ -69,7 +77,9 @@ export type CorePermission =
   | 'share-create'
   /** Extend your own share links (#1638) */
   | 'share-extend'
-  /** Revoke your own share links; revoking anyone's also needs admin-system (#1638) */
+  /** See and revoke every user's share links, whoever made them. Revoking one is recorded as share-revoke; needs no fresh sign-in */
+  | 'share-manage-all'
+  /** Revoke share links through a token or proxy acting for the person who made them. A person at their own session needs no permission to revoke their own link. Revoking another user's link needs share-manage-all instead (#1638) */
   | 'share-revoke'
   /** Add, edit and delete pages and files in a shared folder (/shared/<name>, #2125). Scoped to one folder by the policy's resource (type shared-folder, pattern shared/<name>). The writes themselves are recorded by the page and file doors (page-create, page-edit, page-delete, asset-upload, asset-delete) */
   | 'shared-folder-file'
@@ -109,6 +119,7 @@ export const CORE_PERMISSIONS: readonly CorePermission[] = [
   'identity-manage',
   'identity-read',
   'media-read',
+  'page-categorize',
   'page-create',
   'page-delete',
   'page-edit',
@@ -119,12 +130,16 @@ export const CORE_PERMISSIONS: readonly CorePermission[] = [
   'page-rename',
   'profile-manage',
   'proxy-grant',
+  'pushed-pages-delete',
+  'pushed-pages-edit',
+  'pushed-pages-rename',
   'search-page',
   'search-user',
   'secret-reveal',
   'session-revoke',
   'share-create',
   'share-extend',
+  'share-manage-all',
   'share-revoke',
   'shared-folder-file',
   'shared-folder-read',

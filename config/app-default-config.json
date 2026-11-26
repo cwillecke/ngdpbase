@@ -2,7 +2,7 @@
   "ngdpbase.application-name": "ngdp-instance",
   "ngdpbase.favicon-path": "/favicon.svg",
   "ngdpbase.application.category": "Digital Platform",
-  "ngdpbase.version": "5.40.0",
+  "ngdpbase.version": "5.48.0",
   "ngdpbase.github.repo": "jwilleke/ngdpbase",
   "ngdpbase.application.base-url": "http://localhost:3000",
   "ngdpbase.encoding": "UTF-8",
@@ -41,7 +41,10 @@
     "ngdpbase.auth.google-oidc.client-secret": "secret",
     "ngdpbase.auth.oidc.providers": "sensitive",
     "ngdpbase.access.policies": "sensitive",
+    "ngdpbase.access.subject-attributes": "sensitive",
+    "ngdpbase.access.environment-attributes": "sensitive",
     "ngdpbase.backup.directory": "sensitive",
+    "ngdpbase.markup.performance.history.dir": "sensitive",
     "ngdpbase.backup.restore-manifest": "sensitive",
     "ngdpbase.auth.credentials.file": "sensitive",
     "ngdpbase.auth.agent-token.directory": "sensitive",
@@ -61,7 +64,8 @@
     "ngdpbase.auth.cloudflare-access.application-aud": "sensitive",
     "ngdpbase.addons.install": "sensitive",
     "ngdpbase.managers.addons-manager.install.registry": "sensitive",
-    "ngdpbase.managers.addons-manager.install.sigstore-tuf-url": "sensitive"
+    "ngdpbase.managers.addons-manager.install.sigstore-tuf-url": "sensitive",
+    "ngdpbase.vaults.admin-access": "sensitive"
   },
   "_comment_config_env_keys": "Config keys OWNED BY THE ENVIRONMENT, and the variable that supplies each (#1089). These are ALWAYS read-only on the Admin Configuration screen — not 'read-only while the variable happens to be set'. A conditional would make the UI the source of truth whenever the variable is unset, which is exactly the ambiguity this removes: a key is owned by one layer, never two. The value shipped for such a key in this file is a BOOT FALLBACK so a fresh install comes up; it is not a setting. To change one, set the variable in .env (root or <FAST_STORAGE>/.env) and restart — nothing in ngdpbase writes .env, by design, with these exceptions, each generated once and appended to <FAST_STORAGE>/.env when absent: NGDPBASE_SESSION_SECRET (#1194, src/bootstrap-env.ts), because the alternative was signing every session with the public literal shipped below; NGDPBASE_CREDENTIALS_KEY (#1524, src/bootstrap-env.ts), which signs every credentials-store row and encrypts TOTP seeds and has no config key at all; NGDPBASE_SHARED_FOLDERS_KEY (#2124, src/bootstrap-env.ts), the organization's key every shared folder's own key is wrapped under, with no config key either; and, only when oidc-auth-server.enabled is true, OIDC_AUTH_SERVER_JWKS and OIDC_AUTH_SERVER_COOKIE_KEYS (#1574, OidcManager), the embedded OpenID Connect provider's signing and cookie keys, read by that package from the environment only. A config screen that restarts the server is a different feature. Deliberately SHORT: a key earns a place only if the environment must be able to supply it in a deployment where NO config file exists — a fresh headless container boot onto an empty volume is the case that decides it. NOTE application.base-url may equally be set in app-custom-config.json (the install wizard writes it there); it is listed because docker-compose-traefik.yml composes it at deploy time and InstallService names the env var as the alternative for headless installs, so the environment must remain a valid source. Replaces a hardcoded map that used to live in ConfigurationManager.getProperty() where nothing could see it.",
   "ngdpbase.config.env-keys": {
@@ -95,7 +99,7 @@
   "ngdpbase.jobs.history-limit": 50,
   "_comment_jobs_checkpoints": "#1716 — the largest checkpoint a job may save with ctx.checkpoint(data), in bytes of JSON. A larger one throws to the job. A checkpoint is a bookmark (\"done through account 311\"), not storage for results.",
   "ngdpbase.jobs.max-checkpoint-bytes": 65536,
-  "_comment_import_engine": "#1979 ICE — the import engine's limits. noise: paths dropped before any shim sees them ('dir/' a directory segment, 'x*' / '*x' a name prefix or suffix, else an exact file name). zip-max-entries / zip-max-bytes: per archive, inflated. zip-max-depth: zips inside zips. max-file-bytes: one file. max-chain-depth: shims one file may pass through. default-original: cite | keep | none, when the person importing does not choose (D11). ledger-dir: fingerprints, per-file status and item keys, one file per scope. ledger-max-entries: per scope. max-kept-runs: run reports held in memory. upload-max-files / upload-max-bytes: what one upload on the /import screen may hold (#2021), files and total bytes, held in memory until the run; upload-max-bytes ships equal to zip-max-bytes so the screen never refuses a file the engine would take. recent-imports: files listed under 'Your recent imports' on /import, read from the ledger (#2110). fetch-max-bytes: the largest response a URL source may return, such as a feed fetched on its schedule (#2109). Each shim is switched with ngdpbase.import.shims.<shim id>.enabled (default true) and given ngdpbase.import.shims.<shim id>.options.",
+  "_comment_import_engine": "#1979 ICE — the import engine's limits. noise: paths dropped before any shim sees them ('dir/' a directory segment, 'x*' / '*x' a name prefix or suffix, else an exact file name). zip-max-entries: files, counted across the whole upload (every archive in it and the zips inside them); one archive over it is left out and reported, and several over it together refuse the whole upload. zip-max-bytes: inflated, counted across the whole upload the same way, each file's stated size and full name before it is unpacked, and over it the whole upload is refused. zip-max-depth: zips inside zips. max-file-bytes: one file. takeout-zip-max-entries / takeout-zip-max-bytes / takeout-max-file-bytes: the same three limits for a takeout handed back into a private store (#2187), set to what the old takeout import allowed (65,534 entries, 256 MB unpacked, 256 MB a file); every other import keeps the engine's (10,000 entries, 256 MB unpacked, 100 MB a file). max-chain-depth: shims one file may pass through. default-original: cite | keep | none, when the person importing does not choose (D11). ledger-dir: fingerprints, per-file status and item keys, one file per scope. ledger-max-entries: per scope. max-kept-runs: run reports held in memory. upload-max-files / upload-max-bytes: what one upload on the /import screen may hold (#2021), files and total bytes, held in memory until the run; upload-max-bytes ships equal to zip-max-bytes and takeout-zip-max-bytes so the screen never refuses a file the engine would take. recent-imports: files listed under 'Your recent imports' on /import, read from the ledger (#2110). fetch-max-bytes: the largest response a URL source may return, such as a feed fetched on its schedule (#2109). Each shim is switched with ngdpbase.import.shims.<shim id>.enabled (default true) and given ngdpbase.import.shims.<shim id>.options.",
   "ngdpbase.import.engine.noise": [
     "__MACOSX/",
     ".DS_Store",
@@ -107,6 +111,9 @@
   "ngdpbase.import.engine.zip-max-bytes": 268435456,
   "ngdpbase.import.engine.zip-max-depth": 3,
   "ngdpbase.import.engine.max-file-bytes": 104857600,
+  "ngdpbase.import.engine.takeout-zip-max-entries": 65534,
+  "ngdpbase.import.engine.takeout-zip-max-bytes": 268435456,
+  "ngdpbase.import.engine.takeout-max-file-bytes": 268435456,
   "ngdpbase.import.engine.max-chain-depth": 5,
   "ngdpbase.import.engine.default-original": "none",
   "ngdpbase.import.engine.ledger-dir": "${FAST_STORAGE}/import-ledger",
@@ -117,6 +124,17 @@
   "ngdpbase.import.engine.recent-imports": 25,
   "ngdpbase.import.engine.fetch-max-bytes": 8388608,
   "ngdpbase.import.engine.name-max-length": 200,
+  "_comment_export_search": "Exporting search results makes one zip of every page and file the person may read. It stops at max-items pages and files together (default 200) or at max-bytes in all (default 25 MB, 26214400), whichever comes first, and the export says how many matches were left out. max-items and max-bytes apply to page, file and search exports; a records-to-CSV export (#2408) has no row or size limit. People in the results are never exported; the export says how many were left out.",
+  "ngdpbase.export.engine.max-bytes": 26214400,
+  "ngdpbase.export.engine.max-items": 200,
+  "ngdpbase.export.engine.keep-minutes": 30,
+  "ngdpbase.export.engine.max-held-bytes": 268435456,
+  "ngdpbase.export.engine.max-kept-runs": 100,
+  "ngdpbase.export.engine.max-queued-per-user": 3,
+  "_comment_export_csv_max_columns": "#2396 — the most distinct columns a CSV export writes (default 1000). A CSV has a column for every field name in any row, so rows times columns is the table's size; an export over the limit is refused with a plain message before anything is built. It is the only limit on a records-to-CSV export: max-items and max-bytes do not apply to it (#2408).",
+  "ngdpbase.export.engine.csv-max-columns": 1000,
+  "_comment_export_csv_max_cells": "#2410 — the most cells (records times distinct columns) a CSV export builds (default 20000000, 20 million). An admin can raise it: each extra 10 million cells costs about 0.35 GB of peak memory (a 50 million cell export peaked at 1.7 GB), so raise it only as far as the server's memory allows. A CSV has a cell for every column in every row, so a long list with many different field names makes a table far larger than the list itself; an export over the limit is refused with a plain message before anything is built. A finished CSV is also counted against max-held-bytes, and a file over it is refused and not kept. Together with csv-max-columns these are the only limits on a records-to-CSV export: max-items and max-bytes do not apply to it (#2408).",
+  "ngdpbase.export.engine.csv-max-cells": 20000000,
   "_comment_jobs_shutdown": "#1717 — at shutdown (SIGTERM, SIGINT), how long running jobs get to stop after their abort signal fires. A scheduled run that did not finish is then saved as interrupted with its last checkpoint, and the next start resumes it at once, without counting an attempt.",
   "ngdpbase.jobs.shutdown-grace-ms": 5000,
   "_comment_session_max_age": "#1767 — the longest a sign-in lasts, in milliseconds: a signed-in session ends this long after it signed in, however active it has been, and the person signs in again. Shipped at 30 days (2592000000). Enforced server-side on the next request, from the time sign-in completed; a re-authentication (step-up) does not extend it, and there is no off. Until #1767 this only set the cookie and store lifetime, which both roll forward on use, so a session in use never ended. A signed-in session's cookie now lasts this long; a session nobody signed in to keeps ngdpbase.session.anonymous-max-age (or this, when shorter), so the store does not hold a month of one-visit sessions. The cookie part is read at startup.",
@@ -184,8 +202,6 @@
   "ngdpbase.page.provider.filesystem.private.files.storemeta": "store.json",
   "_comment_stores_recovery": "Private stores (#1414): how many EXTRA attempts a user gets to confirm their 12 recovery words before the door gives up and they start over. Each attempt shows a NEW set of words — a failed confirmation never re-shows the set that was just missed. 1 = two attempts in all; 0 = one attempt. Nothing is written until an attempt succeeds.",
   "ngdpbase.stores.recovery.confirmretries": 1,
-  "_comment_stores_import": "Private stores (#1472): the largest takeout a person may upload to import into their own store, in bytes, and the most it may unpack to. The whole archive and everything in it are held in memory for the import (nothing decrypted is staged on disk), so this is also the most memory one import can use. 256 MB matches the line the instance backup draws for private data.",
-  "ngdpbase.stores.import.maxsize": 268435456,
   "_comment_page_index": "Page index file - used by VersioningFileProvider for fast lookups (high I/O, consider fast storage)",
   "ngdpbase.page.provider.versioning.indexfile": "${FAST_STORAGE}/page-index.json",
   "ngdpbase.page.provider.filesystem.encoding": "utf-8",
@@ -210,6 +226,7 @@
   "ngdpbase.comments.storagedir": "${SLOW_STORAGE}/comments",
   "ngdpbase.footnotes.enabled": true,
   "ngdpbase.footnotes.storagedir": "${SLOW_STORAGE}/footnotes",
+  "ngdpbase.footnotes.sources.storagedir": "${SLOW_STORAGE}/footnote-sources",
   "_comment_share": "Share links (#842): anonymous capability-token access to keyword-scoped content. Keys approved by operator 2026-07-16.",
   "ngdpbase.share.enabled": true,
   "ngdpbase.share.storagedir": "${FAST_STORAGE}/shares",
@@ -311,12 +328,14 @@
   "ngdpbase.user.account-roles": {
     "vault-owner": true
   },
-  "_comment_auth": "Sign-in methods offered (#1523; docs/planning/authentication.md). One entry per provider: authproviderid; primary (can start a sign-in); amr (RFC 8176 values), aal (1-3) and acr (phr | phrh) — what the provider gives, which config may LOWER but never raise (an overstated value is lowered with a warning); enabled. amr [\"trust\"] is ignored (#1633): an outside provider's own second factor is trusted by its entry's trust-mfa in ngdpbase.auth.oidc.providers. A listed provider that is not registered or not fully configured is never offered. What a sign-in must REACH is per role (required-aal), not here. Replaces ngdpbase.auth.required-factors, which is still read from custom config and converted.",
+  "_comment_auth": "Sign-in methods offered (#1523; docs/planning/authentication.md). One entry per provider: authproviderid; primary (can start a sign-in); amr (RFC 8176 values), aal (1-3) and acr (phr | phrh) — what the provider gives, which config may LOWER but never raise (an overstated value is lowered with a warning); enabled; preference (#1523), where it comes among the second factors offered after a password, lower first, none last — those that reach the person's required level come first, then by preference; shipped passkey 1, magic-link 2, totp 3 (an authenticator app, #421; Web Push 4 and SMS 5 when they exist). magic-link is also the email link as a second factor, and email-link is read as magic-link; enabled false, or not listed, offers neither, and accounts that enrolled the email second factor then sign in with one step (warned at startup). amr [\"trust\"] is ignored with a startup warning (#1633): an outside provider's own second factor is trusted by its entry's trust-mfa in ngdpbase.auth.oidc.providers. A listed provider that is not registered or not fully configured is never offered. What a sign-in must REACH is per role (required-aal), not here. Replaces ngdpbase.auth.required-factors, which is still read from custom config and converted.",
   "_comment_auth_credentials": "#1524 — the credentials store: passkeys, TOTP, verified email/phone and known devices, many per account. Passwords are NOT here; they stay on the user record. Written owner-only (0600) beside the user store. Every row is signed with NGDPBASE_CREDENTIALS_KEY (instance .env, generated on first boot); a row that does not verify is ignored and raised as a security alert. Back up .env separately from the data: without the key every row is rejected.",
   "ngdpbase.auth.credentials.file": "${FAST_STORAGE}/users/credentials.json",
-  "_comment_auth_passkey": "#448 — passkeys (WebAuthn): a passkey alone signs a person in, at AAL2, phishing-resistant. Registered only when ngdpbase.application.base-url is set explicitly and is https (or localhost): a passkey is tied to that host, so it works only on that hostname — a site answering on several hostnames should redirect the others to it. Stored in the credentials store. false turns passkeys off.",
+  "_comment_auth_passkey": "#448 — passkeys (WebAuthn): a passkey alone signs a person in, at AAL2, phishing-resistant. Registered only when ngdpbase.application.base-url is set explicitly and is https (or localhost): a passkey is tied to that host, so it works only on that hostname — a site answering on several hostnames should redirect the others to it. Stored in the credentials store. false turns passkeys off. #2317 — while this is true and the address cannot support passkeys (base-url not set explicitly, or not https and not localhost), none are offered anywhere, and Admin > Configuration says on this row \"Passkeys can't work on this site's address. They need an https address.\" with a Turn passkeys off button that saves false. Nothing rewrites the setting by itself.",
   "ngdpbase.auth.passkey.enabled": true,
-  "_comment_auth_step_up": "#1525 — step-up: permissions marked step-up: true in ngdpbase.permissions.definitions ask (#1638; the permissions list here was folded into the entries, and a list still set in a custom config is honoured with a warning) for a fresh factor even inside a valid session, so a session left open on a shared machine cannot change what protects the account or the instance. Fresh means a factor satisfied within max-age-minutes that reaches the level the person's roles require (an admin re-authenticates with a passkey, others with a passkey or their password); a known device never counts, and a delegated credential (agent token, app token) never satisfies it. The prompt is /auth/reauth, which returns to the page. Every prompt and outcome is audited (reauth-prompt, reauth-success, reauth-failure). Rare by design: account-security, not profile-manage, so everyday self-service never prompts (decided 2026-10-04). max-age-minutes is one site-wide window for every step-up permission, shipped at 60 (operator, 2026-10-18; was 15, #1767; there is no per-action window); a site wanting \"prove it now\" sets 1. A max-age-minutes of 0 turns step-up off.",
+  "_comment_auth_known_device": "#1523 slice 1c — \"Remember this browser\": an opt-in box at the second step of a sign-in, recorded as a consent record (scope remember-browser, bound to the device). The browser makes a non-extractable ECDSA P-256 key (WebCrypto) and keeps it; the credentials store keeps only the public half as a device row, with the browser and system it was issued to. At a later sign-in the browser signs a one-time challenge; when the signature verifies and the browser and system still match, the second-factor prompt is skipped. It is not a factor: the sign-in reports only the factors entered (amr, aal) with a knownDevice flag, and step-up still asks. It applies only when the factors entered already reach the highest required-aal among the person's roles, so a person whose roles need AAL2 is always asked. remember-days is how long a remembered browser counts (default 30); 0 turns remembering off. The profile lists each remembered browser under sign-in methods, with Remove.",
+  "ngdpbase.auth.known-device.remember-days": 30,
+  "_comment_auth_step_up": "#1525 — step-up: permissions marked step-up: true in ngdpbase.permissions.definitions ask (#1638; the permissions list here was folded into the entries, and a list still set in a custom config is honoured with a warning) for a fresh factor even inside a valid session, so a session left open on a shared machine cannot change what protects the account or the instance. Fresh means a factor satisfied within max-age-minutes that reaches the level the person's roles require (an admin re-authenticates with a passkey, others with a passkey or their password); a known device never counts, and a delegated credential (agent token, app token) never satisfies it. The prompt is /auth/reauth, which returns to the page. Every prompt and outcome is audited (reauth-prompt, reauth-success, reauth-failure). Rare by design: account-security, not profile-manage, so everyday self-service never prompts (decided 2026-10-04). An add-on marks its own permission the same way in its config/default-config.json (#2190). max-age-minutes is one site-wide window for every step-up permission, shipped at 60 (operator, 2026-10-18; was 15, #1767; there is no per-action window); a site wanting \"prove it now\" sets 1. A max-age-minutes of 0 turns step-up off.",
   "ngdpbase.auth.step-up": {
     "max-age-minutes": 60
   },
@@ -332,7 +351,8 @@
       ],
       "aal": 2,
       "acr": "phr",
-      "enabled": true
+      "enabled": true,
+      "preference": 1
     },
     {
       "authproviderid": "password",
@@ -350,22 +370,27 @@
         "email"
       ],
       "aal": 1,
-      "enabled": true
+      "enabled": true,
+      "preference": 2
+    },
+    {
+      "authproviderid": "totp",
+      "primary": false,
+      "amr": [
+        "otp"
+      ],
+      "aal": 1,
+      "enabled": true,
+      "preference": 3
     },
     {
       "authproviderid": "oidc:google",
       "primary": true,
-      "amr": [
-        "trust"
-      ],
       "enabled": true
     },
     {
       "authproviderid": "cloudflare-access",
       "primary": true,
-      "amr": [
-        "trust"
-      ],
       "enabled": true
     }
   ],
@@ -456,6 +481,8 @@
   "ngdpbase.theme.active": "default",
   "ngdpbase.theme.directory": "themes",
   "ngdpbase.theme.defaults.mode": "light",
+  "_comment_display": "Short lines or full width for page text and pictures. \"short\" keeps them about as wide as a book page; \"full\" lets them fill the screen. A signed-in person can choose for themselves in their profile. Left unset in your own config, the active theme decides (theme.json lineLength), else full.",
+  "ngdpbase.display.line-length": "full",
   "_comment_directories": "LEGACY: Directory settings - use provider-specific configs instead (e.g., ngdpbase.page.provider.filesystem.storagedir)",
   "ngdpbase.session.store": "users/sessions.json",
   "ngdpbase.directories.pages": "${SLOW_STORAGE}/pages",
@@ -719,6 +746,14 @@
       "group": "Access control",
       "restart": false
     },
+    "ngdpbase.access.subject-attributes": {
+      "group": "Access control",
+      "restart": false
+    },
+    "ngdpbase.access.environment-attributes": {
+      "group": "Access control",
+      "restart": false
+    },
     "ngdpbase.roles.definitions": {
       "group": "Access control",
       "restart": false
@@ -769,6 +804,10 @@
     },
     "ngdpbase.mail.rate-limit.window-minutes": {
       "group": "Rate limiting",
+      "restart": false
+    },
+    "ngdpbase.vaults.admin-access": {
+      "group": "Access control",
       "restart": false
     }
   },
@@ -981,6 +1020,8 @@
   "ngdpbase.markup.cache.parse-results.ttl": 300,
   "ngdpbase.markup.cache.parse-results.max-size": 1000,
   "ngdpbase.markup.cache.metrics-enabled": true,
+  "_comment_markup_performance_history": "#2468 — where the parser keeps its once-a-minute page building check (the time to build a page, the share served from stored copies, the share that failed), one line per check in a file for each day. Files older than 30 days are removed. Operational data that rebuilds itself: not part of a backup. The limits the check is held to are ngdpbase.markup.performance.alert-thresholds.parse-time (100 ms), cache-hit-ratio (0.2), error-rate (0.05) and min-cache-samples (50). Crossing a limit and coming back are written as one log line each; no notification is sent. Sensitive in ngdpbase.config.sensitive-values.",
+  "ngdpbase.markup.performance.history.dir": "${FAST_STORAGE}/parser-performance",
   "ngdpbase.markup.handler-registry.max-handlers": 100,
   "ngdpbase.markup.handler-registry.allow-duplicate-priorities": true,
   "ngdpbase.markup.handler-registry.enable-dependency-resolution": true,
@@ -1142,7 +1183,6 @@
   "ngdpbase.notifications.escalation.levels": [
     "error"
   ],
-  "ngdpbase.notifications.escalation.recipient-role": "admin",
   "_comment_forms": "Generic Forms addon",
   "ngdpbase.addons.forms.enabled": false,
   "ngdpbase.addons.forms.dataPath": "${FAST_STORAGE}/forms",
@@ -1164,7 +1204,6 @@
   "ngdpbase.access-control.custom-schedules.schedules": "./config/schedules.json",
   "_comment_audit_legacy": "Legacy audit settings (moved to provider-specific config above)",
   "_comment_defaults": "Default values for page creation",
-  "ngdpbase.default.system-category": "general",
   "ngdpbase.default.template.dateformat": "dd-MMM-yyyy HH:mm",
   "ngdpbase.default.timezone": "UTC",
   "_comment_system_category": "System category definitions (docs/system-category.md). storageLocation.defaultstore: the folder its public pages live in; no storageLocation means its pages are never stored on the site. storageLocation.privatestore: its vault, pages/vaults/{user}/{vaultid}/, whose last folder is the vault id; no privatestore means its pages can never be private. Every privatestore shares one parent folder, which is where all vaults live. defaultPrivate: how a new page's Private box starts: true, false, or choice (each person's preference, private until set). comments, footnotes: false turns off the Comments or Footnotes tab for its pages and refuses new ones; a page's own comments: or footnotes: frontmatter wins, and unset is on (#1951). Exactly one entry has default: true; its vault is where a private page goes when nothing names another. Add-ons declare their own entries in their own config/default-config.json (the journal's is there, #1507); core reads them live from the installed add-ons, whether on or off, and never persists them here (#1559).",
@@ -1256,8 +1295,19 @@
       "defaultPrivate": "choice",
       "encrypt": false,
       "shareMaxDays": 15
+    },
+    "shared": {
+      "label": "shared",
+      "description": "Pages in a shared folder (#1775). A page created in a shared folder gets this category, and nothing else may set it",
+      "default": false,
+      "enabled": false,
+      "storageLocation": {
+        "sharedfolder": true
+      }
     }
   },
+  "_comment_vaults_admin_access": "#2255 — whether a holder of admin-system may read and write inside another person's vault. true (shipped): yes, when the vault is not encrypted; an encrypted vault always needs its key, whatever this says. Every such access is recorded in the audit log with the administrator as the actor (vault-admin-access). Read on every request. false: no role reaches into a vault (the container rule, docs/guides/security-developer-guide.md).",
+  "ngdpbase.vaults.admin-access": true,
   "_comment_knowledge_role": "#706 — knowledge-role: opt-in per-page position in the knowledge graph (source / citation / concept). Distinct from system-category (page-type). Absence is valid and means 'not in the graph' (the common case). Present with a value outside this catalog is HARD-REJECTED by ValidationManager. Each entry's page-badge block renders alongside the system-category badge via the v3.14.0 mechanism.",
   "ngdpbase.knowledge-role": {
     "source": {
@@ -1737,7 +1787,7 @@
     "allowedAuthMethods",
     "avatar"
   ],
-  "_comment_permissions": "Canonical permission registry, and the one declaration of each action (#1638: a permission and its action are one thing). Format: {target}-{action}, target-first, hyphen-separated (URL-safe, matches the 'permissions' array in role definitions). The key is the permission name. Each entry: description, icon (Font Awesome name), color (hex), and optionally audit — { on-failure: refuse | continue, enabled, description } — when using the permission is recorded (the event shares the permission's name; see ngdpbase.audit.events for the rules), and step-up: true when using it needs a fresh sign-in within ngdpbase.auth.step-up.max-age-minutes. grantable: false marks an entry that declares a record, not an action anyone may hold (system-start, job-failed, authentication-failed): never offered to an app as a scope, listed as grantable (roles matrix, permission listings), or in the CorePermission type, and no shipped policy grants one (#1638 slice 3). Omitted means true. An add-on declares its permissions, their audit and their step-up the same way in its config/default-config.json.",
+  "_comment_permissions": "Canonical permission registry, and the one declaration of each action (#1638: a permission and its action are one thing). Format: {target}-{action}, target-first, hyphen-separated (URL-safe, matches the 'permissions' array in role definitions). The key is the permission name. Each entry: description, icon (Font Awesome name), color (hex), and optionally audit — { on-failure: refuse | continue, enabled, description } — when using the permission is recorded (the event shares the permission's name; see ngdpbase.audit.events for the rules), and step-up: true when using it needs a fresh sign-in within ngdpbase.auth.step-up.max-age-minutes. read-only: true marks an action that only lets someone see something, so an allow rule giving it to everyone or to every signed-in user is not listed as a rule that lets many people change things (page-read needs no mark; an add-on may mark only the permissions it declares itself, never a core permission or one the site defined in its own file, and * is never read-only). grantable: false marks an entry that declares a record, not an action anyone may hold (system-start, job-failed, authentication-failed): never offered to an app as a scope, listed as grantable (roles matrix, permission listings), or in the CorePermission type, and no shipped policy grants one (#1638 slice 3). Omitted means true. An add-on declares its permissions, their audit and their step-up the same way in its config/default-config.json.",
   "ngdpbase.permissions.definitions": {
     "page-read": {
       "description": "View pages",
@@ -1759,6 +1809,30 @@
         "on-failure": "continue",
         "description": "Page edited"
       }
+    },
+    "pushed-pages-edit": {
+      "description": "Edit pushed pages: pages shipped by the system or an add-on (the categories a policy grants it on; system, documentation and addon as shipped) (#2255)",
+      "label": "Edit pushed pages",
+      "icon": "edit",
+      "color": "#dc3545"
+    },
+    "pushed-pages-delete": {
+      "description": "Delete pushed pages (#2255)",
+      "label": "Delete pushed pages",
+      "icon": "trash",
+      "color": "#dc3545"
+    },
+    "pushed-pages-rename": {
+      "description": "Rename pushed pages (#2255)",
+      "label": "Rename pushed pages",
+      "icon": "i-cursor",
+      "color": "#dc3545"
+    },
+    "page-categorize": {
+      "description": "Set or change a page's system-category (#2255). A page created in a shared folder gets the shared category without it",
+      "label": "Change a page's system category",
+      "icon": "tags",
+      "color": "#dc3545"
     },
     "page-public": {
       "description": "Make a page public: move it out of its vault (checked by the page's system-category, #1504)",
@@ -1864,14 +1938,20 @@
       }
     },
     "share-revoke": {
-      "description": "Revoke your own share links; revoking anyone's also needs admin-system (#1638)",
-      "label": "Revoke your own share links",
+      "description": "Revoke share links through a token or proxy acting for the person who made them. A person at their own session needs no permission to revoke their own link. Revoking another user's link needs share-manage-all instead (#1638)",
+      "label": "Revoke share links through a token or proxy",
       "icon": "ban",
       "color": "#20c997",
       "audit": {
         "on-failure": "refuse",
         "description": "Share link revoked; pairs with token-revoke"
       }
+    },
+    "share-manage-all": {
+      "description": "See and revoke every user's share links, whoever made them. Revoking one is recorded as share-revoke; needs no fresh sign-in",
+      "label": "See and revoke everyone's shared links",
+      "icon": "link-slash",
+      "color": "#20c997"
     },
     "profile-manage": {
       "description": "Manage your own account — profile, preferences, display theme, pinned pages and the /my/* pages (#1198). Every signed-in role; never anonymous",
@@ -1880,21 +1960,21 @@
       "color": "#6f42c1"
     },
     "account-security": {
-      "description": "Change what protects your own account — password, email, sign-in methods (passkeys), vault takeout and import, approving a device (#1525). Granted wherever profile-manage is; asks for a fresh sign-in when listed in ngdpbase.auth.step-up",
+      "description": "Change what protects your own account — password, email, sign-in methods (passkeys), vault takeout and import, approving a device (#1525). Granted wherever profile-manage is; asks for a fresh sign-in, because the entry carries \"step-up\": true (#1638)",
       "label": "Change your password, email and sign-in methods, and approve devices",
       "icon": "user-shield",
       "color": "#6f42c1",
       "step-up": true
     },
     "config-manage": {
-      "description": "Change any configuration setting, and download a backup (#1525). Admin only by default; asks for a fresh sign-in when listed in ngdpbase.auth.step-up",
+      "description": "Change any configuration setting, and download a backup (#1525). Admin only by default; asks for a fresh sign-in, because the entry carries \"step-up\": true (#1638)",
       "label": "Change site settings and download backups",
       "icon": "sliders-h",
       "color": "#dc3545",
       "step-up": true
     },
     "secret-reveal": {
-      "description": "Unmask a configuration secret (#1525). Admin only by default; asks for a fresh sign-in when listed in ngdpbase.auth.step-up. Hashed credentials (agent tokens) and shown-once secrets can never be revealed",
+      "description": "Unmask a configuration secret (#1525). Admin only by default; asks for a fresh sign-in, because the entry carries \"step-up\": true (#1638). Hashed credentials (agent tokens) and shown-once secrets can never be revealed",
       "label": "Show hidden configuration secrets",
       "icon": "eye-slash",
       "color": "#dc3545",
@@ -2122,7 +2202,7 @@
       }
     },
     "footnote-edit": {
-      "description": "A page's footnote list changed — action add, import, transfer, update or delete; page content written on someone's behalf (#1233)",
+      "description": "A page's footnote list changed — action add, import, transfer, update or delete; page content written on someone's behalf (#1233) — or a shared footnote source was changed: action create (#2454)",
       "grantable": false,
       "audit": {
         "on-failure": "continue"
@@ -2205,6 +2285,13 @@
         "on-failure": "refuse"
       }
     },
+    "shared-folder-access-change": {
+      "description": "An administrator changed who may read and who may file in a shared folder on the Shared folders screen (#2126): which folder, who, and the roles before and after for each. Recorded once the folder's policies are written; a failed write is recorded as a failure, with the error, and a record that cannot be written puts the policies back",
+      "grantable": false,
+      "audit": {
+        "on-failure": "refuse"
+      }
+    },
     "proxy-switch": {
       "description": "A signed-in session started or stopped acting for someone under a proxy grant, or opens their private store: chosen, switched-back, ended because the grant no longer allows it (grant-ended, proxy-access-off), or vault-opened; user is the user represented, actor the user signed in (#1762)",
       "grantable": false,
@@ -2242,6 +2329,13 @@
     },
     "authorization-allow": {
       "description": "Access granted; emitter exists, nothing in production calls it",
+      "grantable": false,
+      "audit": {
+        "on-failure": "continue"
+      }
+    },
+    "vault-admin-access": {
+      "description": "An administrator read or changed a page inside another person's vault that is not encrypted (ngdpbase.vaults.admin-access, #2255): the administrator is the actor, and the vault's owner, the vault and the page are named",
       "grantable": false,
       "audit": {
         "on-failure": "continue"
@@ -2774,13 +2868,33 @@
       "color": "#adb5bd"
     }
   },
-  "_comment_access_policies": "Access control policies - Role-based with specific action permissions",
+  "_comment_access_policies": "Access control policies - Role-based with specific action permissions. A policy has no priority (#2330): the rule-combining algorithm below is deny-overrides, so any matching deny wins and the order of the policies does not matter. A leftover priority is ignored and reported once at start-up. A condition follows XACML 3.0 in lowercase (docs/access-policies.md): one function named for its XACML function (string-equal, integer-equal, boolean-equal, string-is-in, integer-is-in, integer-greater-than, integer-greater-than-or-equal, integer-less-than, integer-less-than-or-equal, and, or, not) whose value is the array of its arguments, each { attributeid, datatype } or { value, datatype }. datatype is required. The old { attribute, equals } shape is refused on save and reported at start-up. The older plural conditions array is not enforced (#2334): nothing reads it, so it limits no access; it is reported at start-up and on save, not refused. Use condition.",
+  "_comment_access_rule_combining_algorithm": "How the matching policies are combined (#2330, XACML 3.0 rule-combining algorithm). Only deny-overrides is accepted: any matching deny wins, and with no deny any matching allow permits; with neither the request is refused. Any other value is refused on save, and at start-up it is reported and the site does not start. The start-up log states it, and Admin → Configuration shows it above the policies.",
+  "ngdpbase.access.rule-combining-algorithm": "deny-overrides",
   "ngdpbase.access.policies.default-policy": "deny",
   "ngdpbase.access.policies.enabled": true,
-  "_comment_access_resource_types": "Policy resource types (#1504, docs/access-policies.md): the kinds of thing a policy's resources may name. Declared once here and read through ConfigurationManager; the policy evaluator holds one matcher per type, and a type with no matcher, or not declared, never matches.",
+  "_comment_access_resource_types": "Policy resource types (#1504, docs/access-policies.md): the kinds of thing a policy's resources may name. Declared once here and read through ConfigurationManager. The evaluator holds one matcher per core type (page, system-category, vault, shared-folder). A type an add-on declares is matched by id only when a record of that type is decided (#1823); a page decision does not use it. A type that is not declared never matches.",
   "ngdpbase.access.resource-types": {
     "page": {
-      "description": "A page, matched by its name (glob pattern)"
+      "description": "A page, matched by its name (glob pattern). Its attributes are what a policy's condition may read as resource:<name> (an attributeid in a condition), each read by the PIP from its source (#2255): owner is the page's author; vault-owner and encrypted are the owner and the encryption of the vault the page is in (vault:owner, vault:encrypted), missing for a page in no vault and for a shared folder's page. A vault and a shared-folder type may declare attributes too, and a policy that names the type may read them",
+      "attributes": {
+        "system-category": {
+          "type": "string",
+          "from": "frontmatter:system-category"
+        },
+        "owner": {
+          "type": "identity",
+          "from": "frontmatter:author"
+        },
+        "encrypted": {
+          "type": "boolean",
+          "from": "vault:encrypted"
+        },
+        "vault-owner": {
+          "type": "identity",
+          "from": "vault:owner"
+        }
+      }
     },
     "system-category": {
       "description": "Every page of a system-category, matched by the page's system-category (glob pattern)"
@@ -2792,12 +2906,33 @@
       "description": "A shared folder, its pages and files, matched by the folder as shared/<name> (glob pattern; shared/* is every folder). Only shared-folder-read and shared-folder-file are asked with it (#2125)"
     }
   },
+  "_comment_access_subject_attributes": "Subject attributes (#2261, docs/access-policies.md): what a policy's condition may read about whoever asks, as subject:<name> (the attributeid of an argument, whose datatype must be the attribute's type: string for a string or an identity, integer, boolean). Each has a type (string, integer, boolean, identity, list) and a from, the source the PIP reads it from: account:<field> or profile:<field> (a field of the person's account record; the password, email, roles and the like are never readable), or sign-in (the assurance level, 1 to 3, the session's sign-in reached; an agent token or a background job has the level stored when it was made, and a visitor who is not signed in, or a token made before it was stored, has none, so a condition on it fails closed). id and aal are built in and cannot be redefined here (a declaration of either with another meaning is refused on save and reported at start-up; the built-in is kept). A site adds its own, for example department-id with type string and from profile:department; a condition naming one that is not declared here is refused on save and reported at start-up.",
+  "ngdpbase.access.subject-attributes": {
+    "id": {
+      "type": "identity",
+      "from": "account:id"
+    },
+    "aal": {
+      "type": "integer",
+      "from": "sign-in"
+    }
+  },
+  "_comment_access_environment_attributes": "Environment attributes (#2261, docs/access-policies.md): what a policy's condition may read about the moment or the site, as environment:<name> (the attributeid of an argument, with datatype boolean). Each is a boolean (type boolean) with a from: schedule:<name> (whether that schedule in ngdpbase.schedules is open now, in its own time zone) or config:<key> (the boolean stored at that configuration key; any key may be read, secrets included, and its value is never written to a log, an audit record or a message). A schedule that is not in ngdpbase.schedules, or a key that does not hold a boolean, makes the attribute missing, so an allow with the condition does not apply and a deny does; the start-up log names a missing schedule. The time is read once per decision or listing.",
+  "ngdpbase.access.environment-attributes": {
+    "is-business-hours": {
+      "type": "boolean",
+      "from": "schedule:business-hours"
+    },
+    "vaults-admin-access": {
+      "type": "boolean",
+      "from": "config:ngdpbase.vaults.admin-access"
+    }
+  },
   "ngdpbase.access.policies": [
     {
       "id": "admin-full-access",
       "name": "Administrator Full Access",
       "description": "Full system access for administrators - all page and admin permissions",
-      "priority": 100,
       "effect": "allow",
       "subjects": [
         {
@@ -2813,10 +2948,7 @@
       ],
       "actions": [
         "page-read",
-        "page-edit",
         "page-create",
-        "page-delete",
-        "page-rename",
         "page-export",
         "asset-read",
         "media-read",
@@ -2851,10 +2983,30 @@
       ]
     },
     {
+      "id": "admin-share-manage-all",
+      "name": "Administrator: Everyone's Shared Links",
+      "description": "Lets administrators see and revoke every user's share links. A separate policy, so a site holding a stored copy of admin-full-access still receives it",
+      "effect": "allow",
+      "subjects": [
+        {
+          "type": "role",
+          "value": "admin"
+        }
+      ],
+      "resources": [
+        {
+          "type": "page",
+          "pattern": "*"
+        }
+      ],
+      "actions": [
+        "share-manage-all"
+      ]
+    },
+    {
       "id": "demo-admin-access",
       "name": "Demo Administrator (read-only)",
       "description": "Demo visitors may view admin screens and edit pages, but change nothing administrative",
-      "priority": 90,
       "effect": "allow",
       "subjects": [
         {
@@ -2870,7 +3022,6 @@
       ],
       "actions": [
         "page-read",
-        "page-edit",
         "page-create",
         "page-export",
         "asset-read",
@@ -2889,7 +3040,6 @@
       "id": "contact-read-access",
       "name": "Administrators and demo administrators find and view identity records",
       "description": "List, search and view identity records and organizations (#1930). Changing them is identity-manage, admins only. An add-on that needs them grants identity-read to its own roles in its own policy. The id keeps its name from before #2038, so an operator's override of it still merges",
-      "priority": 100,
       "effect": "allow",
       "subjects": [
         {
@@ -2915,7 +3065,6 @@
       "id": "contact-manage-admin",
       "name": "Administrators change identity records",
       "description": "Admins create, edit, delete and link identity records and organizations (#1930). An add-on that needs to change them grants identity-manage to its own roles in its own policy. The id keeps its name from before #2038, so an operator's override of it still merges",
-      "priority": 100,
       "effect": "allow",
       "subjects": [
         {
@@ -2937,7 +3086,6 @@
       "id": "user-admin-permissions",
       "name": "User Administrator Permissions",
       "description": "Can manage users — create, edit, deactivate, delete",
-      "priority": 95,
       "effect": "allow",
       "subjects": [
         {
@@ -2971,7 +3119,6 @@
       "id": "editor-permissions",
       "name": "Editor Permissions",
       "description": "Can create, edit, delete, and rename pages plus manage assets",
-      "priority": 80,
       "effect": "allow",
       "subjects": [
         {
@@ -2987,10 +3134,7 @@
       ],
       "actions": [
         "page-read",
-        "page-edit",
         "page-create",
-        "page-delete",
-        "page-rename",
         "page-export",
         "asset-read",
         "media-read",
@@ -3014,7 +3158,6 @@
       "id": "contributor-permissions",
       "name": "Contributor Permissions",
       "description": "Can create and edit pages, upload assets (no delete/rename)",
-      "priority": 70,
       "effect": "allow",
       "subjects": [
         {
@@ -3030,7 +3173,6 @@
       ],
       "actions": [
         "page-read",
-        "page-edit",
         "page-create",
         "page-export",
         "asset-read",
@@ -3051,7 +3193,6 @@
       "id": "reader-permissions",
       "name": "Reader Permissions",
       "description": "Read-only access - can view pages and assets, search, and export",
-      "priority": 60,
       "effect": "allow",
       "subjects": [
         {
@@ -3085,7 +3226,6 @@
       "id": "executive-permissions",
       "name": "Executive (read-only)",
       "description": "The executive role reads the organization's pages, files, accounts and identity records and opens the Executive Hub (#2093). It writes nothing; add-ons grant it their own read and board-decide permissions in their own policies",
-      "priority": 75,
       "effect": "allow",
       "subjects": [
         {
@@ -3115,7 +3255,6 @@
       "id": "signed-in-self-service",
       "name": "Signed-in Self-Service",
       "description": "Every account manages its own profile and sign-in methods (#448). Granted to vault-owner, the role every account is given (ngdpbase.user.account-roles), so a session whose site role has stepped down for its required-aal can still reach its profile to enrol a passkey. profile-manage, account-security (#1525), and search-user: every user may search for other users (operator, 2026-10-24, #2018), so the people pickers work for every account. Nothing else.",
-      "priority": 60,
       "effect": "allow",
       "subjects": [
         {
@@ -3139,7 +3278,6 @@
       "id": "shared-folder-default",
       "name": "Shared Folder: default",
       "description": "/shared/default is open to every signed-in user (#1775, #2125): every account may open it and add, edit and delete its pages and files. Granted to vault-owner, the role every account is given (ngdpbase.user.account-roles); never anonymous. Every other folder opens only through a policy naming it: administrators open and file in every folder (shared-folder-admin), executives read every folder (shared-folder-executive-read) and file in /shared/executive (shared-folder-executive-file)",
-      "priority": 60,
       "effect": "allow",
       "subjects": [
         {
@@ -3162,7 +3300,6 @@
       "id": "shared-folder-admin",
       "name": "Shared Folders: administrators",
       "description": "Administrators may open every shared folder and add, edit and delete in it (#2125, #2095, operator 2026-10-30): its pages, their history and its files, the folder list on /shared and the folder's search",
-      "priority": 60,
       "effect": "allow",
       "subjects": [
         {
@@ -3185,7 +3322,6 @@
       "id": "shared-folder-executive-read",
       "name": "Shared Folders: executives read",
       "description": "Executives may open every shared folder (#2095, operator 2026-10-30): its pages, their history and its files, the folder list on /shared and the folder's search. Read only: adding, editing and deleting is shared-folder-executive-file, in /shared/executive alone. Users' own vaults are not shared folders and stay closed",
-      "priority": 60,
       "effect": "allow",
       "subjects": [
         {
@@ -3207,7 +3343,6 @@
       "id": "shared-folder-executive-file",
       "name": "Shared Folders: executives file in /shared/executive",
       "description": "Executives may add, edit and delete pages and files in /shared/executive (#2095, operator 2026-10-30), and in no other folder but /shared/default. A site may give shared-folder-file on shared/executive to others (e.g. a secretary) by its own policy",
-      "priority": 60,
       "effect": "allow",
       "subjects": [
         {
@@ -3229,7 +3364,6 @@
       "id": "vault-owner-permissions",
       "name": "Vault Owner Permissions",
       "description": "Everything inside the subject's own vaults — pages and files. The private-container check admits only the owner, so `vault: *` means their own vaults (#1539)",
-      "priority": 65,
       "effect": "allow",
       "subjects": [
         {
@@ -3264,7 +3398,6 @@
       "id": "anonymous-read-only",
       "name": "Anonymous Read Access",
       "description": "Anonymous users can read pages and attachments, and search pages",
-      "priority": 50,
       "effect": "allow",
       "subjects": [
         {
@@ -3288,7 +3421,6 @@
       "id": "page-public-access",
       "name": "Make pages public",
       "description": "Move one's own general and capture pages out of their vault (#1504): the roles that can have private pages today. The journal add-on grants the same for journal pages in its own policy, journal-page-public (#1507)",
-      "priority": 60,
       "effect": "allow",
       "subjects": [
         {
@@ -3329,6 +3461,244 @@
       "actions": [
         "page-public"
       ]
+    },
+    {
+      "id": "general-page-write",
+      "name": "Change general pages",
+      "description": "Edit, delete and rename pages in the general category (#2255). Admin and editor hold all three, as they did on every page before",
+      "effect": "allow",
+      "subjects": [
+        {
+          "type": "role",
+          "value": "admin"
+        },
+        {
+          "type": "role",
+          "value": "editor"
+        }
+      ],
+      "resources": [
+        {
+          "type": "system-category",
+          "pattern": "general"
+        }
+      ],
+      "actions": [
+        "page-edit",
+        "page-delete",
+        "page-rename"
+      ]
+    },
+    {
+      "id": "general-page-edit",
+      "name": "Edit general pages",
+      "description": "Edit pages in the general category (#2255). Contributor and demo-admin hold edit only, as they did on every page before",
+      "effect": "allow",
+      "subjects": [
+        {
+          "type": "role",
+          "value": "contributor"
+        },
+        {
+          "type": "role",
+          "value": "demo-admin"
+        }
+      ],
+      "resources": [
+        {
+          "type": "system-category",
+          "pattern": "general"
+        }
+      ],
+      "actions": [
+        "page-edit"
+      ]
+    },
+    {
+      "id": "self-managed-author-write",
+      "name": "Authors change their own self-managed pages",
+      "description": "Edit, delete and rename a capture or user-profile page you are the author of (#2255). The journal add-on adds journal. Changing a user-profile page also needs profile-manage, which editor holds",
+      "effect": "allow",
+      "subjects": [
+        {
+          "type": "role",
+          "value": "editor"
+        }
+      ],
+      "resources": [
+        {
+          "type": "system-category",
+          "pattern": "capture"
+        },
+        {
+          "type": "system-category",
+          "pattern": "user-profile"
+        }
+      ],
+      "actions": [
+        "page-edit",
+        "page-delete",
+        "page-rename"
+      ],
+      "condition": {
+        "string-equal": [
+          {
+            "attributeid": "resource:owner",
+            "datatype": "string"
+          },
+          {
+            "attributeid": "subject:id",
+            "datatype": "string"
+          }
+        ]
+      }
+    },
+    {
+      "id": "self-managed-author-edit",
+      "name": "Authors edit their own self-managed pages",
+      "description": "Edit a capture or user-profile page you are the author of (#2255). Changing a user-profile page also needs profile-manage, which contributor and demo-admin hold",
+      "effect": "allow",
+      "subjects": [
+        {
+          "type": "role",
+          "value": "contributor"
+        },
+        {
+          "type": "role",
+          "value": "demo-admin"
+        }
+      ],
+      "resources": [
+        {
+          "type": "system-category",
+          "pattern": "capture"
+        },
+        {
+          "type": "system-category",
+          "pattern": "user-profile"
+        }
+      ],
+      "actions": [
+        "page-edit"
+      ],
+      "condition": {
+        "string-equal": [
+          {
+            "attributeid": "resource:owner",
+            "datatype": "string"
+          },
+          {
+            "attributeid": "subject:id",
+            "datatype": "string"
+          }
+        ]
+      }
+    },
+    {
+      "id": "self-managed-admin",
+      "name": "Administrators change self-managed pages",
+      "description": "The administrator exception for capture and user-profile pages: edit, delete and rename whoever the author is (#2255)",
+      "effect": "allow",
+      "subjects": [
+        {
+          "type": "role",
+          "value": "admin"
+        }
+      ],
+      "resources": [
+        {
+          "type": "system-category",
+          "pattern": "capture"
+        },
+        {
+          "type": "system-category",
+          "pattern": "user-profile"
+        }
+      ],
+      "actions": [
+        "page-edit",
+        "page-delete",
+        "page-rename"
+      ]
+    },
+    {
+      "id": "pushed-pages-admin",
+      "name": "Administrators change pushed pages",
+      "description": "Pages shipped by the system or an add-on (system, documentation, addon) are changed by holders of pushed-pages-edit, -delete and -rename; shipped only to admin (#2255)",
+      "effect": "allow",
+      "subjects": [
+        {
+          "type": "role",
+          "value": "admin"
+        }
+      ],
+      "resources": [
+        {
+          "type": "system-category",
+          "pattern": "system"
+        },
+        {
+          "type": "system-category",
+          "pattern": "documentation"
+        },
+        {
+          "type": "system-category",
+          "pattern": "addon"
+        }
+      ],
+      "actions": [
+        "pushed-pages-edit",
+        "pushed-pages-delete",
+        "pushed-pages-rename"
+      ]
+    },
+    {
+      "id": "shared-page-write",
+      "name": "Change pages in shared folders",
+      "description": "The shared category's own permission (#2255): edit, delete and rename a page in a shared folder. Which folders is shared-folder-file's to say (shared-folder-default and the policies beside it); an author-lock narrows it to the author. Admin is named for the system principal, which holds no vault-owner",
+      "effect": "allow",
+      "subjects": [
+        {
+          "type": "role",
+          "value": "admin"
+        },
+        {
+          "type": "role",
+          "value": "vault-owner"
+        }
+      ],
+      "resources": [
+        {
+          "type": "system-category",
+          "pattern": "shared"
+        }
+      ],
+      "actions": [
+        "page-edit",
+        "page-delete",
+        "page-rename"
+      ]
+    },
+    {
+      "id": "page-categorize-admin",
+      "name": "Administrators set a page's system-category",
+      "description": "Set or change any page's system-category (#2255). A page created in a shared folder gets shared without it",
+      "effect": "allow",
+      "subjects": [
+        {
+          "type": "role",
+          "value": "admin"
+        }
+      ],
+      "resources": [
+        {
+          "type": "page",
+          "pattern": "*"
+        }
+      ],
+      "actions": [
+        "page-categorize"
+      ]
     }
   ],
   "_comment_telemetry": "OpenTelemetry metrics configuration",
@@ -3368,6 +3738,10 @@
   "ngdpbase.backup.env-keys-saved": null,
   "_comment_backup_shared_folders_key_saved": "#2124: the fingerprint of the shared-folders key (NGDPBASE_SHARED_FOLDERS_KEY) an admin confirmed is saved off the server, recorded when they confirm a downloaded .env that holds it ('I have saved .env off the server' on Admin -> Backup). Empty: the dashboard asks for .env to be saved. A different key (a rotated one, later) asks again. The fingerprint never reveals the key.",
   "ngdpbase.backup.shared-folders-key-saved-fingerprint": "",
+  "_comment_access_checked_denies": "#2355: the deny rules an administrator marked as checked on the dashboard, each as rule id -> a fingerprint of the rule's content at that time. A deny listed here with the same content is not reported under 'Access policies need review'; change the rule and it is reported again. Nothing that decides access reads this.",
+  "ngdpbase.access.checked-denies": {},
+  "_comment_access_narrowed_role_writes": "#2270: the page writes a site removed from its own copy of editor-permissions, contributor-permissions or demo-admin-access before page-edit, page-delete and page-rename moved to the category policies, each as { role, action }. Every category policy in force leaves these out for that role only, at every start and every save of the access policies, so a policy added later, or one edited or deleted in Admin, does not give them back. Written the first time the site's file is saved after an update that finds such a narrowing. Take a pair out of this list to give the role that write again; an empty list changes nothing.",
+  "ngdpbase.access.narrowed-role-writes": [],
   "_comment_media": "MediaManager configuration (Issue #273). Media scanning/indexing of external photo/video libraries.",
   "ngdpbase.media.enabled": false,
   "ngdpbase.media.folders": [],

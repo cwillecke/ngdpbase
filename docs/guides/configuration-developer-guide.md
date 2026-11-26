@@ -1,7 +1,7 @@
 ---
 name: Configuration developer guide
 description: How to add or change a configuration key — one reader, three merge layers, maps not arrays
-dateModified: 2026-10-29
+dateModified: 2026-11-14
 category: guides
 relatedModules: [ConfigurationManager]
 ---
@@ -39,6 +39,31 @@ How to add or change a configuration key. Config selects and parameterises; it n
   `npm run lint:sensitive` (part of `npm run lint`) fails on a secret-looking string setting that isn't declared; the other two choices are yours to make.
 - 6 Document it next to the module that consumes it (`docs/managers/…`), not as a second catalog.
 
+## Attributes for access policies
+
+An access policy's `condition` ([#2261](https://github.com/jwilleke/ngdpbase/issues/2261)) reads only attributes declared in config. An attribute with no declaration cannot be used: the validator refuses a policy that names it.
+
+| Key | Declares | Example |
+| --- | --- | --- |
+| `ngdpbase.access.resource-types` | Each type's `attributes`, read as `resource:<name>` | `owner`, `owning-department` |
+| `ngdpbase.access.subject-attributes` | Attributes of whoever asks, read as `subject:<name>` | `id`, `aal`, `department-id` |
+| `ngdpbase.access.environment-attributes` | Attributes of the moment or the site, read as `environment:<name>` | `is-business-hours`, `vaults-admin-access` |
+
+Each is `{ "type": …, "from": … }`. Types: `string`, `integer`, `boolean`, `identity` (an @id) and `list` (of strings, booleans or whole numbers). `from` names the PIP source by prefix and name:
+
+| Source | Reads | Declared on |
+| --- | --- | --- |
+| `frontmatter:<field>` | The page's frontmatter field | resource |
+| `vault:<field>` | The vault a page is in: `vault:owner`, `vault:encrypted` | resource |
+| `account:<field>`, `profile:<field>` | The signed-in account's record; `account:id` is the @id | subject |
+| `sign-in` | The assurance level the session's sign-in reached | subject |
+| `schedule:<name>` | Whether now is inside a schedule in `ngdpbase.schedules` | environment |
+| `config:<key>` | A boolean configuration value | environment |
+
+The set of sources is code: each is a reader in `PolicyInformationPoint`. Config chooses which attributes exist and where each comes from, never how a source is read. `id` and `aal` are pinned in code and cannot be redeclared. The attribute tables and what each source reads when it is missing are in [access-policies.md](../access-policies.md#subject-attributes); a worked example that declares `owning-department` and `department-id` is [there too](../access-policies.md#worked-example-project-documents).
+
+Checks in the Admin screen and at boot: saving `ngdpbase.access.policies` refuses a policy that reads an undeclared attribute, the wrong datatype or an unknown function, and `ngdpbase.access.rule-combining-algorithm` accepts only `deny-overrides`. A `priority` left on a policy is ignored and named once at start-up.
+
 ## How you know you are done
 
 - The key appears in `config/app-default-config.json`.
@@ -49,8 +74,10 @@ How to add or change a configuration key. Config selects and parameterises; it n
 ## See also
 
 - [ConfigurationManager](../managers/ConfigurationManager.md)
+- Keys added with [#2174](https://github.com/jwilleke/ngdpbase/issues/2174): `ngdpbase.export.engine.max-items` (default 200), the most items one page, file or search export holds (a search's pages and files together), beside `ngdpbase.export.engine.max-bytes` (default 26214400, the most the whole zip holds) and `ngdpbase.export.engine.csv-max-columns` (default 1000, the most distinct columns a CSV export writes, [#2396](https://github.com/jwilleke/ngdpbase/issues/2396)). `max-items` and `max-bytes` apply to page, file and search exports; a records-to-CSV export has no row or size limit ([#2408](https://github.com/jwilleke/ngdpbase/issues/2408)), and `csv-max-columns` and `csv-max-cells` (default 20000000, the most cells, records times columns, a CSV builds, [#2410](https://github.com/jwilleke/ngdpbase/issues/2410)) still apply to it; documented in [ImportManager](../managers/ImportManager.md#configuration)
 - Keys added with [#1974](https://github.com/jwilleke/ngdpbase/issues/1974), documented with their module: `ngdpbase.export.pdf.*`, the PDF provider (`none`, `local-chrome`, `chrome-service`) and its settings, in [ExportManager](../managers/ExportManager.md#configuration) (read on every render, no restart; a `chrome-service` URL on a private address also needs its range in `ngdpbase.security.egress.allowed-ranges`), `ngdpbase.mail.attachments.max-bytes` in [EmailManager](../managers/EmailManager.md#configuration) (read at startup)
 - `ngdpbase.share.public-base-url` ([#2117](https://github.com/jwilleke/ngdpbase/issues/2117)), the address share links are made with when it differs from `ngdpbase.application.base-url`, documented in [sharing.md](../sharing.md#configuration) (read on every link shown; an invalid value is ignored and named at startup)
+- `ngdpbase.display.line-length` ([#2399](https://github.com/jwilleke/ngdpbase/issues/2399)), `"short"` or `"full"`, shipped default `"full"`: the site default for the width of page text and pictures. A signed-in person's own choice (`display.line-length` in their preferences: `short`, `full` or `site`) wins; a signed-out visitor gets the site setting. Read it with `getCustomProperty`, so when the operator's own config leaves it out the active theme's `lineLength` in `theme.json` decides, and a theme that says nothing gets `"full"`. The choice rides on `<body data-line-length>` and `themes/core.css` applies it; how wide "short" is comes from `--ngdp-short-measure` (core fallback `36em`), see [theming.md](../theming.md#short-lines-and-full-width). Read on every page view, no restart
 - [bootstrap-developer-guide.md](bootstrap-developer-guide.md)
 - [security-developer-guide.md](security-developer-guide.md) — addon merge of permissions and policies
 - `src/utils/configFiles.ts`, `src/utils/configEnvKeys.ts`

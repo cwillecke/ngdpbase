@@ -12,7 +12,8 @@
  * multi-factor flow, the per-role check and the boot refusal follow under #1523.
  *
  * Built-in providers, each gated on its own config key and all registered
- * through the public {@link AuthManager.registerProvider} (#1050):
+ * through registerCoreProvider(), which shares the checks of the public
+ * {@link AuthManager.registerProvider} (#1050):
  *   - PasswordAuthProvider          (unless ngdpbase.auth.password.enabled is false)
  *   - MagicLinkAuthProvider         (ngdpbase.auth.magic-link.enabled)
  *   - OidcAuthProvider, one per entry (ngdpbase.auth.oidc.providers; the old
@@ -21,8 +22,9 @@
  *   - AuthentikBearerAuthProvider   (ngdpbase.auth.authentik-bearer.enabled)
  *   - AgentTokenAuthProvider        (ngdpbase.auth.agent-token.enabled)
  *
- * Addons register through the same method, so the contributed path is the one
- * exercised on every boot rather than a second, less-travelled one.
+ * Addons register through registerProvider(), so the contributed path is the one
+ * exercised on every boot rather than a second, less-travelled one. Core's ids
+ * and the `oidc:` prefix are reserved for core there (#2223).
  *
  * Future providers (see #421):
  *   - TotpAuthProvider
@@ -30,11 +32,12 @@
  * @see {@link https://github.com/jwilleke/ngdpbase/issues/396}
  */
 
-import { CONSENT_PATH } from '../types/Consent.js';
+import { CONSENT_PATH, REMEMBER_BROWSER_CONSENT_SCOPE, type ConsentDocument } from '../types/Consent.js';
 import BaseManager from './BaseManager.js';
 import type { BackupData, BackupFolder } from './BaseManager.js';
 import type { WikiEngine } from '../types/WikiEngine.js';
 import type ConfigurationManager from './ConfigurationManager.js';
+import { IN_SERVER_SETTINGS } from '../utils/plainAttention.js';
 import type UserManager from './UserManager.js';
 import type { PermissionSubject } from './UserManager.js';
 import type { JobContext } from '../context/JobContext.js';
@@ -73,12 +76,14 @@ import type AgentTokenManager from './AgentTokenManager.js';
 import type { OidcManager } from './OidcManager.js';
 import logger from '../utils/logger.js';
 import LocaleUtils from '../utils/LocaleUtils.js';
-import { describeBrowser } from '../utils/browserDescription.js';
+import { browserIdentity, describeBrowser, sameBrowser, type BrowserIdentity } from '../utils/browserDescription.js';
 import { approximateLocation } from '../utils/ipLocation.js';
 import type { PluginFormatters } from './PluginManager.js';
-import { createHash, createPrivateKey, randomBytes, randomUUID, type KeyObject } from 'node:crypto';
+import { createHash, createPrivateKey, createPublicKey, randomBytes, randomUUID, verify as verifySignature, type KeyObject } from 'node:crypto';
 import FileCredentialsProvider from '../providers/FileCredentialsProvider.js';
 import { PasskeyAuthProvider, relyingPartyFrom, type PasskeyRelyingParty } from '../providers/PasskeyAuthProvider.js';
+import { TotpAuthProvider } from '../providers/TotpAuthProvider.js';
+import QRCode from 'qrcode';
 import {
   CREDENTIALS_KEY_ENV,
   type CredentialKind,
@@ -107,6 +112,7 @@ import { sameUsername } from '../utils/username.js';
 import { isEmail } from '../types/guards.js';
 import { jobContextFromRequestWithReason } from '../context/JobContext.js';
 import { systemContext, systemPrincipalOf } from '../context/bootActions.js';
+import type { AuthenticationRecordSummary } from './AuditManager.js';
 import type NotificationManager from './NotificationManager.js';
 import type IdentityManager from './IdentityManager.js';
 
@@ -118,6 +124,58 @@ export interface FactorEntry {
   aal?: Aal;
   acr?: PhishingResistance;
   enabled?: boolean;
+  /**
+   * Where it comes among the second factors offered, lower first; none comes
+   * last (#1523, operator 2026-10-11). A number, because the configuration
+   * merge does not keep a custom entry's place in the list.
+   */
+  preference?: number;
+}
+
+/**
+ * Old provider ids whose entries still govern the provider (#1743; #1523 Q3,
+ * operator 2026-10-31): an entry, or an account's `allowedAuthMethods`, under
+ * the old id is read as the current one.
+ */
+const FACTOR_ALIASES: Readonly<Record<string, string>> = { 'google-oidc': 'oidc:google', 'email-link': 'magic-link' };
+
+/**
+ * Do an account's `allowedAuthMethods` let it use `providerId`? Absent or
+ * empty means any; an old id names the provider it was renamed to (Q3). The
+ * one reading for signing in and for the level the account can reach.
+ */
+const allowsProvider = (allowed: readonly string[] | undefined, providerId: string): boolean =>
+  !allowed || allowed.length === 0 || allowed.some(a => (FACTOR_ALIASES[a] ?? a) === providerId);
+
+/**
+ * The entry that governs the email link as a second factor (#1523 Q3): the
+ * magic link's, since starting a sign-in and confirming one are the same
+ * provider. The second step runs it itself, so it needs no registered provider.
+ */
+const EMAIL_LINK_ENTRY = 'magic-link';
+
+/**
+ * Every provider id core registers on some site (#1523 Q1), whether or not
+ * this one has it on. An entry naming one is never a typo: a provider that is
+ * off here, such as passkeys without an https base-url, is treated as off.
+ * `oidc:<name>` ids are known from `ngdpbase.auth.oidc.providers` instead.
+ */
+const CORE_PROVIDER_IDS: readonly string[] = [
+  'password', 'magic-link', 'passkey', 'totp', 'cloudflare-access', 'authentik-bearer', 'agent-token', 'oidc-bearer'
+];
+
+/** Ids only core may register (#2223): every core id, and any `oidc:<name>`. */
+function isReservedProviderId(id: string): boolean {
+  return CORE_PROVIDER_IDS.includes(id) || id.startsWith('oidc:');
+}
+
+/**
+ * The host passkeys are tied to, or null when the site's address cannot support
+ * them: base-url must be set explicitly, and be https (or localhost).
+ */
+function passkeyRelyingPartyOf(configManager: ConfigurationManager): PasskeyRelyingParty | null {
+  if (!configManager.isBaseUrlExplicit()) return null;
+  return relyingPartyFrom(configManager.getBaseURL(), String(configManager.getProperty('ngdpbase.application-name', 'ngdpbase')));
 }
 
 /** A factor as offered: its entry lowered to what the provider's code gives. */
@@ -125,7 +183,17 @@ export interface FactorEntry {
  * Providers that count toward a sign-in level only once the account has
  * enrolled one (#1690): the provider id, and the credential kind it needs.
  */
-const ENROLLED_FACTORS: Readonly<Record<string, CredentialKind>> = { passkey: 'passkey' };
+const ENROLLED_FACTORS: Readonly<Record<string, CredentialKind>> = { passkey: 'passkey', totp: 'totp' };
+
+/** What an account can add or use toward a stronger sign-in (#2356); see `strongerSignInWays`. */
+export interface StrongerSignInWays {
+  addPasskey: boolean;
+  addTotp: boolean;
+  usePasskey: boolean;
+  useTotp: boolean;
+  password: boolean;
+  outside: string[];
+}
 
 export interface Factor {
   provider: string;
@@ -269,12 +337,71 @@ export interface PendingSignIn {
   requestLocation?: string | null;
   /** Private-store keys unlocked by the password, held until the sign-in completes or is dropped. */
   privateStoreHandle?: string;
+  /** The level this account's roles require (`requiredAalFor`), so the second factors that reach it are offered first (#1523 Q2). */
+  requiredAal?: Aal;
   /** The second factor, once satisfied. */
   approved?: SatisfiedFactor;
   /** Refused by the person (Deny). */
   denied?: boolean;
   /** When the last approval message went out, for the resend limit. */
   lastSentAt?: number;
+  /**
+   * #1523 slice 1c: the highest `required-aal` among the person's roles, not
+   * capped by what the account can reach: the bar a remembered browser's skip
+   * must clear.
+   */
+  rolesAal?: Aal;
+  /** #1523 slice 1c: "Remember this browser" was ticked, with the version of its page the person was shown. */
+  remember?: { version: string };
+  /** #1523 slice 1c: the one-time challenge a remembered browser signs; taken by its first use. */
+  deviceChallenge?: string;
+  /** #1523 slice 1c: the remembered device that proved itself, so the prompt is skipped. Not a factor. */
+  knownDevice?: string;
+}
+
+/** #1523 slice 1c: a remembered browser's `device` row secret: its public key and what it was issued to. */
+export interface DeviceSecret extends BrowserIdentity {
+  /** The ECDSA P-256 public key, SPKI DER, base64url. Never a private key. */
+  publicKey: string;
+  /** The `amr` of the sign-in that remembered it. */
+  amr: string[];
+  /** RFC 3339: after this it no longer skips the prompt. */
+  expiresAt: string;
+  /**
+   * The account's password-change generation when it was remembered (#1482):
+   * a later password change retires it.
+   */
+  generation?: number;
+  /**
+   * The id of the audit record of the sign-in that remembered it (#1523,
+   * operator 2026-10-31), and how that sign-in was made, as the record says.
+   * A browser remembered before this has neither.
+   */
+  auditId?: string;
+  signInMethod?: string;
+}
+
+const KNOWN_DEVICE_DEFAULT_DAYS = 30;
+/** What a remembered browser signs: this, then the challenge. Separates the signature from any other use of the key. */
+export const KNOWN_DEVICE_SIGNED_PREFIX = 'ngdpbase known device v1\n';
+
+/** The same factors, in any order (#1523). */
+function sameAmr(a: string[] | undefined, b: string[]): boolean {
+  if (!a || a.length !== b.length) return false;
+  const want = new Set(b);
+  return a.every((v) => want.has(v));
+}
+
+function parseDeviceSecret(secret: string): DeviceSecret | null {
+  try {
+    const d = JSON.parse(secret) as Partial<DeviceSecret>;
+    return typeof d.publicKey === 'string' && typeof d.browser === 'string' && typeof d.os === 'string' && typeof d.platform === 'string' && typeof d.expiresAt === 'string'
+      ? { publicKey: d.publicKey, browser: d.browser, os: d.os, platform: d.platform, amr: Array.isArray(d.amr) ? d.amr.map(String) : [], expiresAt: d.expiresAt, ...(typeof d.generation === 'number' ? { generation: d.generation } : {}),
+        ...(typeof d.auditId === 'string' ? { auditId: d.auditId } : {}), ...(typeof d.signInMethod === 'string' ? { signInMethod: d.signInMethod } : {}) }
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -326,7 +453,8 @@ export interface ApprovalVisitor {
 
 /** A second factor a person has enrolled and can use now. */
 export interface AvailableSecondFactor {
-  id: 'email-link';
+  /** The second step's method: `email-link` for the email link (its entry is `magic-link`), else the provider id. */
+  id: string;
   label: string;
   /** Where it goes, masked for display (j***@example.com). */
   target: string;
@@ -526,6 +654,8 @@ export type OutsideSignIn =
 /** What the one completion step leaves for the route (#1743): where to go instead, when a pending identity waits to be confirmed. */
 export interface SignInCompleted {
   next?: string;
+  /** The id of the sign-in's audit record, when it was recorded (#1523: a remembered browser's row names it). */
+  auditId?: string;
 }
 
 /** Short: a shared browser should not keep someone else's identity waiting for long (#1743). */
@@ -769,6 +899,8 @@ function proxyGrantLive(grant: ProxyGrant, now: number): boolean {
 export interface SignInRecord extends Assurance {
   provider: string;
   factors: SatisfiedFactor[];
+  /** #1523 slice 1c: the second-factor prompt was skipped on a remembered browser. It raises nothing. */
+  knownDevice?: true;
   /** When the sign-in completed, RFC 3339. */
   at: string;
 }
@@ -777,24 +909,187 @@ export interface SignInRecord extends Assurance {
  * How a refused request wants its answer: a page to redirect, JSON, or plain
  * text (#1745). `download` is a GET that answers with a file: refused like a
  * page, but returned to the page that linked it, since going back to the file
- * itself saves it and leaves the browser on the prompt (#2145).
+ * itself saves it and leaves the browser on the prompt (#2145). `form` (#2360)
+ * is for a route that answers a script in JSON and whose action must not run
+ * until the person presses it again: a plain form post is answered as a page
+ * but is not kept to be redone (#2154), so confirming returns to the page
+ * with the note and the person presses the button once more; a script gets
+ * JSON, as for `json`.
  */
-export type ReauthMode = 'json' | 'page' | 'text' | 'download';
+export type ReauthMode = 'json' | 'page' | 'text' | 'download' | 'form';
+
+/**
+ * Whether `req` is a browser's plain form post (#2360): a POST that asks for a
+ * page (`Accept` names `text/html`, not JSON) and carries no script marker
+ * (`X-Requested-With`). A script's `fetch` is none of these: it names JSON, or
+ * sets the marker, or asks for no particular type. Reads `headers` alone, so a
+ * request without any is not one.
+ */
+export function isPlainFormPost(req: Request): boolean {
+  if (req.method !== 'POST') return false;
+  const header = (name: string): string => {
+    const value = req.headers?.[name];
+    return (Array.isArray(value) ? value.join(',') : value ?? '').toLowerCase();
+  };
+  const accept = header('accept');
+  return accept.includes('text/html') && !accept.includes('json') && !header('x-requested-with');
+}
+
+/**
+ * The mode a step-up answer takes for `req` (#2360): a route that answers a
+ * script in JSON answers a plain form post as a page, so the person is sent to
+ * the "confirm it is you" step rather than shown raw JSON. A route that asked
+ * for `form` gets the same for a plain form post (a page whose form is not
+ * kept to be redone) and JSON for any other request. Any other mode, and any
+ * other request, is as asked for.
+ */
+export function stepUpModeFor(req: Request, mode: ReauthMode): ReauthMode {
+  if (mode === 'form') return isPlainFormPost(req) ? 'form' : 'json';
+  return mode === 'json' && isPlainFormPost(req) ? 'page' : mode;
+}
 
 /** Whether a refusal in `mode` is answered by sending the browser to a page: a page, or a file a page links to (#2145). */
 export function answeredWithPage(mode: ReauthMode): boolean {
-  return mode === 'page' || mode === 'download';
+  return mode === 'page' || mode === 'download' || mode === 'form';
 }
 
 /**
  * A step-up asked for and not yet given, kept on the session (#2145): which
  * permission it was for, where the prompt returns, and whether going there
- * does the action again (a page GET) or only brings the person back to it.
+ * does the action again (a page GET, or a form POST kept to be redone, #2154)
+ * or only brings the person back to it.
  */
 export interface PendingStepUp {
   permission: string;
   next: string;
   replays: boolean;
+  /** The kept form POST the confirmation releases (#2154). */
+  replay?: string;
+  /** Which note the page says once it is back (#2360): a fixed key the header looks up, never text. */
+  note?: StepUpNote;
+}
+
+/** The notes a confirmation can carry besides the generic one (#2360). `press-again`: "Confirmed, press Reset again". */
+export type StepUpNote = 'press-again';
+
+/**
+ * Where a script's own prompt is (#2193): a page that sent a request by
+ * `fetch` and was refused waits on the prompt its refusal named, and sends
+ * again only when that prompt, not another tab's, is confirmed.
+ */
+export type StepUpPromptState = 'waiting' | 'confirmed' | 'cancelled';
+
+/** A script's prompt as the session keeps it (#2193): its id and where it is. */
+export interface StepUpPrompt {
+  id: string;
+  state: StepUpPromptState;
+}
+
+/** How many prompts one session keeps (#2193), the newest: a few tabs' worth. */
+const STEP_UP_PROMPTS_PER_SESSION = 5;
+
+/** A prompt id as minted (#2193), or null for anything else. */
+export function stepUpPromptId(value: unknown): string | null {
+  return typeof value === 'string' && /^[0-9a-f]{32}$/.test(value) ? value : null;
+}
+
+/** A waiting prompt of this session confirmed or cancelled (#2193); one already settled stays as it is. */
+function settleStepUpPrompt(req: Request, id: unknown, state: StepUpPromptState): void {
+  const prompt = stepUpPromptId(id);
+  const kept = req.session?.stepUpPrompts?.find((p) => p.id === prompt);
+  if (kept?.state === 'waiting') kept.state = state;
+}
+
+/** Where a fresh sign-in sends the browser to redo a form POST (#2154). */
+export const STEP_UP_CONTINUE_PATH = '/auth/reauth/continue';
+
+/** How long a kept form POST waits for its fresh sign-in (#2154): reading the prompt may take a while. */
+const STEP_UP_REPLAY_WAIT_MS = 60 * 60_000;
+
+/** How long a confirmed form POST waits to be redone (#2154), from the confirmation: the browser goes there at once. */
+const STEP_UP_REPLAY_TTL_MS = 2 * 60_000;
+
+/** How many kept form POSTs one session holds at once (#2176): a few tabs' worth, so memory stays bounded. */
+const STEP_UP_REPLAYS_PER_SESSION = 5;
+
+/** How many one account holds across its sessions (#2176): signing in many times does not hold more. */
+const STEP_UP_REPLAYS_PER_ACCOUNT = 10;
+
+/** How many the site holds in all (#2176): each may hold a form body of up to 100 KB, so at most 20 MB. */
+const STEP_UP_REPLAYS_TOTAL = 200;
+
+/** The kept form POST a prompt's `next` names (#2154), or null when it names none. */
+function stepUpReplayId(next: string): string | null {
+  const url = new URL(next, 'http://site.invalid');
+  return url.pathname === STEP_UP_CONTINUE_PATH ? url.searchParams.get('replay') : null;
+}
+
+/**
+ * Field names whose value is a secret (#2154): a password, recovery words, a
+ * token. A form holding one is never kept or written back into a page; it
+ * returns with the note instead.
+ */
+const SECRET_FIELD = /password|secret|token|^words$/i;
+
+/** Drop kept form POSTs past their time (#2154). */
+function dropExpiredReplays(replays: Map<string, StepUpReplay>, now: number): void {
+  for (const [id, kept] of replays) if (kept.expires <= now) replays.delete(id);
+}
+
+/**
+ * Drop the oldest of `entries` from `replays` until `room` are left (#2176),
+ * the unconfirmed first: a confirmed one is an action about to be carried out.
+ * `entries` are in the Map's insertion order, oldest first.
+ */
+function dropOldestReplays(replays: Map<string, StepUpReplay>, entries: Array<[string, StepUpReplay]>, room: number): void {
+  const order = [...entries.filter(([, kept]) => !kept.ready), ...entries.filter(([, kept]) => kept.ready)];
+  for (const [id] of order.slice(0, Math.max(0, order.length - room))) replays.delete(id);
+}
+
+/** A kept form POST's address for the log and the audit (#2176): the path, never the query. */
+function replayPath(action: string): string {
+  return new URL(action, 'http://site.invalid').pathname;
+}
+
+/**
+ * A form POST kept to be redone after its fresh sign-in (#2154). In memory
+ * only, never the session store: the fields may hold a secret. Tied to the
+ * session and the person; released once, and only after the confirmation.
+ */
+interface StepUpReplay {
+  sessionId: string;
+  username: string;
+  permission: string;
+  action: string;
+  fields: Array<[string, string]>;
+  back: string;
+  expires: number;
+  ready: boolean;
+}
+
+/** What the continue page does (#2154): post `fields` to `action` (`back` is the page it came from), or go `back` with nothing redone. */
+export type StepUpReplayAnswer = { action: string; fields: Array<[string, string]>; back: string } | { back: string };
+
+/**
+ * A form POST's fields as they can be posted again to give the same body
+ * (#2154), or null when they cannot: a file upload, a nested field, a name
+ * with brackets. A list goes back as `name[]`, which parses to a list even
+ * of one. `_csrf` is left out: the replay carries the session's token. A
+ * secret (`SECRET_FIELD`) is never kept, so such a form is null too.
+ */
+export function replayableFields(req: Request): Array<[string, string]> | null {
+  if (!req.is('application/x-www-form-urlencoded')) return null;
+  const body = req.body as unknown;
+  if (!body || typeof body !== 'object') return null;
+  const fields: Array<[string, string]> = [];
+  for (const [name, value] of Object.entries(body as Record<string, unknown>)) {
+    if (name === '_csrf') continue;
+    if (/[[\]]/.test(name) || SECRET_FIELD.test(name)) return null;
+    if (typeof value === 'string') fields.push([name, value]);
+    else if (Array.isArray(value) && value.every((v): v is string => typeof v === 'string')) for (const v of value) fields.push([`${name}[]`, v]);
+    else return null;
+  }
+  return fields;
 }
 
 /** The step-up answer (#1525, #1635), for the caller to send in its own form. */
@@ -863,6 +1158,34 @@ export interface AuthenticateResult {
   aal?: Aal;
   /** #1633: what an outside provider reported about its own sign-in, for the audit record. */
   reported?: ReportedValues;
+  /**
+   * #1523 slice 1c: the second-factor prompt was skipped because this browser
+   * is remembered. Not a factor: `factors` holds only what was entered.
+   */
+  knownDevice?: boolean;
+}
+
+/**
+ * A passkey can not be added, for a reason the person can act on (#2494):
+ * passkeys are off on this site, or the account may not sign in with one.
+ * `message` is written for the person, so a route may show it as it is.
+ */
+export class PasskeyRefused extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PasskeyRefused';
+  }
+}
+
+/**
+ * A proxy grant that was refused, with a reason written for the person who asked (#2494):
+ * nothing was changed, and trying again would not change the answer.
+ */
+export class ProxyGrantRefused extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProxyGrantRefused';
+  }
 }
 
 class AuthManager extends BaseManager {
@@ -872,6 +1195,12 @@ class AuthManager extends BaseManager {
   private factorCache: Factor[] | null;
   /** The credentials store (#1524); null when it could not be opened. */
   private credentials: BaseCredentialsProvider | null = null;
+  /**
+   * #421: TOTP, built for enrolment only. Not registered as a sign-in
+   * provider until the second-factor step can ask for it (slice 2b): offering
+   * it earlier would raise admins to AAL2 before they could use it.
+   */
+  private totp: TotpAuthProvider | null = null;
   /** `ngdpbase.auth.credentials.file`, resolved at start: what a backup copies (#1876). */
   private credentialsFile: string | null = null;
 
@@ -889,7 +1218,7 @@ class AuthManager extends BaseManager {
 
     // Register password provider if enabled (default: true)
     if (configManager?.getProperty('ngdpbase.auth.password.enabled', true) !== false) {
-      this.registerProvider(new PasswordAuthProvider(this.engine));
+      this.registerCoreProvider(new PasswordAuthProvider(this.engine));
     }
 
     // Register magic-link provider if enabled
@@ -912,7 +1241,7 @@ class AuthManager extends BaseManager {
           'ngdpbase.auth.magic-link.ttl-minutes', 15
         ) as number;
 
-        this.registerProvider(new MagicLinkAuthProvider(this.engine, {
+        this.registerCoreProvider(new MagicLinkAuthProvider(this.engine, {
           ttlMs: ttlMinutes * 60_000,
           mailProvider: emailManager
         }));
@@ -936,7 +1265,7 @@ class AuthManager extends BaseManager {
           defaultRole: configManager.getProperty('ngdpbase.auth.cloudflare-access.default-role', 'reader') as string,
           groupMap: configManager.getProperty('ngdpbase.auth.cloudflare-access.group-map', {}) as Record<string, string>
         };
-        this.registerProvider(new CloudflareAccessAuthProvider(this.engine, cfConfig));
+        this.registerCoreProvider(new CloudflareAccessAuthProvider(this.engine, cfConfig));
         logger.info(`[AuthManager] cloudflare-access team=${teamDomain}`);
       }
     }
@@ -962,7 +1291,7 @@ class AuthManager extends BaseManager {
           defaultRole: configManager.getProperty('ngdpbase.auth.authentik-bearer.default-role', 'reader') as string,
           groupMap: configManager.getProperty('ngdpbase.auth.authentik-bearer.group-map', {}) as Record<string, string>
         };
-        this.registerProvider(new AuthentikBearerAuthProvider(this.engine, authentikConfig));
+        this.registerCoreProvider(new AuthentikBearerAuthProvider(this.engine, authentikConfig));
         logger.info(`[AuthManager] authentik-bearer issuer=${issuer}`);
       }
     }
@@ -972,7 +1301,7 @@ class AuthManager extends BaseManager {
     // so it registers whenever enabled, with no further required config. Both
     // bearer providers may be active at once; the middleware tries each.
     if (configManager?.getProperty('ngdpbase.auth.agent-token.enabled', false)) {
-      this.registerProvider(new AgentTokenAuthProvider(this.engine));
+      this.registerCoreProvider(new AgentTokenAuthProvider(this.engine));
     }
 
     // #1576: access tokens from this instance's own OpenID Connect provider,
@@ -980,7 +1309,7 @@ class AuthManager extends BaseManager {
     // arrives, so registering ahead of it is safe; with the provider off,
     // every token simply fails to verify.
     if (configManager?.getProperty('oidc-auth-server.enabled', false) === true) {
-      this.registerProvider(new OidcBearerAuthProvider(this.engine));
+      this.registerCoreProvider(new OidcBearerAuthProvider(this.engine));
     }
 
     this.factorEntries = this.readFactorEntries(configManager);
@@ -988,7 +1317,9 @@ class AuthManager extends BaseManager {
 
     await this.openCredentialsStore(configManager);
     this.registerPasskeys(configManager);
+    this.openTotp(configManager);
     this.registerOidcProviders(configManager);
+    this.warnIfEmailSecondFactorsDropped();
 
     logger.info(`[AuthManager] Initialized — factors: [${this.factorEntries.map(e => e.authproviderid).join(', ')}]`);
   }
@@ -1001,26 +1332,65 @@ class AuthManager extends BaseManager {
     if (!configManager) return [{ authproviderid: 'password' }];
     const legacy = configManager.getCustomProperty('ngdpbase.auth.required-factors');
     const custom = configManager.getCustomProperty('ngdpbase.auth.factors');
-    if (Array.isArray(legacy)) {
+    const legacyIds = Array.isArray(legacy) ? legacy.filter((id): id is string => typeof id === 'string') : null;
+    if (legacyIds) {
       logger.warn(
         '[AuthManager] ngdpbase.auth.required-factors is retired — ' +
-        (custom === undefined
-          ? 'converted to ngdpbase.auth.factors entries; rename it in custom config. (#1523)'
-          : 'ignored, because ngdpbase.auth.factors is also set; remove it from custom config. (#1523)')
+        (custom !== undefined
+          ? 'ignored, because ngdpbase.auth.factors is also set; remove it from custom config. (#1523)'
+          : legacyIds.some(id => (FACTOR_ALIASES[id] ?? id) === EMAIL_LINK_ENTRY)
+            ? 'converted to ngdpbase.auth.factors entries; rename it in custom config. (#1523)'
+            : `converted to ngdpbase.auth.factors entries; rename it in custom config. It lists no ${EMAIL_LINK_ENTRY}, so the email second factor is off: ` +
+              `accounts that enrolled one sign in with one step. List ${EMAIL_LINK_ENTRY} to keep it. (#1523)`)
       );
-      if (custom === undefined) {
-        return legacy.filter((id): id is string => typeof id === 'string').map(id => ({ authproviderid: id }));
-      }
     }
-    const entries = configManager.getProperty('ngdpbase.auth.factors', [{ authproviderid: 'password' }]);
+    const entries: unknown = legacyIds && custom === undefined
+      ? legacyIds.map(id => ({ authproviderid: id }))
+      : configManager.getProperty('ngdpbase.auth.factors', [{ authproviderid: 'password' }]);
     if (!Array.isArray(entries)) {
       logger.error('[AuthManager] ngdpbase.auth.factors is not a list — offering password only. (#1523)');
       return [{ authproviderid: 'password' }];
     }
-    return entries
-      .filter((e): e is FactorEntry => typeof e === 'object' && e !== null && typeof (e as FactorEntry).authproviderid === 'string')
-      // #1743: Google's provider is now `oidc:google`; an entry under its old id still governs it.
-      .map(e => (e.authproviderid === 'google-oidc' ? { ...e, authproviderid: 'oidc:google' } : e));
+    // An entry without a string authproviderid is dropped, and it also made
+    // the merge replace the shipped list instead of merging by id.
+    const wellFormed = entries.filter((e): e is FactorEntry => {
+      if (typeof e === 'object' && e !== null && typeof (e as FactorEntry).authproviderid === 'string') return true;
+      logger.warn(
+        `[AuthManager] ngdpbase.auth.factors: dropped ${JSON.stringify(e)}, which has no string authproviderid. ` +
+        'A custom list holding such an entry replaces the shipped list rather than merging with it, so every shipped entry it does not restate is off. (#1523)'
+      );
+      return false;
+    });
+    // #1743, #1523 Q3: an entry under an old id governs the provider. The merge
+    // appends a custom entry under the old id after the shipped one, so of two
+    // entries for one provider the later wins, in the earlier one's place.
+    const byProvider = new Map<string, FactorEntry>();
+    for (const e of wellFormed) {
+      const id = FACTOR_ALIASES[e.authproviderid] ?? e.authproviderid;
+      byProvider.set(id, { ...e, authproviderid: id });
+    }
+    const read = [...byProvider.values()];
+    // #1523 Q10: no longer shipped, so only a site's own config still says it.
+    const trusting = read.filter(e => Array.isArray(e.amr) && e.amr.includes('trust')).map(e => e.authproviderid);
+    if (trusting.length > 0) {
+      logger.warn(`[AuthManager] ngdpbase.auth.factors: "amr": ["trust"] on ${trusting.join(', ')} does nothing — trust an outside provider's own second factor with "trust-mfa": true on its entry in ngdpbase.auth.oidc.providers. (#1633)`);
+    }
+    return read;
+  }
+
+  /**
+   * #1523: with the `magic-link` entry off or not listed, an enrolled email
+   * second factor is no longer asked for. The operator may mean that, but it
+   * must not happen silently.
+   */
+  private warnIfEmailSecondFactorsDropped(): void {
+    if (this.factorEntries.some(e => e.authproviderid === EMAIL_LINK_ENTRY && e.enabled !== false)) return;
+    const accounts = new Set((this.credentials?.listKind('email') ?? []).map(r => r.username)).size;
+    if (accounts === 0) return;
+    logger.warn(
+      `[AuthManager] ngdpbase.auth.factors: the ${EMAIL_LINK_ENTRY} entry is off or not listed, so the enrolled email second factor ` +
+      `of ${accounts} account(s) is no longer asked for — they sign in with one step, and magic-link sign-in is off too. (#1523)`
+    );
   }
 
   /**
@@ -1078,7 +1448,7 @@ class AuthManager extends BaseManager {
         : '');
       if (!redirectUri) { refuse('ngdpbase.application.base-url is not set explicitly, so there is no address for the provider to send people back to'); continue; }
       const store = this.credentials;
-      this.registerProvider(new OidcAuthProvider(
+      this.registerCoreProvider(new OidcAuthProvider(
         {
           name, displayName: entry['display-name'] || preset?.displayName || name,
           icon: resolveOutsideProviderIcon(name, entry.icon, preset ? entry.preset : undefined, m => logger.warn(m)), issuer, clientId, clientSecret, redirectUri, policy: egress.policy,
@@ -1522,14 +1892,16 @@ class AuthManager extends BaseManager {
     if (!file) return;
     this.credentialsFile = file;
     if (!key) {
-      this.markDegraded(`${CREDENTIALS_KEY_ENV} is not set, so the credentials store is closed`, CREDENTIALS_KEY_ENV);
+      logger.error(`[AuthManager] ${CREDENTIALS_KEY_ENV} is not set, so the credentials store is closed`);
+      this.markDegraded("Nobody can sign in with a password, because the key that protects the saved passwords is not set. This is set in the server's settings, outside this page.", CREDENTIALS_KEY_ENV);
       return;
     }
     const store = new FileCredentialsProvider(file, key);
     try {
       await store.initialize((rejected) => this.raiseRejectedCredentials(store.location(), rejected));
     } catch (err) {
-      this.markDegraded(`The credentials store ${file} could not be read: ${(err as Error).message}`, 'ngdpbase.auth.credentials.file');
+      logger.error(`[AuthManager] The credentials store ${file} could not be read: ${(err as Error).message}`);
+      this.markDegraded('Nobody can sign in with a password, because the saved passwords could not be read. Ask whoever runs the server to check them; this is outside this page.', 'ngdpbase.auth.credentials.file');
       return;
     }
     this.credentials = store;
@@ -1547,21 +1919,98 @@ class AuthManager extends BaseManager {
       logger.warn('[AuthManager] Passkeys NOT registered: the credentials store is not available (#448)');
       return;
     }
-    if (!configManager.isBaseUrlExplicit()) {
-      logger.info('[AuthManager] Passkeys off: ngdpbase.application.base-url is not set explicitly, and a passkey is tied to that host (#448)');
-      return;
-    }
-    const rp = relyingPartyFrom(configManager.getBaseURL(), String(configManager.getProperty('ngdpbase.application-name', 'ngdpbase')));
+    const rp = passkeyRelyingPartyOf(configManager);
     if (!rp) {
-      logger.warn(`[AuthManager] Passkeys off: base-url ${configManager.getBaseURL()} is not https (or localhost), where browsers allow WebAuthn (#448)`);
+      if (!configManager.isBaseUrlExplicit()) {
+        logger.info('[AuthManager] Passkeys off: ngdpbase.application.base-url is not set explicitly, and a passkey is tied to that host (#448)');
+      } else {
+        logger.warn(`[AuthManager] Passkeys off: base-url ${configManager.getBaseURL()} is not https (or localhost), where browsers allow WebAuthn (#448)`);
+      }
       return;
     }
     const store = this.credentials;
-    this.registerProvider(new PasskeyAuthProvider(rp, {
+    this.registerCoreProvider(new PasskeyAuthProvider(rp, {
       find: (credentialId) => store.findBySubject('passkey', credentialId),
       used: (id, at, secret) => store.touch(id, at, secret)
     }));
     logger.info(`[AuthManager] passkeys tied to ${rp.rpID}`);
+  }
+
+  /**
+   * #2317: the setting says passkeys are on, but the site's address cannot
+   * support them (base-url not set explicitly, or neither https nor localhost),
+   * so none are offered. The same rule registerPasskeys applies. Admin →
+   * Configuration says so on that setting's row and offers to turn it off.
+   */
+  passkeysCannotWork(): boolean {
+    const configManager = this.engine.getManager<ConfigurationManager>('ConfigurationManager');
+    if (!configManager || configManager.getProperty('ngdpbase.auth.passkey.enabled', true) === false) return false;
+    return passkeyRelyingPartyOf(configManager) === null;
+  }
+
+  /** TOTP enrolment (#421), available whenever the credentials store is open. */
+  private openTotp(configManager: ConfigurationManager | null | undefined): void {
+    this.totp = null;
+    this.providers.delete('totp');
+    const store = this.credentials;
+    if (!store) return;
+    const name = configManager?.getProperty('ngdpbase.application-name', 'ngdpbase');
+    const issuer = typeof name === 'string' && name ? name : 'ngdpbase';
+    this.totp = new TotpAuthProvider(process.env[CREDENTIALS_KEY_ENV] ?? '', issuer, {
+      rows: (username) => store.list(username).filter(r => r.kind === 'totp'),
+      used: (id, at, secret) => store.touch(id, at, secret)
+    });
+    // #421 slice 2b: registered, so its factor entry counts and the second step can ask for its code.
+    this.registerCoreProvider(this.totp);
+  }
+
+  /** Whether an authenticator app can be enrolled here (#421). */
+  totpAvailable(): boolean {
+    return this.totp !== null;
+  }
+
+  /**
+   * A new seed for `username` to add to an authenticator app (#421): the
+   * manual key, the `otpauth://` URI and that URI as an SVG QR code. Nothing
+   * is stored. `pending` is the seed sealed for this account: the caller keeps
+   * that, never the seed, (in the session) until a code confirms it. Refused
+   * while the account already has one.
+   */
+  async totpEnrolmentStart(ctx: PermissionSubject, username: string): Promise<{ seed: string; pending: string; uri: string; qrSvg: string }> {
+    const totp = await this.totpEnrolGate(ctx, username);
+    if (this.requireCredentialsStore().list(username).some(r => r.kind === 'totp')) {
+      throw new Error('This account already has an authenticator app; remove it before adding another');
+    }
+    const { seed, uri } = totp.newEnrolment(username);
+    const qrSvg = await QRCode.toString(uri, { type: 'svg', errorCorrectionLevel: 'M', margin: 2 });
+    return { seed, pending: totp.sealPending(username, seed), uri, qrSvg };
+  }
+
+  /**
+   * Confirm an enrolment with a code from the app and store the seed,
+   * encrypted (#421). Returns the credential id, or null when the code does
+   * not match, or when `pending` is not a seed `totpEnrolmentStart` sealed
+   * for this account. The confirming code is spent: it cannot also sign
+   * anyone in.
+   */
+  async totpEnrolmentConfirm(ctx: PermissionSubject, username: string, pending: string, code: string, label: string): Promise<string | null> {
+    const totp = await this.totpEnrolGate(ctx, username);
+    const name = credentialLabel(label || 'Authenticator app');
+    if (this.requireCredentialsStore().list(username).some(r => r.kind === 'totp')) {
+      throw new Error('This account already has an authenticator app; remove it before adding another');
+    }
+    const seed = totp.openPending(username, pending);
+    if (!seed) return null;
+    const sealed = totp.confirmEnrolment(username, seed, code);
+    if (!sealed) return null;
+    return this.storeCredential(ctx, username, { kind: 'totp', subject: randomUUID(), secret: sealed, label: name });
+  }
+
+  private async totpEnrolGate(ctx: PermissionSubject, username: string): Promise<TotpAuthProvider> {
+    if (!(await this.mayManageCredentials(ctx, username))) throw new Error('Permission denied');
+    if (!(await this.userMayUseProvider(username, 'totp'))) throw new Error('This account cannot sign in with an authenticator app');
+    if (!this.totp) throw new Error('Authenticator apps are not available on this site');
+    return this.totp;
   }
 
   private passkeyProvider(): PasskeyAuthProvider | null {
@@ -1574,6 +2023,11 @@ class AuthManager extends BaseManager {
     return this.passkeyProvider()?.relyingParty() ?? null;
   }
 
+  /** Can a passkey be added or used here at all (#2345)? False when passkeys are off or the address can't host them. */
+  passkeysAvailable(): boolean {
+    return this.passkeyRelyingParty() !== null;
+  }
+
   /** Options for `username` to enrol a passkey (#448); the caller keeps `challenge` for verify. */
   /**
    * May this account sign in with `providerId`? Its `allowedAuthMethods`, when
@@ -1583,16 +2037,14 @@ class AuthManager extends BaseManager {
    */
   async userMayUseProvider(username: string, providerId: string): Promise<boolean> {
     const user = await this.engine.getManager<UserManager>('UserManager')?.getUser(username);
-    const allowed = user?.allowedAuthMethods;
-    // #1743: Google's provider was `google-oidc`; an account limited to it keeps it as `oidc:google`.
-    return !allowed || allowed.length === 0 || allowed.includes(providerId) || (providerId === 'oidc:google' && allowed.includes('google-oidc'));
+    return allowsProvider(user?.allowedAuthMethods, providerId);
   }
 
   async passkeyRegistrationOptions(ctx: PermissionSubject, username: string, displayName: string): Promise<unknown> {
     if (!(await this.mayManageCredentials(ctx, username))) throw new Error('Permission denied');
-    if (!(await this.userMayUseProvider(username, 'passkey'))) throw new Error('This account cannot sign in with a passkey');
+    if (!(await this.userMayUseProvider(username, 'passkey'))) throw new PasskeyRefused('This account cannot sign in with a passkey');
     const provider = this.passkeyProvider();
-    if (!provider) throw new Error('Passkeys are not available on this site');
+    if (!provider) throw new PasskeyRefused('Passkeys are not available on this site');
     const existing = this.requireCredentialsStore().list(username).filter(c => c.kind === 'passkey');
     return provider.registrationOptions(username, displayName, existing);
   }
@@ -1649,7 +2101,8 @@ class AuthManager extends BaseManager {
       title: 'Security alert: credential rows rejected',
       message
     }).catch(() => { /* the audit record and the degraded state still stand */ });
-    this.markDegraded(message, 'ngdpbase.auth.credentials.file');
+    // #2354: the dashboard says it in plain words; the rows and the way to re-sign them are in the log line above.
+    this.markDegraded(`${rejected.length === 1 ? 'A saved sign-in record' : `${rejected.length} saved sign-in records`} failed a security check and ${rejected.length === 1 ? 'was' : 'were'} ignored. Treat this as a possible attempt to get into an account, and ask whoever runs the server to look into it.`, 'ngdpbase.auth.credentials.file');
   }
 
   /**
@@ -1709,6 +2162,7 @@ class AuthManager extends BaseManager {
    */
   async listCredentials(ctx: PermissionSubject, username: string): Promise<CredentialView[]> {
     if (!(await this.mayManageCredentials(ctx, username, { viewOnly: true }))) throw new Error('Permission denied');
+    await this.pruneRememberedDevices(username);
     // #1762: a proxy grant is not a sign-in method; it is listed and ended through the proxy-grant methods only.
     return this.requireCredentialsStore().list(username).filter(r => !NOT_SIGN_IN_METHODS.has(r.kind)).map(({ secret: _secret, ...view }) => view);
   }
@@ -1718,6 +2172,7 @@ class AuthManager extends BaseManager {
     if (!(await this.mayManageCredentials(ctx, username))) throw new Error('Permission denied');
     if (input.kind === 'proxy') throw new Error('A proxy grant is made with grantProxy (#1762)');
     if (input.kind === 'invitation') throw new Error('An invitation is sent with inviteUser (#2049)');
+    if (input.kind === 'totp') throw new Error('An authenticator app is enrolled with totpEnrolmentConfirm, which encrypts its seed (#421)');
     return this.storeCredential(ctx, username, input);
   }
 
@@ -1755,6 +2210,8 @@ class AuthManager extends BaseManager {
     }
     const removed = await store.remove(id);
     if (removed) this.auditCredentialChange(ctx, username, 'credential-remove', row);
+    // Q5: removing a remembered browser withdraws the agreement to remember it.
+    if (removed && row.kind === 'device') await this.withdrawRememberConsent(ctx, username, row.subject, 'removed');
     return removed;
   }
 
@@ -1792,14 +2249,13 @@ class AuthManager extends BaseManager {
     await step('sessions', async () => this.engine.getManager<UserManager>('UserManager')?.deleteUserSessions(username, reason, { ipAddress: ctx.ipAddress }));
     if (mode !== 'delete') return;
 
-    const by = ctx.username ?? 'system';
     // #1764: the same path a person's own Revoke takes, one kind per step so one failing store does not stop the other.
     for (const [what, kind] of [['agent tokens', 'token'], ['app grants', 'app']] as const) {
       await step(what, async () => this.endDelegationsWhere(ctx, username, kind, () => true));
     }
     await step('shares', async () => {
-      const shares = this.engine.getManager<{ list(owner?: string): Array<{ id: string; revokedAt?: string | null }>; revoke(id: string, by: string): Promise<boolean> }>('ShareManager');
-      for (const sh of shares?.list(username) ?? []) if (!sh.revokedAt) await shares?.revoke(sh.id, by);
+      const shares = this.engine.getManager<{ list(owner?: string): Array<{ id: string; revokedAt?: string | null }>; revoke(id: string, by: PermissionSubject): Promise<boolean> }>('ShareManager');
+      for (const sh of shares?.list(username) ?? []) if (!sh.revokedAt) await shares?.revoke(sh.id, ctx);
     });
     await step('proxy grants', async () => {
       if (!this.credentials) return;
@@ -1915,7 +2371,7 @@ class AuthManager extends BaseManager {
   }
 
   private requireProxyAccess(): BaseCredentialsProvider {
-    if (!this.proxyAccessEnabled()) throw new Error('Proxy access is turned off on this site');
+    if (!this.proxyAccessEnabled()) throw new ProxyGrantRefused('Proxy access is turned off on this site');
     return this.requireCredentialsStore();
   }
 
@@ -1956,33 +2412,33 @@ class AuthManager extends BaseManager {
     const store = this.requireProxyAccess();
     const owner = typeof input?.owner === 'string' ? input.owner.trim() : '';
     const proxy = typeof input?.proxy === 'string' ? input.proxy.trim() : '';
-    if (!owner || !proxy) throw new Error('Name the person represented and the person acting for them');
-    if (!(await this.mayManageProxyGrants(ctx, owner))) throw new Error('Permission denied');
-    if (owner === proxy) throw new Error('A person cannot act for themselves');
+    if (!owner || !proxy) throw new ProxyGrantRefused('Name the person represented and the person acting for them');
+    if (!(await this.mayManageProxyGrants(ctx, owner))) throw new ProxyGrantRefused('Permission denied');
+    if (owner === proxy) throw new ProxyGrantRefused('A person cannot act for themselves');
 
     const { pdp, pip, ownerSubject } = await this.proxyOwnerSubject(ctx, owner);
-    if (!(await pip.subjectFor(proxy))) throw new Error(`There is no active account ${proxy}`);
+    if (!(await pip.subjectFor(proxy))) throw new ProxyGrantRefused(`There is no active account ${proxy}`);
 
     const permissions = requireScopeList(input.permissions);
     // Vault access is added only by the person themselves (operator, 2026-10-12): an administrator's grant never carries it.
     if (ctx.username !== owner && permissions.includes(VAULT_PROXY_PERMISSION)) {
-      throw new Error('A grant made for someone else can never include access to their vaults');
+      throw new ProxyGrantRefused('A grant made for someone else can never include access to their vaults');
     }
     // Nor does a proxy's, re-delegating: it would hand on the owner's vault key (#1762 slice 5).
     if (ctx.viaProxy && permissions.includes(VAULT_PROXY_PERMISSION)) {
-      throw new Error(`Only ${owner} can give access to their vaults`);
+      throw new ProxyGrantRefused(`Only ${owner} can give access to their vaults`);
     }
     // Held, not fresh: the owner's own step-up is not the question when an administrator makes it.
     const lacking = await lackingScopes(permissions, p => pdp.holds(ownerSubject, p));
     if (lacking.length > 0) {
-      throw new Error(`${owner} does not hold ${lacking.join(', ')}. A grant can only carry permissions the person represented has.`);
+      throw new ProxyGrantRefused(`${owner} does not hold ${lacking.join(', ')}. A grant can only carry permissions the person represented has.`);
     }
 
     const now = Date.now();
     let expiresAt: string | null = null;
     if (input.expiresAt !== undefined && input.expiresAt !== null) {
       const end = typeof input.expiresAt === 'string' ? Date.parse(input.expiresAt) : NaN;
-      if (!Number.isFinite(end) || end <= now) throw new Error('The end date must be a date in the future');
+      if (!Number.isFinite(end) || end <= now) throw new ProxyGrantRefused('The end date must be a date in the future');
       expiresAt = new Date(end).toISOString();
     }
 
@@ -2032,15 +2488,15 @@ class AuthManager extends BaseManager {
    */
   private async sealVaultCopy(ctx: PermissionSubject, owner: string, proxy: string): Promise<Lockbox | null> {
     const blocked = await this.vaultGrantBlocked(ctx, owner);
-    if (blocked) throw new Error(blocked);
+    if (blocked) throw new ProxyGrantRefused(blocked);
     const pagesDirectory = this.pagesDirectory();
     if (!pagesDirectory || !(await hasUserKeys(pagesDirectory, owner))) return null;
     const proxyKey = await personKeyOf(pagesDirectory, proxy);
     if (!proxyKey) {
-      throw new Error(`${proxy} cannot be given access to your encrypted vaults yet: they need a private store of their own, unlocked at least once. Give access without vaults, or ask them to set one up first.`);
+      throw new ProxyGrantRefused(`${proxy} cannot be given access to your encrypted vaults yet: they need a private store of their own, unlocked at least once. Give access without vaults, or ask them to set one up first.`);
     }
     const copy = await sealKekCopyFor(ctx, proxyKey);
-    if (!copy) throw new Error('Unlock your private store first: access to your encrypted vaults can only be given while it is open.');
+    if (!copy) throw new ProxyGrantRefused('Unlock your private store first: access to your encrypted vaults can only be given while it is open.');
     return copy;
   }
 
@@ -2572,13 +3028,24 @@ class AuthManager extends BaseManager {
     return hardwareVerified ? { amr, aal, acr: 'phrh' } : { amr, aal };
   }
 
-  /** The audit record of one sign-in method's check (#1758): written here, never by a route. */
-  private async auditCheck(attempt: AuthAttempt, username: string | undefined, method: string, result: 'success' | 'failure', reason: string, reported?: ReportedValues): Promise<void> {
+  /**
+   * The audit record of one sign-in method's check (#1758): written here, never
+   * by a route. Returns the record's id when it was recorded (#1523).
+   */
+  private async auditCheck(
+    attempt: AuthAttempt, username: string | undefined, method: string, result: 'success' | 'failure', reason: string,
+    more: { reported?: ReportedValues; knownDevice?: boolean; amr?: string[] } = {}
+  ): Promise<string | undefined> {
     try {
-      const audit = this.engine.getManager<{ logAuthentication?(context: Record<string, unknown>, result: string, reason: string): Promise<string> }>('AuditManager');
-      await audit?.logAuthentication?.({ username: username ?? 'unknown', ipAddress: attempt.ipAddress, userAgent: attempt.userAgent, loginMethod: method, ...(reported ? { reported } : {}) }, result, reason);
+      const audit = this.engine.getManager<{ logAuthentication?(context: Record<string, unknown>, result: string, reason: string): Promise<{ id?: string } | undefined> }>('AuditManager');
+      const recorded = await audit?.logAuthentication?.({
+        username: username ?? 'unknown', ipAddress: attempt.ipAddress, userAgent: attempt.userAgent, loginMethod: method,
+        ...(more.reported ? { reported: more.reported } : {}), ...(more.knownDevice ? { knownDevice: true } : {}), ...(more.amr ? { amr: more.amr } : {})
+      }, result, reason);
+      return typeof recorded?.id === 'string' ? recorded.id : undefined;
     } catch (err) {
       logger.warn('[AuthManager] audit record failed for an authentication check:', err);
+      return undefined;
     }
   }
 
@@ -2630,15 +3097,55 @@ class AuthManager extends BaseManager {
    * is told, on every page, to close.
    */
   async aalReachFor(username: string): Promise<{ now: Aal; ifEnrolled: Aal }> {
+    const { offered, usable } = await this.accountFactors(username);
+    const reach = (factors: Factor[]): Aal => Math.max(factors.some(f => f.primary) ? this.assess(factors).aal : 0, 1) as Aal;
+    return { now: reach(usable), ifEnrolled: reach(offered) };
+  }
+
+  /**
+   * The site's factors this account may use (`offered`: narrowed to its
+   * `allowedAuthMethods`), and of those the ones it can use now (`usable`: a
+   * factor that must be enrolled counts only once it is). One reading for
+   * the level the account can reach and for what it is told to add (#2356).
+   */
+  private async accountFactors(username: string): Promise<{ offered: Factor[]; usable: Factor[] }> {
     const user = await this.engine.getManager<UserManager>('UserManager')?.getUser(username);
     const allowed = user?.allowedAuthMethods;
-    const offered = this.getFactors().filter(f => !allowed || allowed.length === 0 || allowed.includes(f.provider));
-    const reach = (factors: Factor[]): Aal => Math.max(factors.some(f => f.primary) ? this.assess(factors).aal : 0, 1) as Aal;
+    const offered = this.getFactors().filter(f => allowsProvider(allowed, f.provider));
     const usable = offered.filter(f => {
       const kind = ENROLLED_FACTORS[f.provider];
       return kind === undefined || this.hasCredential(username, kind);
     });
-    return { now: reach(usable), ifEnrolled: reach(offered) };
+    return { offered, usable };
+  }
+
+  /**
+   * What this account can add or use here toward a stronger sign-in (#2356),
+   * for the sign-in banners and the confirm page's wording. Never a decision:
+   * who steps down and what step-up needs stay with `rolesAtSignIn` and
+   * `stepUpNeeded`. "Add" is a passkey or an authenticator app the site
+   * offers, the account is allowed and has not set up; "use" is one it has,
+   * is allowed, and the site offers (the app's code as step-up offers it).
+   * `password` is a password it has and is allowed, which the app's code
+   * needs to reach AAL2. `outside` names any other allowed sign-in method
+   * that reaches AAL2 by itself, such as an outside provider's.
+   * Computed per call; never cached across accounts.
+   */
+  async strongerSignInWays(username: string): Promise<StrongerSignInWays> {
+    const { offered, usable } = await this.accountFactors(username);
+    const has = (list: Factor[], id: string): boolean => list.some(f => f.provider === id);
+    const password = has(usable, 'password')
+      && (await this.engine.getManager<UserManager>('UserManager')?.hasPassword(username).catch(() => false) ?? false);
+    return {
+      addPasskey: has(offered, 'passkey') && !has(usable, 'passkey'),
+      addTotp: has(offered, 'totp') && !has(usable, 'totp'),
+      usePasskey: has(usable, 'passkey'),
+      useTotp: has(usable, 'totp') && this.stepUpTotpOffered(username),
+      password,
+      outside: usable
+        .filter(f => f.primary && f.aal >= 2 && f.provider !== 'passkey')
+        .map(f => this.providers.get(f.provider)?.displayName ?? f.provider)
+    };
   }
 
   /**
@@ -2701,6 +3208,49 @@ class AuthManager extends BaseManager {
   }
 
   /**
+   * The start-up check of the `ngdpbase.auth.factors` ids, once add-ons have
+   * registered their providers (#1523 Q1, operator 2026-10-31). An id no
+   * provider could ever register, such as a typo, refuses the boot when its
+   * entry is on, and only warns when it is `enabled: false`. Returns the
+   * problems that must refuse the boot.
+   */
+  checkFactorIds(): string[] {
+    const { refused, ignored } = this.unknownFactorIds(this.factorEntries);
+    for (const problem of ignored) logger.warn(`[AuthManager] ${problem}. The entry is off, so it is ignored. (#1523)`);
+    return refused;
+  }
+
+  /**
+   * The same check for a value the configuration screen is about to save as
+   * `ngdpbase.auth.factors` (#1523), so a typo is refused there rather than
+   * at the next restart, which would refuse to start. `refused` names each
+   * enabled unknown id; `ignored` each one whose entry is `enabled: false`.
+   */
+  checkFactorEntries(value: unknown): { refused: string[]; ignored: string[] } {
+    const entries = (Array.isArray(value) ? value : [])
+      .filter((e): e is FactorEntry => typeof e === 'object' && e !== null && typeof (e as FactorEntry).authproviderid === 'string')
+      .map(e => ({ ...e, authproviderid: FACTOR_ALIASES[e.authproviderid] ?? e.authproviderid }));
+    return this.unknownFactorIds(entries);
+  }
+
+  /** The entries whose id no provider could ever register, split by whether the entry is on. */
+  private unknownFactorIds(entries: readonly FactorEntry[]): { refused: string[]; ignored: string[] } {
+    const raw = this.engine.getManager<ConfigurationManager>('ConfigurationManager')?.getUnresolvedProperty?.('ngdpbase.auth.oidc.providers', {});
+    const oidcNames = raw && typeof raw === 'object' && !Array.isArray(raw) ? Object.keys(raw) : [];
+    // `oidc:google` is also what the old ngdpbase.auth.google-oidc.* keys register.
+    const known = new Set([...CORE_PROVIDER_IDS, 'oidc:google', ...oidcNames.map(n => `oidc:${n}`), ...this.providers.keys()]);
+    const knownIds = [...known].sort().join(', ');
+    const refused: string[] = [];
+    const ignored: string[] = [];
+    for (const entry of entries) {
+      if (known.has(entry.authproviderid)) continue;
+      const problem = `ngdpbase.auth.factors entry '${entry.authproviderid}' names no provider. Known ids: ${knownIds}`;
+      (entry.enabled === false ? ignored : refused).push(problem);
+    }
+    return { refused, ignored };
+  }
+
+  /**
    * The start-up check, once add-ons have registered their providers (#1523,
    * #448). Returns the problems that must refuse the boot: a level the operator
    * set that no factor reaches. A shipped default that cannot be reached instead
@@ -2713,7 +3263,11 @@ class AuthManager extends BaseManager {
     const shipped = unreachable.filter(u => !u.operatorSet);
     if (shipped.length > 0) {
       const roles = shipped.map(u => `${u.role} (AAL${u.aal})`).join(', ');
-      this.markNeedsAttention(`${roles} require a stronger sign-in than this site offers, so they act at AAL${Math.max(reachable, 1)} for now. Set ngdpbase.application.base-url (https) so passkeys can be enabled.`, 'ngdpbase.auth.factors');
+      logger.warn(`[AuthManager] ${roles} require a stronger sign-in than this site offers, so they act at AAL${Math.max(reachable, 1)} for now. Set ngdpbase.application.base-url (https) so passkeys can be enabled.`);
+      // From the server's settings the address row is locked: say where to change it instead of linking to it.
+      const fromServer = !!this.engine.getManager<ConfigurationManager>('ConfigurationManager')?.getEnvControlledKeys?.()['ngdpbase.application.base-url'];
+      const needs = `${shipped.length === 1 ? 'One role needs' : 'Some roles need'} a stronger sign-in than this site offers, so ${shipped.length === 1 ? 'it uses' : 'they use'} a simpler one for now. Set the site's web address to a secure (https) one so passkeys can be turned on.`;
+      this.markNeedsAttention(fromServer ? `${needs} ${IN_SERVER_SETTINGS}` : needs, fromServer ? undefined : 'ngdpbase.application.base-url');
     }
     const descriptions = this.unreachableRequiredAal();
     return unreachable.flatMap((u, i) => (u.operatorSet ? [descriptions[i]] : []));
@@ -2733,16 +3287,28 @@ class AuthManager extends BaseManager {
    * fresh enough, with the `reauth-prompt` recorded. A delegated credential is
    * refused outright: it can never give a fresh factor.
    */
-  async askForFreshSignIn(req: Request, userContext: unknown, permission: string, mode: ReauthMode): Promise<FreshSignInAnswer> {
+  async askForFreshSignIn(req: Request, userContext: unknown, permission: string, asked: ReauthMode): Promise<FreshSignInAnswer> {
+    // #2360: a plain form post is answered like a page, whichever way its route asked.
+    const mode = stepUpModeFor(req, asked);
     const user = (userContext ?? {}) as { viaToken?: unknown; viaShare?: unknown };
     const delegated = Boolean(user.viaToken || user.viaShare);
     await this.recordReauth(req, AUDIT_EVENT.REAUTH_PROMPT, 'failure', permission, delegated ? 'delegated credential cannot re-authenticate' : 'fresh sign-in asked for');
     if (delegated) return { permission, delegated, error: 'This needs a fresh sign-in by the person; a token cannot give one' };
-    const next = reauthReturnTo(req, mode);
+    const back = reauthReturnTo(req, mode);
+    // #2154: a form POST is kept, and the confirmation returns to redo it. Not in `form` mode (#2360):
+    // that route's action is pressed again by the person, so the confirmation returns to its page.
+    const replay = req.session ? this.keepStepUpReplay(req, permission, mode, back) : null;
+    const next = replay ? `${STEP_UP_CONTINUE_PATH}?replay=${replay}` : back;
+    // #2193: a script's request names its own prompt, so the page that sent it
+    // waits for that confirmation and no other.
+    const prompt = req.session && mode === 'json' ? randomBytes(16).toString('hex') : null;
+    if (prompt) req.session.stepUpPrompts = [...(req.session.stepUpPrompts ?? []), { id: prompt, state: 'waiting' as const }].slice(-STEP_UP_PROMPTS_PER_SESSION);
     // #2145: what the prompt was for, so its success is recorded against it and,
     // when returning does not redo the action, the page says it can be done now.
     if (req.session) {
-      req.session.pendingStepUp = { permission, next, replays: req.method === 'GET' && mode === 'page' };
+      req.session.pendingStepUp = replay
+        ? { permission, next, replays: true, replay }
+        : { permission, next, replays: req.method === 'GET' && mode === 'page', ...(mode === 'form' ? { note: 'press-again' as const } : {}) };
       // Saved before the answer goes out: the browser follows a redirect on its
       // headers, before express-session's own save at the end lands, and the
       // prompt's request would read (and write back) the session without it.
@@ -2752,8 +3318,23 @@ class AuthManager extends BaseManager {
       permission,
       delegated,
       error: 'A fresh sign-in is needed',
-      reauth: `/auth/reauth?next=${encodeURIComponent(next)}`
+      reauth: `/auth/reauth?next=${encodeURIComponent(next)}${prompt ? `&prompt=${prompt}` : ''}`
     };
+  }
+
+  /**
+   * Where this session's prompt `id` is (#2193): waiting, confirmed or
+   * cancelled, or unknown (another session's, dropped, or not an id). Reads
+   * only, so asking it often changes nothing in the session.
+   */
+  stepUpPromptState(req: Request, id: unknown): StepUpPromptState | 'unknown' {
+    const prompt = stepUpPromptId(id);
+    return req.session?.stepUpPrompts?.find((p) => p.id === prompt)?.state ?? 'unknown';
+  }
+
+  /** The prompt's Cancel (#2193): a waiting prompt of this session is cancelled, so its page stops waiting. */
+  cancelStepUpPrompt(req: Request, id: unknown): void {
+    settleStepUpPrompt(req, id, 'cancelled');
   }
 
   /** Record a step-up event: a prompt, a success or a failure (#1525). */
@@ -2781,15 +3362,36 @@ class AuthManager extends BaseManager {
    * directly, against the method), and when going there does not redo the
    * action (a form POST, a script's request, a download) the page there says
    * it can be done now (`takeStepUpNotice`).
+   *
+   * #2193: `prompt`, the id a script's refusal named, is confirmed when it is
+   * this session's and still waiting; no other prompt is.
    */
-  async completeReauth(req: Request, result: AuthenticateResult, method: string, next: string): Promise<SignInRecord | null> {
+  async completeReauth(req: Request, result: AuthenticateResult, method: string, next: string, prompt?: unknown): Promise<SignInRecord | null> {
     const record = this.reauthenticated(req.session.signIn, result);
     if (record) req.session.signIn = record;
+    if (record) settleStepUpPrompt(req, prompt, 'confirmed');
     const pending = req.session.pendingStepUp;
     delete req.session.pendingStepUp;
     const answered = pending && pending.next === next ? pending : undefined;
-    if (answered && !answered.replays) req.session.stepUpConfirmed = new URL(next, 'http://site.invalid').pathname;
-    await this.recordReauth(req, AUDIT_EVENT.REAUTH_SUCCESS, 'success', answered?.permission ?? method,
+    if (answered && !answered.replays) {
+      req.session.stepUpConfirmed = new URL(next, 'http://site.invalid').pathname;
+      if (answered.note) req.session.stepUpNote = answered.note;
+    }
+    // #2154: the confirmation releases the form POST it was asked for, named by
+    // `next` itself (the session's pending prompt may be another tab's), and
+    // its time to be redone starts now, however long the prompt was open.
+    // Another session's or person's is not released, nor is the success recorded
+    // against its permission: the attempt is a `reauth-failure`, as at the take.
+    const kept = this.stepUpReplays.get(stepUpReplayId(next) ?? '');
+    const mine = kept && kept.sessionId === req.sessionID && kept.username === req.session.username ? kept : undefined;
+    if (kept && !mine) {
+      await this.recordReauth(req, AUDIT_EVENT.REAUTH_FAILURE, 'failure', kept.permission, `kept form POST for ${replayPath(kept.action)} confirmed from another session; not released`);
+    }
+    if (mine && mine.expires > Date.now()) {
+      mine.ready = true;
+      mine.expires = Date.now() + STEP_UP_REPLAY_TTL_MS;
+    }
+    await this.recordReauth(req, AUDIT_EVENT.REAUTH_SUCCESS, 'success', answered?.permission ?? mine?.permission ?? method,
       `re-authenticated with ${method}${answered ? ` for ${answered.permission}` : ''}; acr ${record?.acr ?? 'unknown'}`);
     return record;
   }
@@ -2805,7 +3407,83 @@ class AuthManager extends BaseManager {
     if (typeof path !== 'string') return false;
     if (req.method !== 'GET' || !(req.get('accept') ?? '').includes('text/html')) return false;
     delete req.session.stepUpConfirmed;
+    delete req.session.stepUpNote;
     return req.path === path;
+  }
+
+  /** #2154: form POSTs kept for their fresh sign-in, by a random id. In memory: a restart drops them. */
+  private stepUpReplays = new Map<string, StepUpReplay>();
+
+  /**
+   * Keep a form POST answered with the prompt, to be redone after it
+   * (#2154); its id, or null when it cannot be redone exactly. Only a page's
+   * POST by a signed-in person, to an address on this site. Each prompt keeps
+   * its own, so the same button pressed in two tabs loses neither (#2176); a
+   * session keeps at most `STEP_UP_REPLAYS_PER_SESSION`, an account
+   * `STEP_UP_REPLAYS_PER_ACCOUNT` and the site `STEP_UP_REPLAYS_TOTAL`, a new
+   * prompt dropping the oldest past that, unconfirmed first, and any past its
+   * time. It waits `STEP_UP_REPLAY_WAIT_MS` for the confirmation, which
+   * restarts its clock. A session's end drops its own (`dropStepUpReplays`).
+   */
+  private keepStepUpReplay(req: Request, permission: string, mode: ReauthMode, back: string): string | null {
+    const username = req.session.username;
+    if (req.method !== 'POST' || mode !== 'page' || typeof username !== 'string' || !req.sessionID) return null;
+    const action = req.originalUrl;
+    if (safeRedirect(action) !== action) return null;
+    const fields = replayableFields(req);
+    if (!fields) return null;
+    const now = Date.now();
+    dropExpiredReplays(this.stepUpReplays, now);
+    // A Map iterates in insertion order: the oldest come first.
+    const all = (): Array<[string, StepUpReplay]> => Array.from(this.stepUpReplays);
+    dropOldestReplays(this.stepUpReplays, all().filter(([, kept]) => kept.sessionId === req.sessionID), STEP_UP_REPLAYS_PER_SESSION - 1);
+    dropOldestReplays(this.stepUpReplays, all().filter(([, kept]) => kept.username === username), STEP_UP_REPLAYS_PER_ACCOUNT - 1);
+    dropOldestReplays(this.stepUpReplays, all(), STEP_UP_REPLAYS_TOTAL - 1);
+    const id = randomBytes(16).toString('hex');
+    this.stepUpReplays.set(id, { sessionId: req.sessionID, username, permission, action, fields, back, expires: now + STEP_UP_REPLAY_WAIT_MS, ready: false });
+    return id;
+  }
+
+  /** Whether the kept form POST `next` names holds anything typed (#2485): Revoke's holds only its CSRF token. */
+  stepUpReplayHasFields(req: Request, next: string): boolean {
+    const kept = this.stepUpReplays.get(stepUpReplayId(next) ?? '');
+    return Boolean(kept && kept.sessionId === req.sessionID && kept.username === req.session?.username && kept.fields.length > 0);
+  }
+
+  /** A session ended (#2176): the form POSTs it kept go with it (`endSession`). */
+  dropStepUpReplays(sessionId: string): void {
+    for (const [id, kept] of this.stepUpReplays) if (kept.sessionId === sessionId) this.stepUpReplays.delete(id);
+  }
+
+  /**
+   * Take the kept form POST `id` for the continue page (#2154). Single-use:
+   * taken, it is gone, whatever the answer. Another session's or person's is
+   * refused (null); one not confirmed (the prompt's Cancel) or past its time
+   * only goes back, a confirmed one with the note (#2145). Otherwise the page
+   * posts the fields to the same address. A refusal or one past its time is
+   * recorded as a `reauth-failure`; any other past its time is dropped.
+   */
+  async takeStepUpReplay(req: Request, id: unknown): Promise<StepUpReplayAnswer | null> {
+    const kept = typeof id === 'string' ? this.stepUpReplays.get(id) : undefined;
+    if (kept) this.stepUpReplays.delete(id as string);
+    const now = Date.now();
+    dropExpiredReplays(this.stepUpReplays, now);
+    if (!kept) {
+      await this.recordReauth(req, AUDIT_EVENT.REAUTH_FAILURE, 'failure', STEP_UP_CONTINUE_PATH, 'kept form POST not found: already used, past its time, or unknown');
+      return null;
+    }
+    if (kept.sessionId !== req.sessionID || kept.username !== req.session?.username) {
+      logger.warn(`[step-up] a kept form POST for ${replayPath(kept.action)} was asked for from another session; refused`);
+      await this.recordReauth(req, AUDIT_EVENT.REAUTH_FAILURE, 'failure', kept.permission, `kept form POST for ${replayPath(kept.action)} asked for from another session`);
+      return null;
+    }
+    if (now > kept.expires) {
+      await this.recordReauth(req, AUDIT_EVENT.REAUTH_FAILURE, 'failure', kept.permission, `kept form POST for ${replayPath(kept.action)} past its time; not redone`);
+      if (kept.ready) req.session.stepUpConfirmed = new URL(kept.back, 'http://site.invalid').pathname;
+      return { back: kept.back };
+    }
+    if (!kept.ready) return { back: kept.back };
+    return { action: kept.action, fields: kept.fields, back: kept.back };
   }
 
   /**
@@ -2859,12 +3537,14 @@ class AuthManager extends BaseManager {
     const handle = how.privateStoreHandle
       ?? (how.unlockWith && this.vaultUnlocker ? await this.vaultUnlocker(username, how.unlockWith.password) : undefined);
     if (handle) req.session.privateStoreHandle = handle;
-    await this.auditCheck({ ipAddress: req.ip, userAgent: req.get?.('user-agent'), purpose: 'sign-in' }, username, how.method, 'success', `signed in: ${how.method}`, result.reported);
+    const auditId = await this.auditCheck({ ipAddress: req.ip, userAgent: req.get?.('user-agent'), purpose: 'sign-in' }, username, how.method, 'success', `signed in: ${how.method}`,
+      { reported: result.reported, knownDevice: result.knownDevice, ...(record ? { amr: record.amr } : {}) });
     try {
       await this.engine.getManager<{ recordSignIn?(u: string): Promise<void> }>('UserManager')?.recordSignIn?.(username);
     } catch (err) {
       logger.warn(`[AuthManager] could not count the sign-in for ${username}:`, err);
     }
+    this.startPrivatePageCleanup(req, username);
     let next: string | undefined;
     if (pending && pending.expiresAt > Date.now()) {
       req.session.pendingConnection = { ...pending, ...(how.returnTo !== undefined ? { returnTo: safeRedirect(how.returnTo) } : {}) };
@@ -2880,9 +3560,43 @@ class AuthManager extends BaseManager {
     // (consentPending, the consent gate) until they accept or sign out.
     if (await this.termsPendingFor(username)) {
       req.session.consentPending = true;
-      return { next: `${CONSENT_PATH}?returnTo=${encodeURIComponent(next ?? safeRedirect(how.returnTo))}` };
+      return { next: `${CONSENT_PATH}?returnTo=${encodeURIComponent(next ?? safeRedirect(how.returnTo))}`, ...(auditId ? { auditId } : {}) };
     }
-    return next ? { next } : {};
+    return { ...(next ? { next } : {}), ...(auditId ? { auditId } : {}) };
+  }
+
+  /**
+   * After a sign-in (#2466): the upgrade clean-up of the person's own private
+   * pages, run as them. It starts on a later turn and is never waited for, so
+   * it cannot slow or stop the sign-in: its failure, in building the person's
+   * permissions or in the clean-up itself, is logged and nothing more. The
+   * subject is the one the person's next request would carry (their roles as
+   * this sign-in holds them, how they signed in, the key handle of their
+   * private stores), so every read and save in it is decided by their own
+   * permissions, never the system's.
+   */
+  private startPrivatePageCleanup(req: Request, username: string): void {
+    const pages = this.engine.getManager<{ convertLegacyAccessOnSignIn?(subject: PermissionSubject): Promise<unknown> }>('PageManager');
+    if (typeof pages?.convertLegacyAccessOnSignIn !== 'function') return;
+    // Read now: the session is the request's, and the route goes on to save and answer.
+    const { signIn, privateStoreHandle } = req.session;
+    const ipAddress = req.ip;
+    setImmediate(() => {
+      void (async () => {
+        const pip = this.engine.getManager<{ subjectFor(u: string): Promise<PermissionSubject | null> }>('PolicyInformationPoint');
+        const subject = await pip?.subjectFor(username);
+        if (!subject) return;
+        const reach = await this.aalReachFor(username);
+        const roles = this.rolesAtSignIn(subject.roles, signIn?.aal ?? 1, reach.now).kept;
+        await pages.convertLegacyAccessOnSignIn?.({
+          ...subject,
+          roles,
+          ...(ipAddress ? { ipAddress } : {}),
+          ...(typeof privateStoreHandle === 'string' && privateStoreHandle ? { privateStoreHandle } : {}),
+          ...(signIn ? { signIn } : {})
+        });
+      })().catch((err: unknown) => logger.warn(`[AuthManager] The clean-up of a person's private pages after sign-in did not finish; the sign-in was not affected: ${err instanceof Error ? err.message : String(err)}`));
+    });
   }
 
   /**
@@ -2982,7 +3696,7 @@ class AuthManager extends BaseManager {
   signInRecord(result: AuthenticateResult): SignInRecord | null {
     if (!result.success || !result.provider || result.viaToken) return null;
     const factors = result.factors ?? [];
-    return { provider: result.provider, factors, ...this.assess(factors), at: new Date().toISOString() };
+    return { provider: result.provider, factors, ...this.assess(factors), ...(result.knownDevice ? { knownDevice: true as const } : {}), at: new Date().toISOString() };
   }
 
   /**
@@ -3012,18 +3726,37 @@ class AuthManager extends BaseManager {
 
   /**
    * Whether `permission` needs a fresher factor than `signIn` holds (#1525).
-   * Fresh: a factor satisfied within the step-up window that reaches the
-   * level the person's roles require (at least 1 — a known device, aal 0,
-   * never counts). A delegated credential has no sign-in of its own, so it
+   * Fresh: the factors satisfied within the step-up window together reach
+   * the level the person's roles require (at least 1 — a known device, aal 0,
+   * never counts); a password and an authenticator code reach AAL2 (#421). A delegated credential has no sign-in of its own, so it
    * never satisfies step-up.
    */
   stepUpNeeded(permission: string, signIn: SignInRecord | undefined, roles: readonly string[], delegated: boolean, now: number = Date.now(), cap?: number): boolean {
     const policy = this.stepUpPolicy();
     if (!policy.permissions.has(permission)) return false;
-    if (delegated) return true;
+    return !this.freshUnder(policy.maxAgeMs, signIn, roles, delegated, now, cap);
+  }
+
+  /**
+   * Whether `signIn` is fresh enough for every step-up permission (#2193): the
+   * window and the level are one for all of them, so a page waiting on its
+   * prompt asks this without naming the permission. With step-up off, every
+   * sign-in is.
+   */
+  signInFresh(signIn: SignInRecord | undefined, roles: readonly string[], delegated: boolean, now: number = Date.now(), cap?: number): boolean {
+    const policy = this.stepUpPolicy();
+    return policy.permissions.size === 0 || this.freshUnder(policy.maxAgeMs, signIn, roles, delegated, now, cap);
+  }
+
+  private freshUnder(maxAgeMs: number, signIn: SignInRecord | undefined, roles: readonly string[], delegated: boolean, now: number, cap?: number): boolean {
+    if (delegated) return false;
     const need = Math.max(this.requiredAalFor(roles, cap), 1);
-    const since = now - policy.maxAgeMs;
-    return !(signIn?.factors ?? []).some((f) => f.aal >= need && Date.parse(f.at) >= since);
+    const since = now - maxAgeMs;
+    // #421 slice 2c: the factors satisfied within the window, together — a
+    // password and an authenticator code reach AAL2 as at sign-in. A known
+    // device (aal 0) never counts.
+    const fresh = (signIn?.factors ?? []).filter((f) => f.aal >= 1 && Date.parse(f.at) >= since);
+    return fresh.length > 0 && this.assess(fresh).aal >= need;
   }
 
   /**
@@ -3335,16 +4068,51 @@ class AuthManager extends BaseManager {
   }
 
   /**
-   * The second factors `username` has enrolled and can use now (#1523). Any
-   * enrolled factor works; one that is not truly available (no mail transport)
-   * is not offered. Empty means the sign-in is one step, as before.
+   * Whether the email link can be a second factor now (#1523): its entry in
+   * `ngdpbase.auth.factors` (`magic-link`, or its alias `email-link`) listed
+   * and enabled, mail, and an explicit base-url.
    */
-  secondFactorsFor(username: string): AvailableSecondFactor[] {
+  emailSecondFactorAvailable(): boolean {
+    return this.mailForLinks() !== null && this.factorEntries.some(e => e.authproviderid === EMAIL_LINK_ENTRY && e.enabled !== false);
+  }
+
+  /**
+   * The second factors that may follow `first`, in the order they are offered
+   * (#1523; Q2, operator 2026-10-31): every enabled entry of
+   * `ngdpbase.auth.factors` other than the one the sign-in started with, whose
+   * level is known (its provider registered, or the email link). Those that,
+   * with the first step, reach `requiredAal` come first; then by `preference`,
+   * lower first, an entry with none last. Entry ids.
+   */
+  secondFactorOrder(first: Pick<AuthenticateResult, 'provider' | 'factors'>, requiredAal: number): string[] {
+    const ranked = this.factorEntries.flatMap((entry) => {
+      if (entry.enabled === false || entry.authproviderid === first.provider) return [];
+      const factor = entry.authproviderid === EMAIL_LINK_ENTRY ? EMAIL_FACTOR : this.getFactors().find(f => f.provider === entry.authproviderid);
+      if (!factor) return [];
+      const reaches = this.assess([...(first.factors ?? []), factor]).aal >= requiredAal;
+      return [{ id: entry.authproviderid, reaches, preference: entry.preference ?? Number.MAX_SAFE_INTEGER }];
+    });
+    return ranked.sort((a, b) => Number(b.reaches) - Number(a.reaches) || a.preference - b.preference).map(r => r.id);
+  }
+
+  /**
+   * The second factors `username` has enrolled and can use now (#1523), in
+   * `secondFactorOrder` after the pending sign-in's first step; without one,
+   * by `preference`. Only what the second step can run is offered — the
+   * email link and an authenticator app (#421) — and one that is not truly
+   * available (no mail transport) is not. Empty means the sign-in is one step, as before.
+   */
+  secondFactorsFor(username: string, signIn?: Pick<PendingSignIn, 'first' | 'requiredAal'>): AvailableSecondFactor[] {
     const rows = this.credentials?.list(username) ?? [];
     const out: AvailableSecondFactor[] = [];
-    if (this.mailForLinks()) {
-      for (const r of rows.filter((c) => c.kind === 'email')) {
-        out.push({ id: 'email-link', label: 'Email link', target: maskEmail(r.subject) });
+    for (const id of this.secondFactorOrder(signIn?.first ?? {}, signIn?.requiredAal ?? 0)) {
+      if (id === EMAIL_LINK_ENTRY && this.mailForLinks()) {
+        for (const r of rows.filter((c) => c.kind === 'email')) {
+          out.push({ id: 'email-link', label: 'Email link', target: maskEmail(r.subject) });
+        }
+      }
+      if (id === 'totp' && this.totp && rows.some((c) => c.kind === 'totp')) {
+        out.push({ id: 'totp', label: 'Authenticator app', target: '' });
       }
     }
     return out;
@@ -3362,7 +4130,7 @@ class AuthManager extends BaseManager {
   needsSecondStep(result: AuthenticateResult): boolean {
     const record = result.success && result.username ? this.signInRecord(result) : null;
     if (!record || record.aal >= 2 || record.amr.includes('email')) return false;
-    return this.secondFactorsFor(result.username as string).length > 0;
+    return this.secondFactorsFor(result.username as string, { first: result }).length > 0;
   }
 
   /**
@@ -3392,6 +4160,15 @@ class AuthManager extends BaseManager {
     const username = await this.storedUsername(first.username);
     if (!username) throw new Error('beginTwoStep: no stored account has that username (#1882)');
     first = { ...first, username };
+    // #1523 Q2: what this account's roles require, so the factors that reach it are offered first.
+    const pip = this.engine.getManager<{ subjectFor(username: string): Promise<PermissionSubject | null> }>('PolicyInformationPoint');
+    const roles = (await pip?.subjectFor(username))?.roles ?? [];
+    const requiredAal = this.requiredAalFor(roles, await this.aalCapFor(username));
+    // #1523 slice 1c: the roles' declared levels, not lowered to what the site
+    // or the account can reach (#1690), so an admin who cannot reach AAL2 yet
+    // is still never let past the prompt by a remembered browser.
+    const declared = new Map(this.requiredLevels().map(({ role, aal }) => [role, aal]));
+    const rolesAal = roles.reduce<Aal>((max, r) => Math.max(max, declared.get(r) ?? 0) as Aal, 0);
     this.sweepPending();
     const handle = randomBytes(24).toString('base64url');
     const now = Date.now();
@@ -3406,7 +4183,9 @@ class AuthManager extends BaseManager {
       requestIp: ctx.ip,
       requestUserAgent: ctx.userAgent,
       requestLocation: ctx.location ?? null,
-      privateStoreHandle: ctx.privateStoreHandle
+      privateStoreHandle: ctx.privateStoreHandle,
+      requiredAal,
+      rolesAal
     });
     // #1532: an expiry is recorded when it happens, not when someone next looks.
     setTimeout(() => this.expirePending(handle), PENDING_SIGN_IN_TTL_MS + 1).unref?.();
@@ -3477,11 +4256,12 @@ class AuthManager extends BaseManager {
   async sendEmailApproval(handle: string, binding: string): Promise<'sent' | 'too-soon' | 'unavailable' | 'failed'> {
     const p = this.pendingSignIn(handle, binding);
     if (!p) return 'unavailable';
-    const mail = this.mailForLinks();
+    const mail = this.emailSecondFactorAvailable() ? this.mailForLinks() : null;
     const row = (this.credentials?.list(p.username) ?? []).find((c) => c.kind === 'email');
     const from = AuthManager.askedFrom(p);
     if (!mail || !row) {
-      await this.recordApproval(AUDIT_EVENT.SIGNINAPPROVAL_SENDFAIL, p, 'error', from, { reason: mail ? 'no email factor enrolled' : 'mail is not configured' });
+      const reason = mail ? 'no email factor enrolled' : this.mailForLinks() ? 'the email link is off in ngdpbase.auth.factors' : 'mail is not configured';
+      await this.recordApproval(AUDIT_EVENT.SIGNINAPPROVAL_SENDFAIL, p, 'error', from, { reason });
       return 'unavailable';
     }
     if (p.lastSentAt && Date.now() - p.lastSentAt < APPROVAL_RESEND_MS) {
@@ -3596,6 +4376,58 @@ class AuthManager extends BaseManager {
     return p.username;
   }
 
+  /**
+   * The authenticator app's code for the waiting sign-in (#421 slice 2b). Its
+   * check goes through `authenticate`, which records a wrong code as a failed
+   * sign-in; a right one approves the pending sign-in, which `completeTwoStep`
+   * then finishes with both factors. `unavailable` when the sign-in is gone,
+   * already decided, or the account has no authenticator app offered here.
+   * The caller throttles wrong codes as it does wrong passwords.
+   */
+  async approveByTotp(handle: string, binding: string, code: string, from: ApprovalVisitor = {}): Promise<'approved' | 'wrong' | 'unavailable'> {
+    const p = this.pendingSignIn(handle, binding);
+    if (!p || p.approved || p.denied) return 'unavailable';
+    if (!this.secondFactorsFor(p.username, p).some((f) => f.id === 'totp')) return 'unavailable';
+    const result = await this.authenticate('totp', { username: p.username, code }, { ipAddress: from.ip, userAgent: from.userAgent, purpose: 'sign-in' });
+    const factor = result.factors?.[0];
+    if (!result.success || result.username !== p.username || !factor) return 'wrong';
+    // The code may have taken a moment; the sign-in may have been cancelled or expired meanwhile.
+    if (!this.pendingSignIn(handle, binding) || p.approved || p.denied) return 'unavailable';
+    p.approved = factor;
+    return 'approved';
+  }
+
+  /**
+   * Whether step-up offers `username` the authenticator app's code (#421
+   * slice 2c): as at the second step, an app enrolled and its
+   * `ngdpbase.auth.factors` entry enabled.
+   */
+  stepUpTotpOffered(username: string): boolean {
+    return this.secondFactorsFor(username).some((f) => f.id === 'totp');
+  }
+
+  /**
+   * Step-up with the authenticator app (#421 slice 2c). The code is checked
+   * through `authenticate`, as at the second step of sign-in, so a wrong one
+   * is recorded as a failed re-check. With `password` (a role that needs
+   * AAL2), the password is checked first, and the result carries both
+   * factors, which together reach AAL2. `unavailable` when the app is not
+   * offered here. The caller throttles wrong answers as it does wrong passwords.
+   */
+  async reauthenticateByTotp(username: string, code: string, password: string | null, attempt: AuthAttempt = {}): Promise<AuthenticateResult | 'unavailable'> {
+    if (!this.stepUpTotpOffered(username)) return 'unavailable';
+    const recheck: AuthAttempt = { ...attempt, purpose: 're-check' };
+    const factors: SatisfiedFactor[] = [];
+    if (password !== null) {
+      const first = password ? await this.authenticate('password', { username, password }, recheck) : { success: false };
+      if (!first.success || first.username !== username) return { success: false };
+      factors.push(...(first.factors ?? []));
+    }
+    const otp = await this.authenticate('totp', { username, code }, recheck);
+    if (!otp.success || otp.username !== username) return { success: false };
+    return { ...otp, factors: [...factors, ...(otp.factors ?? [])] };
+  }
+
   /** Refuse the waiting sign-in from its link (Deny). Returns the username, or null. */
   async denyByToken(token: string, presser?: ApprovalVisitor): Promise<string | null> {
     const entry = this.approvalTokens.get(token);
@@ -3613,15 +4445,279 @@ class AuthManager extends BaseManager {
    * The finished sign-in, once its second factor is satisfied — both factors,
    * assessed together. Single use: the pending entry is gone after this.
    */
-  completeTwoStep(handle: string, binding: string): { result: AuthenticateResult; privateStoreHandle?: string } | null {
+  completeTwoStep(handle: string, binding: string): { result: AuthenticateResult; privateStoreHandle?: string; remember?: { version: string } } | null {
     const p = this.pendingSignIn(handle, binding);
-    if (!p?.approved || p.denied) return null;
+    if (!p || p.denied) return null;
+    // #1523 slice 1c: a remembered browser completes it with only the factors
+    // entered, and only while the person's roles still allow the skip.
+    const known = !p.approved && Boolean(p.knownDevice) && this.knownDeviceMaySkip(p);
+    if (!p.approved && !known) return null;
     this.pendingSignIns.delete(handle);
     for (const [token, entry] of this.approvalTokens) if (entry.handle === handle) this.approvalTokens.delete(token);
+    if (known) return { result: { ...p.first, knownDevice: true }, privateStoreHandle: p.privateStoreHandle };
     return {
-      result: { ...p.first, factors: [...(p.first.factors ?? []), p.approved] },
-      privateStoreHandle: p.privateStoreHandle
+      result: { ...p.first, factors: [...(p.first.factors ?? []), p.approved as SatisfiedFactor] },
+      privateStoreHandle: p.privateStoreHandle,
+      // Offered only where the skip could ever apply; see rememberOffered.
+      ...(p.remember && this.rememberOffered(p) ? { remember: p.remember } : {})
     };
+  }
+
+  // ── Known devices (#1523 slice 1c) ──────────────────────────────────────
+  //
+  // A remembered browser holds a non-extractable ECDSA P-256 key (WebCrypto)
+  // in IndexedDB; the site keeps the public half as a `device` row. At the
+  // second step it signs a one-time challenge. That skips the prompt, never
+  // raises the level (Q4: no carry-forward), and only for a person whose roles
+  // the factors entered already satisfy (operator, 2026-11-01).
+
+  /** How many days a remembered browser stays remembered: `ngdpbase.auth.known-device.remember-days`; 0 turns remembering off. */
+  rememberDays(): number {
+    const cm = this.engine.getManager<ConfigurationManager>('ConfigurationManager');
+    const days = Number(cm?.getProperty('ngdpbase.auth.known-device.remember-days', KNOWN_DEVICE_DEFAULT_DAYS));
+    return Number.isFinite(days) && days > 0 ? Math.min(days, 400) : 0;
+  }
+
+  /**
+   * Whether a remembered browser may skip this sign-in's second step: the
+   * factors entered already reach the highest `required-aal` among the
+   * person's roles (operator, 2026-11-01). A person whose roles need AAL2 is
+   * always asked.
+   */
+  knownDeviceMaySkip(p: Pick<PendingSignIn, 'first' | 'rolesAal'>): boolean {
+    if (this.rememberDays() === 0 || p.rolesAal === undefined) return false;
+    const record = this.signInRecord(p.first);
+    return Boolean(record) && (record as SignInRecord).aal >= Math.max(p.rolesAal, 1);
+  }
+
+  /** Whether "Remember this browser" is offered at this second step: only where it could ever skip one. */
+  rememberOffered(p: Pick<PendingSignIn, 'first' | 'rolesAal'>): boolean {
+    return this.knownDeviceMaySkip(p);
+  }
+
+  /** "Remember this browser" was ticked at the second step, having been shown `version` of its page. */
+  noteRemember(handle: string, binding: string, version: string): void {
+    const p = this.pendingSignIn(handle, binding);
+    if (p && this.rememberOffered(p) && /^[\w.-]{1,40}$/.test(version)) p.remember = { version };
+  }
+
+  /**
+   * When a remembered browser stops skipping the prompt: its stored expiry,
+   * or its creation plus the current `remember-days`, whichever is sooner,
+   * so lowering the setting shortens browsers already remembered.
+   */
+  private deviceExpiry(row: CredentialRecord, device: DeviceSecret): number {
+    const created = Date.parse(row.createdAt);
+    const now = Number.isFinite(created) ? created + this.rememberDays() * 86_400_000 : 0;
+    return Math.min(Date.parse(device.expiresAt), now);
+  }
+
+  /**
+   * `username`'s remembered browsers that have not expired. With the
+   * account's password-change `generation`, also only those remembered
+   * since the last password change (#1482).
+   */
+  rememberedDevices(username: string, now: number = Date.now(), generation?: number): Array<{ row: CredentialRecord; device: DeviceSecret }> {
+    const out: Array<{ row: CredentialRecord; device: DeviceSecret }> = [];
+    for (const row of this.credentials?.list(username) ?? []) {
+      if (row.kind !== 'device') continue;
+      const device = parseDeviceSecret(row.secret);
+      if (!device || this.deviceExpiry(row, device) <= now) continue;
+      if (generation !== undefined && (device.generation ?? 0) !== generation) continue;
+      out.push({ row, device });
+    }
+    return out;
+  }
+
+  private async accountGeneration(username: string): Promise<number> {
+    const account = await this.engine.getManager<{ getUser(u: string): Promise<unknown> }>('UserManager')?.getUser(username) as { sessionGeneration?: number } | null | undefined;
+    return sessionGenerationOf(account);
+  }
+
+  /**
+   * Drop `username`'s remembered browsers that no longer count: expired,
+   * unreadable, or remembered before the last password change. Each is
+   * recorded as `credential-remove` and its consent withdrawn. Returns the
+   * ones that still count.
+   */
+  async pruneRememberedDevices(username: string, now: number = Date.now()): Promise<Array<{ row: CredentialRecord; device: DeviceSecret }>> {
+    if (!this.credentials) return [];
+    const generation = await this.accountGeneration(username);
+    const live = this.rememberedDevices(username, now, generation);
+    const dead = this.credentials.list(username).filter((r) => r.kind === 'device' && !live.some((d) => d.row.id === r.id));
+    for (const row of dead) {
+      const device = parseDeviceSecret(row.secret);
+      const why = device && this.deviceExpiry(row, device) > now ? 'password-changed' : 'expired';
+      const ctx = systemContext(this.engine, `remembered browser ${row.id} of ${username}: ${why}`);
+      if (!(await this.credentials.remove(row.id))) continue;
+      this.auditCredentialChange(ctx, username, 'credential-remove', row, why);
+      await this.withdrawRememberConsent(ctx, username, row.subject, why);
+    }
+    return live;
+  }
+
+  /** Withdraw the "remember this browser" consent bound to `deviceId`; a failure is logged, the browser stays removed. */
+  private async withdrawRememberConsent(ctx: unknown, username: string, deviceId: string, why: string): Promise<void> {
+    const consent = this.engine.getManager<{ withdraw(u: string, scope: string, subject: string, c: unknown, why: string): Promise<unknown> }>('ConsentManager');
+    try {
+      await consent?.withdraw(username, REMEMBER_BROWSER_CONSENT_SCOPE, deviceId, ctx, why);
+    } catch (err) {
+      logger.error(`[AuthManager] remembered browser of ${username} removed (${why}), but its consent could not be withdrawn:`, err);
+    }
+  }
+
+  /**
+   * A one-time challenge for a remembered browser to sign, or null when the
+   * skip cannot apply (the roles need more, or no browser is remembered).
+   * A new challenge replaces the last.
+   */
+  knownDeviceChallenge(handle: string, binding: string): string | null {
+    const p = this.pendingSignIn(handle, binding);
+    if (!p || p.approved || p.denied || !this.knownDeviceMaySkip(p)) return null;
+    if (this.rememberedDevices(p.username).length === 0) return null;
+    p.deviceChallenge = randomBytes(32).toString('base64url');
+    return p.deviceChallenge;
+  }
+
+  /**
+   * A remembered browser's answer to the challenge (#1523 slice 1c). It
+   * counts only when the device is this person's, has not expired, the
+   * signature over the challenge verifies with its public key, and the
+   * browser and system still match what it was issued to, and the audit
+   * record its row names says the same as the row (#1523, operator
+   * 2026-10-31). Any failure is recorded and the prompt stays. A row whose
+   * audit record is missing or disagrees is also a security event; a row
+   * remembered before rows named their record is removed, so the browser is
+   * asked once and may be remembered again. The challenge is spent either way.
+   */
+  async proveKnownDevice(handle: string, binding: string, deviceId: string, signature: string, from: { ip?: string; userAgent?: string; platformHint?: string }): Promise<boolean> {
+    const p = this.pendingSignIn(handle, binding);
+    const challenge = p?.deviceChallenge;
+    if (p) delete p.deviceChallenge;
+    if (!p || !challenge || p.approved || p.denied || !this.knownDeviceMaySkip(p)) return false;
+    const fail = async (reason: string): Promise<false> => {
+      await this.auditCheck({ ipAddress: from.ip, userAgent: from.userAgent, purpose: 'sign-in' }, p.username, 'known device', 'failure', `remembered browser not accepted: ${reason}`);
+      return false;
+    };
+    const found = (await this.pruneRememberedDevices(p.username)).find((d) => d.row.subject === deviceId);
+    if (!found) return fail('no remembered browser of this account with that id, or it expired');
+    const now = browserIdentity(from.userAgent, from.platformHint);
+    if (!now || !sameBrowser(now, found.device)) return fail('a different browser or system from the one it was issued to');
+    let ok: boolean;
+    try {
+      const key = createPublicKey({ key: Buffer.from(found.device.publicKey, 'base64url'), format: 'der', type: 'spki' });
+      ok = verifySignature('sha256', Buffer.from(KNOWN_DEVICE_SIGNED_PREFIX + challenge, 'utf8'), { key, dsaEncoding: 'ieee-p1363' }, Buffer.from(signature, 'base64url'));
+    } catch {
+      ok = false;
+    }
+    if (!ok) return fail('the signature did not verify');
+    // After the signature, so only the browser holding the key can raise this.
+    const disagreement = await this.deviceRecordDisagreement(p.username, found.device);
+    if (disagreement === 'no record named') {
+      const ctx = systemContext(this.engine, `remembered browser ${found.row.id} of ${p.username}: remembered before rows named their sign-in record`);
+      if (await this.credentials?.remove(found.row.id)) {
+        this.auditCredentialChange(ctx, p.username, 'credential-remove', found.row, 'no-sign-in-record');
+        await this.withdrawRememberConsent(ctx, p.username, found.row.subject, 'no-sign-in-record');
+      }
+      return fail('remembered before rows named their sign-in record; asked once, and it may be remembered again');
+    }
+    if (disagreement) {
+      void recordAuditEvent(this.engine.getManager('AuditManager'), {
+        eventType: AUDIT_EVENT.SECURITY_EVENT,
+        user: p.username,
+        ipAddress: from.ip,
+        action: 'remembered-browser-record-mismatch',
+        result: 'deny',
+        severity: 'high',
+        resource: found.row.id,
+        resourceType: 'credential',
+        reason: `remembered browser ${found.row.id} of ${p.username} treated as unknown: ${disagreement}`,
+        metadata: { securityEventType: 'remembered-browser-record-mismatch', credentialId: found.row.id, auditId: found.device.auditId, userAgent: from.userAgent }
+      });
+      return fail(disagreement);
+    }
+    p.knownDevice = found.row.id;
+    await this.credentials?.touch(found.row.id, new Date().toISOString());
+    return true;
+  }
+
+  /**
+   * How a remembered browser's row disagrees with the audit record it names
+   * (#1523), or null when they agree: the record is the account's sign-in,
+   * made the way the row says, with the same factors. `'no record named'` for
+   * a row remembered before rows named one.
+   */
+  private async deviceRecordDisagreement(username: string, device: DeviceSecret): Promise<string | null> {
+    if (!device.auditId) return 'no record named';
+    const audit = this.engine.getManager<{ authenticationRecord?(id: string): Promise<AuthenticationRecordSummary | null> }>('AuditManager');
+    const record = await audit?.authenticationRecord?.(device.auditId);
+    if (!record) return `its sign-in record ${device.auditId} was not found`;
+    if (record.user !== username) return `its sign-in record ${device.auditId} is another account's`;
+    if (record.loginMethod !== device.signInMethod) return `its sign-in record ${device.auditId} names a different way of signing in`;
+    if (!sameAmr(record.amr, device.amr)) return `its sign-in record ${device.auditId} names different factors`;
+    return null;
+  }
+
+  /**
+   * Remember this browser for `ctx`'s person (#1523 slice 1c, Q5): the
+   * consent record first, bound to the device id, then the `device` row with
+   * the public key, the browser and system, and when it expires. Refused
+   * when the key is not an ECDSA P-256 public key, the browser cannot be
+   * told, the page changed since it was shown, or consent cannot be recorded.
+   * The row names the audit record of the sign-in (`auditId`, from
+   * `completeSignIn`), which must be readable and be this person's sign-in
+   * with these factors; otherwise nothing is remembered (#1523).
+   */
+  async rememberBrowser(
+    ctx: { username: string } & Record<string, unknown>,
+    input: { publicKey: string; version: string; userAgent?: string; platformHint?: string; amr: string[]; auditId?: string }
+  ): Promise<{ deviceId: string } | null> {
+    const days = this.rememberDays();
+    if (!this.credentials || days === 0) return null;
+    const identity = browserIdentity(input.userAgent, input.platformHint);
+    if (!identity) return null;
+    const audit = this.engine.getManager<{ authenticationRecord?(id: string): Promise<AuthenticationRecordSummary | null> }>('AuditManager');
+    const signIn = input.auditId ? await audit?.authenticationRecord?.(input.auditId) : null;
+    if (!signIn || signIn.user !== ctx.username || !sameAmr(signIn.amr, input.amr)) {
+      logger.warn(`[AuthManager] ${ctx.username} asked to remember a browser, but the audit record of the sign-in could not be read or does not match; not remembered (#1523)`);
+      return null;
+    }
+    let spki: Buffer;
+    try {
+      const key = createPublicKey({ key: Buffer.from(input.publicKey, 'base64url'), format: 'der', type: 'spki' });
+      if (key.asymmetricKeyType !== 'ec' || key.asymmetricKeyDetails?.namedCurve !== 'prime256v1') return null;
+      spki = key.export({ format: 'der', type: 'spki' });
+    } catch {
+      return null;
+    }
+    const deviceId = createHash('sha256').update(spki).digest('base64url');
+    // A key is made fresh for each remembering, so its id is new; one already
+    // stored under it (another account's included) is never replaced.
+    if (this.credentials.findBySubject('device', deviceId)) return null;
+    const consent = this.engine.getManager<{
+      documents(scope: string): Promise<ConsentDocument[]>;
+      accept(ctx: unknown, scope: string, seen: Array<{ id: string; version: string }>, how: string, subject?: string): Promise<unknown>;
+        }>('ConsentManager');
+    const doc = (await consent?.documents(REMEMBER_BROWSER_CONSENT_SCOPE))?.[0];
+    if (!consent || !doc || String(doc.version) !== input.version) return null;
+    try {
+      await consent.accept(ctx, REMEMBER_BROWSER_CONSENT_SCOPE, [{ id: doc.id, version: String(doc.version) }], 'sign-in', deviceId);
+    } catch (err) {
+      logger.warn(`[AuthManager] ${ctx.username} asked to remember a browser, but the consent could not be recorded; not remembered:`, err);
+      return null;
+    }
+    const now = new Date();
+    const secret: DeviceSecret = {
+      publicKey: spki.toString('base64url'),
+      ...identity,
+      amr: input.amr,
+      expiresAt: new Date(now.getTime() + days * 86_400_000).toISOString(),
+      generation: await this.accountGeneration(ctx.username),
+      auditId: signIn.id,
+      ...(signIn.loginMethod !== undefined ? { signInMethod: signIn.loginMethod } : {})
+    };
+    await this.storeCredential(ctx, ctx.username, { kind: 'device', subject: deviceId, secret: JSON.stringify(secret), label: `${identity.browser} on ${identity.os}` }, 'remember this browser');
+    return { deviceId };
   }
 
   /**
@@ -3669,7 +4765,7 @@ class AuthManager extends BaseManager {
    */
   async startEmailFactorEnrolment(ctx: PermissionSubject, username: string): Promise<'sent' | 'no-email' | 'unavailable' | 'already'> {
     if (!(await this.mayManageCredentials(ctx, username))) throw new Error('Permission denied');
-    const mail = this.mailForLinks();
+    const mail = this.emailSecondFactorAvailable() ? this.mailForLinks() : null;
     if (!mail) return 'unavailable';
     const user = await this.engine.getManager<UserManager>('UserManager')?.getUser(username);
     const address = typeof user?.email === 'string' ? user.email.trim() : '';
@@ -3862,9 +4958,11 @@ class AuthManager extends BaseManager {
   /**
    * Register an authentication provider (#1050).
    *
-   * The built-ins call this during `initialize()`, so the path an addon uses is
-   * the path exercised on every boot rather than a second, less-travelled one.
-   * Config gating stays with the caller: this method decides nothing about
+   * The built-ins register during `initialize()` through registerCoreProvider(),
+   * which shares every check below except the reserved ids, so the path an addon
+   * uses is the path exercised on every boot rather than a second, less-travelled
+   * one. Core ids and the `oidc:` prefix are reserved: an addon registering one is
+   * refused, whether or not core registered it on this site (#2223). Config gating stays with the caller: this method decides nothing about
    * whether a provider *should* be active, only that it is.
    *
    * ## Duplicate ids: first registration wins
@@ -3892,37 +4990,70 @@ class AuthManager extends BaseManager {
    * otherwise here would be worse than the gap.
    *
    * @param provider the provider to register
-   * @param source   attribution for logs — an addon name, or 'built-in'
-   * @returns true if registered; false if rejected as malformed or duplicate
+   * @param source   attribution for logs: the add-on's name
+   * @returns true if registered; false if rejected as reserved, malformed or duplicate
    */
-  registerProvider(provider: AuthProvider, source = 'built-in'): boolean {
+  registerProvider(provider: AuthProvider, source = 'an add-on'): boolean {
+    // #2223: core's ids and the oidc: prefix are core's alone, registered
+    // through registerCoreProvider() in initialize(). An add-on claiming one
+    // would bring its own verify() and AAL under a name the factors config
+    // trusts, on a site where core left that id unregistered.
+    // The id must be a plain own property, read once, and only that value is
+    // checked and stored: a getter could pass the check as one id and register
+    // as another.
+    const idProperty = provider ? Object.getOwnPropertyDescriptor(provider, 'id') : undefined;
+    if (provider && idProperty && !('value' in idProperty)) {
+      logger.error(`[AuthManager] Rejected provider from ${source}: its id must be a plain property, not a getter`);
+      return false;
+    }
+    const id: unknown = idProperty?.value;
+    if (typeof id === 'string' && isReservedProviderId(id)) {
+      logger.error(
+        `[AuthManager] Rejected provider '${id}' from ${source}: core provider ids ` +
+        `(${CORE_PROVIDER_IDS.join(', ')}) and the 'oidc:' prefix are reserved for core`
+      );
+      return false;
+    }
+    return this.addProvider(provider, id, source);
+  }
+
+  /**
+   * Core's own registrations (#2223): the one way a reserved id gets in. Called
+   * only from initialize() and the helpers it runs; add-ons get the AuthManager
+   * through the engine and call registerProvider(), which refuses these ids.
+   */
+  private registerCoreProvider(provider: AuthProvider): boolean {
+    return this.addProvider(provider, provider?.id, 'built-in');
+  }
+
+  private addProvider(provider: AuthProvider, id: unknown, source: string): boolean {
     // An addon can pass anything. A provider with no id would be unreachable;
     // one with no verify() would throw inside authenticate() on a live request,
     // which is a worse place to find out than boot.
-    if (!provider || typeof provider.id !== 'string' || provider.id.trim() === '') {
+    if (!provider || typeof id !== 'string' || id.trim() === '') {
       logger.error(`[AuthManager] Rejected provider from ${source}: missing id`);
       return false;
     }
     if (typeof provider.verify !== 'function') {
-      logger.error(`[AuthManager] Rejected provider '${provider.id}' from ${source}: no verify()`);
+      logger.error(`[AuthManager] Rejected provider '${id}' from ${source}: no verify()`);
       return false;
     }
 
-    if (this.providers.has(provider.id)) {
+    if (this.providers.has(id)) {
       logger.warn(
-        `[AuthManager] Provider '${provider.id}' is already registered — ` +
+        `[AuthManager] Provider '${id}' is already registered — ` +
         `keeping the existing one, ignoring the registration from ${source}`
       );
       return false;
     }
 
-    this.providers.set(provider.id, provider);
+    this.providers.set(id, provider);
     this.factorCache = null;
     // info, not debug: which auth providers are live is a security-relevant
     // fact about a running instance, and the boot log is where an operator
     // checks it. Callers add a second line only when they carry config detail
     // worth seeing (transport, issuer, team) — never a bare repeat of the id.
-    logger.info(`[AuthManager] Registered provider: ${provider.id} (${source})`);
+    logger.info(`[AuthManager] Registered provider: ${id} (${source})`);
     return true;
   }
 

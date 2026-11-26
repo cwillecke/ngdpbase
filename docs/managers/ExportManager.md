@@ -1,6 +1,6 @@
 ---
 name: ExportManager
-description: Per-page export to HTML or Markdown, the one CSV writer for every CSV export, and HTML to PDF through a chosen provider (none, local Chromium, or a Chromium service)
+description: A page as a styled HTML document, the one CSV writer for every CSV export, and HTML to PDF through a chosen provider (none, local Chromium, or a Chromium service)
 dateModified: '2026-10-23'
 category: managers
 code: src/managers/ExportManager.ts
@@ -16,15 +16,13 @@ __Complete Guide:__ [ExportManager-Complete-Guide.md](ExportManager-Complete-Gui
 
 ## Overview
 
-ExportManager handles page exports to multiple formats. Similar to JSPWiki's export functionality, it exports pages to HTML and Markdown, and turns any HTML document into a PDF.
+ExportManager renders a page as a styled HTML document, writes the one CSV format, and turns any HTML document into a PDF. The export screens (__Export this page__, __Export these results__) run through the ImportManager's export engine, which calls it for the HTML and PDF.
 
 ## Key Features
 
-- Export single pages to HTML with styling
+- Render a page as an HTML document with styling
 - Export multiple pages to combined HTML with table of contents
-- Export to Markdown format (raw page content)
 - Locale-aware timestamp formatting
-- Export file management (save, list, delete)
 - The one CSV writer for every CSV export (`toCsv`, `csvCell`): the audit log export and add-ons alike
 - HTML to PDF (`htmlToPdf`): sandboxed, deterministic, off the request path; see [HTML to PDF](#html-to-pdf)
 
@@ -33,26 +31,16 @@ ExportManager handles page exports to multiple formats. Similar to JSPWiki's exp
 ```javascript
 const exportManager = engine.getManager('ExportManager');
 
-// Export single page to HTML
-const html = await exportManager.exportPageToHtml('Main');
-
 // Export multiple pages
 const combinedHtml = await exportManager.exportPagesToHtml(['Main', 'Welcome', 'About']);
-
-// Export to markdown
-const markdown = await exportManager.exportToMarkdown('Main');
-
-// Save export to file
-const filePath = await exportManager.saveExport(html, 'MyExport', 'html');
 ```
 
 ## Supported Formats
 
 | Format | Method | Description |
 | -------- | -------- | ------------- |
-| HTML | `exportPageToHtml()` | Full HTML document with styling |
+| HTML (one page) | `renderPageDocument()` | Full HTML document with styling, for a page the caller already read |
 | HTML (Multi) | `exportPagesToHtml()` | Combined pages with TOC |
-| Markdown | `exportToMarkdown()` | Raw page content |
 | CSV | `toCsv(headers, rows)` | Any tabular data; see [CSV](#csv) |
 | PDF | `htmlToPdf(ctx, html, options?)` | Any HTML document; see [HTML to PDF](#html-to-pdf) |
 
@@ -101,6 +89,8 @@ A Chromium service the site reaches by URL, speaking [Gotenberg](https://gotenbe
 - The PDF goes through the same `normalizePdf` pass a local render gets, in a child process (`normalizePdfInChild`), so parsing it never runs on the thread that answers requests.
 - Unavailable (flagged): no URL set, refused by the egress policy, or nothing answering. A render failure (not flagged): a timeout, a non-`200` answer, an answer that is not a PDF or is too large.
 - What the service's Chromium may load is the service's own setting, not the request's: run Gotenberg with JavaScript off and no outside URLs ([SETUP.md](../../SETUP.md#chrome-service-gotenberg)), and inline images, stylesheets and fonts as for `local-chrome`.
+- Gotenberg's Chromium fetches from Gotenberg's own network, so a URL in the HTML can reach hosts the site cannot (another container, a cloud metadata address). Two Gotenberg flags limit it. `--chromium-allow-list` (SETUP.md sets `^(data:|file:///tmp/)`) loads nothing else. `--chromium-deny-list` refuses what matches, after the allow list; its default, `^file:(?!//\/tmp/).*`, blocks only local files, so a site that cannot use the allow list should at least deny `file:` outside Gotenberg's temp folder, loopback, the private ranges and link-local, for example `'--chromium-deny-list=^(file:(?!//\/tmp/)|https?://(localhost|127\.|0\.|10\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|\[)).*'`. A deny list by address does not catch a host name that resolves inside the network (`http://elasticsearch:9200`), which is why the allow list is the setting to use.
+- The page export (`core.pdf`, [#2120](https://github.com/jwilleke/ngdpbase/issues/2120)) does not rely on those flags: it takes every URL that is not `data:` out of the HTML before it leaves the process (`withoutRemoteUrls`, `src/ice/shims/export.ts`). Any other caller of `htmlToPdf` (an add-on's invoice, say) passes HTML it built itself, and still relies on them.
 
 ### Deterministic output
 
@@ -158,6 +148,8 @@ Never write a second CSV writer; call this one.
 Default: `./exports`
 
 Configurable via `config.exportDirectory` during initialization.
+
+The single-page HTML and Markdown routes that saved files here were removed ([#2378](https://github.com/jwilleke/ngdpbase/issues/2378)), and ExportManager writes nothing here now. Files they saved earlier stay on disk. No screen lists, downloads or deletes them; an administrator manages the folder directly.
 
 ## Related Managers
 

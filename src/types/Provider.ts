@@ -115,6 +115,28 @@ export interface PrivateStorePageRef {
 }
 
 /**
+ * One page in a private store with what a clean-up of its frontmatter reads
+ * (#2514): its path name, uuid, file and metadata.
+ */
+export interface PrivateStorePageInfo {
+  /** The page's path name, `vaults/{owner}/{store}/{title}`. */
+  title: string;
+  uuid: string;
+  filePath: string;
+  metadata: Partial<PageFrontmatter>;
+}
+
+/**
+ * What {@link PageProvider.listPrivateStorePageInfo} found: the pages it could
+ * read, and how many vaults and pages it could not (a closed encrypted vault,
+ * a damaged index or file). A count only: nothing names a page or a path.
+ */
+export interface PrivateStorePageInfoList {
+  pages: PrivateStorePageInfo[];
+  unreadable: number;
+}
+
+/**
  * Options for {@link PageProvider.getPagesByCreator} (#640).
  */
 export interface GetPagesByCreatorOptions {
@@ -262,6 +284,16 @@ export interface PageProvider extends BaseProvider {
   listPrivateStorePages?(ctx: ActorContext, owner?: string): Promise<PrivateStorePageRef[]>;
 
   /**
+   * The pages {@link listPrivateStorePages} lists, each read for its
+   * frontmatter, for the upgrade clean-up of old access limits (#2514). A
+   * vault that cannot be opened with `ctx` (closed, or its index is damaged)
+   * and a page whose file cannot be read are left out and counted in
+   * `unreadable`, so a caller can tell "nothing there" from "could not look".
+   * Never logs a page's name or path. Optional capability, like the listing.
+   */
+  listPrivateStorePageInfo?(ctx: ActorContext, owner?: string): Promise<PrivateStorePageInfoList>;
+
+  /**
    * One owner's private stores as `ctx` can read them (#1457), by store id.
    *
    * A store whose index this context cannot open — sealed, and no key — is
@@ -361,6 +393,16 @@ export interface PageProvider extends BaseProvider {
    * @param uuid - Page UUID
    */
   restoreDeletedPage?(uuid: string): Promise<{ ok: true; title: string } | { ok: false; reason: string; detail?: string }>;
+
+  /**
+   * Where a trashed page would come back to, and its frontmatter, so the
+   * write door can decide the restore before it happens (#1815, security
+   * review L5): its title, or its vault name when it was deleted from a
+   * vault. Null when the uuid is not in the trash.
+   *
+   * @param uuid - Page UUID
+   */
+  deletedPageForRestore?(uuid: string): Promise<{ name: string; metadata: PageFrontmatter } | null>;
 
   /**
    * Get all page titles
@@ -715,6 +757,12 @@ export interface StoreFileInput {
    * the file is marked {@link StoreFileEntry.download}.
    */
   keptOriginal?: { types: readonly string[] };
+  /**
+   * The id to store the file under, set only by AttachmentManager for a file
+   * a takeout re-import brings back (#2188), after it checked that no other
+   * file anywhere holds it. A store that already lists the id refuses it.
+   */
+  id?: string;
 }
 
 /**

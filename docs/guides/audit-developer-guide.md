@@ -1,7 +1,7 @@
 ---
 name: Audit developer guide
 description: How to add or change an audit event — the configuration entry, the names module, the emitter, the on-failure rule, the actor, the tests, and the checks that fail
-dateModified: 2026-10-30
+dateModified: 2026-11-08
 category: guides
 relatedModules: [AuditManager, FileAuditProvider, DatabaseAuditProvider]
 ---
@@ -37,9 +37,11 @@ What a developer has to do so that an action leaves a record. The decisions behi
 Decided by the operator on 2026-10-17 ([#1825](https://github.com/jwilleke/ngdpbase/issues/1825)):
 
 - __The enforcement point records what it allowed.__ The manager that guards a resource (the PEP) records each action it carried out, with the actor, the user acted for, and the resource's `owner` read from storage. It knows what was done ("lab results from Licking Memorial"); core doesn't. Examples: PageManager for pages, FileManager for files (`asset-upload` and `asset-delete`; AttachmentManager, the storage underneath it, records neither, [#2149](https://github.com/jwilleke/ngdpbase/issues/2149)), an add-on's own manager (PhrManager, LedgerManager) for its records, with events it declares. ReviewManager records a request for review filed, approved, rejected, or approved but not carried out (`review-filed`, `review-approved`, `review-rejected`, `review-failed`; [#2072](https://github.com/jwilleke/ngdpbase/issues/2072)): the request's id, kind, handler and permission, never its summary, details, note or the handler's failure text; the add-on's handler records its own work through its own doors.
+- __An import is recorded by the receiver's door, not by the engine.__ Each item's own record is the door it went through (`page-create`, `asset-upload`). Importing the same takeout again puts no file the store still holds, so it writes no second `asset-upload` ([#2171](https://github.com/jwilleke/ngdpbase/issues/2171)). A takeout imported into a private store on `/import` is also recorded as one act, `store-import`, once per run, by `core.private-store`'s `runDone` (`recordStoreImport` in `src/managers/ImportManager.ts`, [#2118](https://github.com/jwilleke/ngdpbase/issues/2118)): the owner (identity `@id` and username), the store, the run id and counts only, never a page title or a file name, since the run is confidential ([#2110](https://github.com/jwilleke/ngdpbase/issues/2110)). When a file could not keep its id, the record also has `filesRenumbered` (each file's takeout id and new id), `pagesRelinked`, the uuids of the store's pages pointed at the new id, and `pagesNotRelinked`, the uuids of those that could not be saved, when there are any ([#2188](https://github.com/jwilleke/ngdpbase/issues/2188)).
 - __Core records every refusal.__ A refused attempt is never left to the enforcement point to remember:
   - page and media doors record each denial as `authorization-deny` (`PolicyInformationPoint.logAccessDecision`); an affordance records nothing;
-  - `ApiContext.enforceDeny`, the one refusal helper, records the same `authorization-deny` event: actor, the user acted for, action, the resource and its owner when given, and the reason. __Not built yet__ (see [Known gaps](#known-gaps)).
+  - a page write refused on the capability alone is recorded by the door that refused it, with `metadata.policyIds` when a policy decided, and `metadata.conditionNotMet` for allows whose condition was not met ([#2288](https://github.com/jwilleke/ngdpbase/issues/2288)) ([#2272](https://github.com/jwilleke/ngdpbase/issues/2272)): `POST /save` and the other routes behind `WikiRoutes.writeRefusal` (`page-edit`, `page-create`) through `PolicyInformationPoint.recordPageRefusal`, and `PageManager.recordCreateRefusal` for a create that reaches the manager. A refusal is recorded by one of the two, never both: the route's refusal returns before the manager is asked;
+  - `ApiContext.enforceDeny`, the one refusal helper, records the same `authorization-deny` event when the caller passes the resource: actor, the user acted for, action, the resource and its owner (`metadata.owner` the identity @id, `metadata.ownerUser` the username), and the reason ([#1823](https://github.com/jwilleke/ngdpbase/issues/1823)). A capability refusal with no resource is still unrecorded (see [Known gaps](#known-gaps)).
 - __The PDP records nothing.__ It decides; recording is the enforcement point's and the refusal helper's.
 - Which events are recorded at all is configuration: each event's `enabled` in its catalog entry.
 
@@ -64,6 +66,8 @@ const page = await audit.searchEntriesAbout(person, { limit: 50, offset: 0 }, ct
 ```
 
 The manager asks the PDP with that subject: `profile-manage` when the subject's username is `person` (every account holds it), `admin-system` for anyone else's entries. A refusal throws `AuditQueryForbiddenError`; never catch it into an empty page. An add-on (yourPHR's patient view) calls it from its own route or manager with the subject core handed it, and renders the rows itself. The database provider answers from indexes; the file provider from the newest 10,000 records it holds in memory.
+
+One record is looked up by id for a check, not a query: `AuditManager.authenticationRecord(id)` returns the user, `loginMethod` and `amr` of an `authentication-success` record, or null, and asks no caller since nothing else of the record leaves it ([#1523](https://github.com/jwilleke/ngdpbase/issues/1523): a remembered browser's row names its sign-in's record). It reads through the provider's `findRecordById`: the database provider by its unique `id` index, the file provider from its queue and memory and then the live log and archives, newest first. A provider without it (the base, the null and cloud providers) answers null.
 
 ## Addons
 
@@ -108,4 +112,4 @@ At boot the log says which provider loaded and whether the posture changed since
 
 ## Known gaps
 
-- [#1825](https://github.com/jwilleke/ngdpbase/issues/1825) — `enforceDeny` does not record its refusals yet; until it does, a refusal by an add-on's manager or a capability check leaves no audit record (page doors already record theirs). Audit entries don't carry a resource `owner` yet (#1823), and most reads (`page-read`, `asset-read`, `vault-proxy`) are switched off by default.
+- [#1825](https://github.com/jwilleke/ngdpbase/issues/1825) — `enforceDeny` records a refusal when the caller passes the resource, including `metadata.owner` ([#1823](https://github.com/jwilleke/ngdpbase/issues/1823)). A capability refusal with no resource still leaves no audit record. Most reads (`page-read`, `asset-read`, `vault-proxy`) are switched off by default. An allow of an add-on record is still the add-on's own event, recorded by its manager. A role cannot be given everyone's records of a type that declares `owner`; obligations such as emergency access are not built.

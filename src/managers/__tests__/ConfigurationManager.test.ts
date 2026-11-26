@@ -212,6 +212,46 @@ describe('ConfigurationManager', () => {
 
       expect(result).toBe('/absolute/path/to/data');
     });
+
+    // #2492: a value typed on the Backup page is resolved exactly as the same value is at start-up.
+    test.each([
+      ['./data/backups', 'backups'],
+      ['data/backups', 'backups'],
+      ['${SLOW_STORAGE}/backups', 'backups'],
+      ['./data', '']
+    ])('resolveConfiguredPath(%s) is under the instance data folder, as getResolvedDataPath says', (typed, below) => {
+      const base = configManager.getInstanceDataFolder();
+      const expected = below ? path.join(base, below) : base;
+      expect(configManager.resolveConfiguredPath(typed)).toBe(expected);
+      configManager.getProperty = () => typed;
+      expect(configManager.getResolvedDataPath('any.key', '/unused')).toBe(expected);
+    });
+
+    describe('resolveTypedPath reads the environment first, as getProperty does (#2492)', () => {
+      afterEach(() => { delete process.env.SLOW_STORAGE; });
+
+      test.each([
+        ['${SLOW_STORAGE}/backups', '/mnt/slow/backups'],
+        ['${SLOW_STORAGE}', '/mnt/slow'],
+        ['/mnt/other/backups', '/mnt/other/backups']
+      ])('%s, with SLOW_STORAGE set, is the folder getResolvedDataPath gives for the stored value', (typed, expected) => {
+        process.env.SLOW_STORAGE = '/mnt/slow';
+        configManager.mergedConfig = { ...(configManager.mergedConfig || {}), 'ngdpbase.test.folder': typed };
+        expect(configManager.resolveTypedPath(typed, 'ngdpbase.test.folder')).toBe(expected);
+        expect(configManager.getResolvedDataPath('ngdpbase.test.folder', '/unused')).toBe(expected);
+      });
+
+      test('with the variable unset it is under the instance data folder, as before', () => {
+        delete process.env.SLOW_STORAGE;
+        expect(configManager.resolveTypedPath('${SLOW_STORAGE}/backups', 'ngdpbase.test.folder'))
+          .toBe(path.join(configManager.getInstanceDataFolder(), 'backups'));
+      });
+    });
+
+    test('resolveConfiguredPath leaves an absolute or other relative path as typed', () => {
+      expect(configManager.resolveConfiguredPath('/mnt/backups')).toBe('/mnt/backups');
+      expect(configManager.resolveConfiguredPath('./required-pages')).toBe('./required-pages');
+    });
   });
 
   describe('custom config loading from instance data folder', () => {
@@ -413,8 +453,8 @@ describe('ConfigurationManager', () => {
       const defaultConfig = {
         'ngdpbase.application-name': 'TestWiki',
         'ngdpbase.access.policies': [
-          { 'id': 'admin-full-access', 'name': 'Admin Access', 'priority': 100 },
-          { 'id': 'reader-permissions', 'name': 'Reader', 'priority': 60 }
+          { 'id': 'admin-full-access', 'name': 'Admin Access', 'description': 'd100' },
+          { 'id': 'reader-permissions', 'name': 'Reader', 'description': 'd60' }
         ]
       };
       await fs.writeJson(
@@ -427,8 +467,8 @@ describe('ConfigurationManager', () => {
       await fs.ensureDir(instanceConfigDir);
       const customConfig = {
         'ngdpbase.access.policies': [
-          { 'id': 'custom-policy', 'name': 'Custom Policy', 'priority': 50 },
-          { 'id': 'reader-permissions', 'name': 'Custom Reader', 'priority': 65 }
+          { 'id': 'custom-policy', 'name': 'Custom Policy', 'description': 'd50' },
+          { 'id': 'reader-permissions', 'name': 'Custom Reader', 'description': 'd65' }
         ]
       };
       await fs.writeJson(
@@ -452,7 +492,7 @@ describe('ConfigurationManager', () => {
       expect(adminPolicy.name).toBe('Admin Access');
       expect(customPolicy.name).toBe('Custom Policy');
       expect(readerPolicy.name).toBe('Custom Reader');
-      expect(readerPolicy.priority).toBe(65);
+      expect(readerPolicy.description).toBe('d65');
     });
 
     test('should replace arrays without id fields', async () => {
@@ -1530,6 +1570,86 @@ describe('ConfigurationManager', () => {
       expect(record).not.toContain('123456789012');
       expect(record).toContain('(hidden)');
       expect(record).toContain('Checking');
+    });
+  });
+
+  // #2126: a list merged by id (the access policies) is written by the Shared
+  // folders screen one site entry at a time. The custom file then holds only
+  // the site's entries; what is in force must still be shipped ⊕ site, as it
+  // is after a restart, not the site's entries alone.
+  describe('setProperty on a list merged by id (#2126)', () => {
+    const POLICIES = 'ngdpbase.access.policies';
+    const actor = { username: 'admin', isAuthenticated: true, roles: ['admin'] };
+    const shipped = [{ id: 'shipped-a', description: 'd1' }, { id: 'shipped-b', description: 'd2' }];
+
+    async function makeCm() {
+      await fs.ensureDir(path.join(tempDir, 'data', 'config'));
+      await fs.writeJson(path.join(tempDir, 'config', 'app-default-config.json'), { [POLICIES]: shipped, 'ngdpbase.plain.list': ['a', 'b'] }, { spaces: 2 });
+      const cm = new ConfigurationManager({ getManager: vi.fn(() => null) });
+      await cm.initialize();
+      return cm;
+    }
+
+    test('the site\'s entries are written alone, and what is in force is shipped and site together, as after a restart', async () => {
+      const cm = await makeCm();
+      await cm.setProperty(POLICIES, [{ id: 'site-x', description: 'd3' }], actor);
+      expect((await fs.readJson(cm.getCustomConfigPath()))[POLICIES]).toEqual([{ id: 'site-x', description: 'd3' }]);
+      const now = (cm.getProperty(POLICIES) as Array<{ id: string }>).map((p) => p.id);
+      expect(now).toEqual(['shipped-a', 'shipped-b', 'site-x']);
+      const restarted = new ConfigurationManager({ getManager: vi.fn(() => null) });
+      await restarted.initialize();
+      expect((restarted.getProperty(POLICIES) as Array<{ id: string }>).map((p) => p.id)).toEqual(now);
+    });
+
+    test('a site entry with a shipped id overrides that one', async () => {
+      const cm = await makeCm();
+      await cm.setProperty(POLICIES, [{ id: 'shipped-b', description: 'd9' }, { id: 'site-x' }], actor);
+      expect(cm.getProperty(POLICIES)).toEqual([{ id: 'shipped-a', description: 'd1' }, { id: 'shipped-b', description: 'd9' }, { id: 'site-x' }]);
+    });
+
+    test('undefined takes the key out of the custom file: the layers beneath are in force again, now and after a restart', async () => {
+      const cm = await makeCm();
+      await cm.setProperty(POLICIES, [{ id: 'site-x' }], actor);
+      await cm.setProperty(POLICIES, undefined, actor);
+      expect(await fs.readJson(cm.getCustomConfigPath())).not.toHaveProperty(POLICIES);
+      expect(cm.getProperty(POLICIES)).toEqual(shipped);
+      const restarted = new ConfigurationManager({ getManager: vi.fn(() => null) });
+      await restarted.initialize();
+      expect(restarted.getProperty(POLICIES)).toEqual(shipped);
+    });
+
+    test('a list not merged by id is still replaced', async () => {
+      const cm = await makeCm();
+      await cm.setProperty('ngdpbase.plain.list', ['c'], actor);
+      expect(cm.getProperty('ngdpbase.plain.list')).toEqual(['c']);
+    });
+  });
+
+  // #2279: PolicyEvaluator keeps compiled conditions while the revision is unchanged,
+  // so every path that changes what is in force must change it.
+  describe('getRevision changes on every change to the configuration in force (#2279)', () => {
+    const actor = { username: 'admin', isAuthenticated: true, roles: ['admin'] };
+    const changes = async (cm: ConfigurationManager, change: () => unknown): Promise<boolean> => {
+      const before = cm.getRevision();
+      await change();
+      return cm.getRevision() !== before;
+    };
+
+    test('reading changes nothing', async () => {
+      await configManager.initialize();
+      expect(await changes(configManager, () => configManager.getProperty('ngdpbase.access.policies', []))).toBe(false);
+    });
+
+    test('a save, a runtime value, a reload, a reset and a restore each change it', async () => {
+      await fs.ensureDir(path.join(tempDir, 'data', 'config'));
+      await configManager.initialize();
+      expect(await changes(configManager, () => configManager.setProperty('ngdpbase.access.policies', [{ id: 'site-x' }], actor))).toBe(true);
+      expect(await changes(configManager, () => configManager.setProperty('ngdpbase.access.policies', undefined, actor))).toBe(true);
+      expect(await changes(configManager, () => configManager.setRuntimeProperty('ngdpbase.access.policies', [{ id: 'addon-x' }]))).toBe(true);
+      expect(await changes(configManager, () => configManager.reload())).toBe(true);
+      expect(await changes(configManager, () => configManager.resetToDefaults(actor))).toBe(true);
+      const backup = await configManager.backup();
+      expect(await changes(configManager, () => configManager.restore(backup))).toBe(true);
     });
   });
 

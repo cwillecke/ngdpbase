@@ -48,6 +48,8 @@ import ShareManager from './managers/ShareManager.js';
 import ConsentManager from './managers/ConsentManager.js';
 import SharedFolderManager from './managers/SharedFolderManager.js';
 import ReviewManager from './managers/ReviewManager.js';
+import UpgradeCheckManager from './managers/UpgradeCheckManager.js';
+import { shippedLiveChecks, shippedUpgradeChecks } from './upgradeChecks/index.js';
 import OrganizationManager from './managers/OrganizationManager.js';
 import IdentityManager from './managers/IdentityManager.js';
 import RoleManager from './managers/RoleManager.js';
@@ -488,6 +490,14 @@ class WikiEngine extends Engine {
     // did not exist yet. Say so now.
     await databaseManager.reportAtBoot();
 
+    // #2301: the release's run-once checks, last, once every manager they ask exists.
+    const upgradeChecks = new UpgradeCheckManager(this);
+    this.registerManager('UpgradeCheckManager', upgradeChecks);
+    await upgradeChecks.initialize();
+    shippedUpgradeChecks(this).forEach((check) => upgradeChecks.register(check));
+    shippedLiveChecks(this).forEach((check) => upgradeChecks.registerLive(check));
+    await upgradeChecks.runAtBoot();
+
     // Mark engine as initialized (required for Engine base class contract)
     this.initialized = true;
 
@@ -524,6 +534,12 @@ class WikiEngine extends Engine {
       await this.getManager<PageManager>('PageManager')?.reportUnmatchableAddonAudiences()
         .catch((err: unknown) => logger.warn('[WikiEngine] Could not check pages for addon: audiences:', err));
     }
+    // #2269: required pages and add-on pages are seeded by now, so the seeded-pages
+    // record is complete and the install stamp on a shipped page is not mistaken
+    // for a limit someone set. Outside the add-on branch: it needs no add-ons.
+    await this.getManager<PageManager>('PageManager')?.convertLegacyAccessAtBoot();
+    await this.getManager<PageManager>('PageManager')?.reportLegacyAccessLimits()
+      .catch((err: unknown) => logger.warn('[WikiEngine] Could not check pages for access limits that no longer apply:', err));
     // #1876: every manager, add-ons included, has now applied its part of a
     // staged restore; say what the restore did, and what it did not bring back.
     await this.getManager<BackupManager>('BackupManager')?.reportRestoreAtBoot();

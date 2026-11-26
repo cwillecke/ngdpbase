@@ -47,7 +47,7 @@ Management (create, edit, delete events; see private reservation details; cancel
 ```json
 {
   "ngdpbase.access.policies": [
-    { "id": "clubhouse-manager-calendar", "name": "Clubhouse manager runs the calendar", "priority": 90, "effect": "allow",
+    { "id": "clubhouse-manager-calendar", "name": "Clubhouse manager runs the calendar", "effect": "allow",
       "subjects": [{ "type": "role", "value": "clubhouse-manager" }], "resources": [{ "type": "page", "pattern": "*" }],
       "actions": ["calendar-manage"] }
   ]
@@ -55,6 +55,10 @@ Management (create, edit, delete events; see private reservation details; cancel
 ```
 
 The add-on never names a role (#1198, #1220).
+
+### Who may see a calendar
+
+Each calendar's `visibility` setting (see [configuration](docs/configuration.md)) applies to the calendar view, the API (`/api/calendar/events`, `/events/search`, `/events/:id`) and the `.ics` feed alike. A `public` calendar is shown to everyone. Every calendar must have a `visibility`: a configured one with no setting is read as `private`, and the calendar admin page names it. A calendar the configuration does not name is read as `private`, and one set to `enabled: false` is shown to no one. An `authenticated` calendar is shown to holders of the `calendar-read` permission, which this add-on grants to every signed-in account. A `private` calendar is shown to holders of `calendar-manage`. A calendar the viewer may not see shows no events, including in the marquee text, and its single-event and `.ics` addresses answer as not found. A changed `visibility` or `enabled` setting applies on the next request, with no restart.
 
 ## Markup Directive
 

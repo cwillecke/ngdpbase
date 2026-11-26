@@ -21,6 +21,7 @@ describe('AuthManager', () => {
     // to exercise the refuse-to-register path.
     // #1523: the retired flat list is read only from custom config.
     getCustomProperty: vi.fn((key) => (overrides.custom ?? {})[key]),
+    getUnresolvedProperty: vi.fn((key, defaultValue) => (overrides.properties ?? {})[key] ?? defaultValue),
     isBaseUrlExplicit: vi.fn().mockReturnValue(overrides.baseUrlExplicit ?? true),
     getBaseURL: vi.fn().mockReturnValue('https://wiki.example.com')
   });
@@ -106,6 +107,9 @@ describe('AuthManager', () => {
       return manager;
     };
     const fake = (id, factor) => ({ id, displayName: id, factor, verify: vi.fn() });
+    // totp is a core id (#421), which registerProvider() refuses (#2223): register it the way core does.
+    const registerCore = (manager: AuthManager, provider: unknown) =>
+      (manager as unknown as { registerCoreProvider: (p: unknown) => boolean }).registerCoreProvider(provider);
 
     test('with no configuration, password is the one factor offered', async () => {
       const manager = await started();
@@ -122,17 +126,74 @@ describe('AuthManager', () => {
       expect(manager.getFactors()).toEqual([]);
     });
 
+    describe('the boot check of factor ids (#1523 Q1)', () => {
+      test('an enabled entry naming an id no provider could register refuses the boot, naming it and the known ids', async () => {
+        const manager = await started({ 'ngdpbase.auth.factors': [{ authproviderid: 'password' }, { authproviderid: 'pasword' }] });
+        const problems = manager.checkFactorIds();
+        expect(problems).toHaveLength(1);
+        expect(problems[0]).toMatch(/^ngdpbase\.auth\.factors entry 'pasword' names no provider\. Known ids: .*\bpassword\b/);
+        expect(problems[0]).toContain('passkey');
+      });
+
+      test('a disabled entry naming an unknown id only warns', async () => {
+        const logger = (await import('../../utils/logger')).default;
+        const warn = vi.spyOn(logger, 'warn');
+        const manager = await started({ 'ngdpbase.auth.factors': [{ authproviderid: 'password' }, { authproviderid: 'pasword', enabled: false }] });
+        expect(manager.checkFactorIds()).toEqual([]);
+        expect(warn).toHaveBeenCalledWith(expect.stringMatching(/ngdpbase\.auth\.factors entry 'pasword' names no provider.*The entry is off, so it is ignored/));
+        warn.mockRestore();
+      });
+
+      test('an id an add-on registers is known once it has registered', async () => {
+        const manager = await started({ 'ngdpbase.auth.factors': [{ authproviderid: 'password' }, { authproviderid: 'addon-key' }] });
+        expect(manager.checkFactorIds()).toHaveLength(1);
+        manager.registerProvider(fake('addon-key', { ...PASSKEY, primary: true }), 'addon');
+        expect(manager.checkFactorIds()).toEqual([]);
+      });
+
+      test('a core provider this site has off, and a configured outside provider, are not unknown', async () => {
+        const manager = await started({
+          'ngdpbase.auth.factors': [{ authproviderid: 'password' }, { authproviderid: 'passkey' }, { authproviderid: 'cloudflare-access' }, { authproviderid: 'oidc:google' }, { authproviderid: 'oidc:work' }],
+          'ngdpbase.auth.oidc.providers': { work: { enabled: false } }
+        });
+        expect(manager.getFactors().map(f => f.provider)).toEqual(['password']);
+        expect(manager.checkFactorIds()).toEqual([]);
+      });
+
+      test('an outside provider id not in ngdpbase.auth.oidc.providers is unknown', async () => {
+        const manager = await started({ 'ngdpbase.auth.factors': [{ authproviderid: 'password' }, { authproviderid: 'oidc:wrok' }] });
+        expect(manager.checkFactorIds()).toEqual([expect.stringMatching(/entry 'oidc:wrok' names no provider/)]);
+      });
+
+      test('every provider core ships is known, registered or not', async () => {
+        const fs = await import('fs');
+        const path = await import('path');
+        const dir = path.join(__dirname, '../../providers');
+        const ids = fs.readdirSync(dir).filter(f => f.endsWith('AuthProvider.ts'))
+          .map(f => /readonly id = '([^']+)'/.exec(fs.readFileSync(path.join(dir, f), 'utf8'))?.[1])
+          .filter(Boolean);
+        expect(ids.length).toBeGreaterThan(5);
+        const manager = await started({ 'ngdpbase.auth.factors': ids.map(id => ({ authproviderid: id })) });
+        expect(manager.checkFactorIds()).toEqual([]);
+      });
+
+      test('an old id is read as the provider it was renamed to', async () => {
+        const manager = await started({ 'ngdpbase.auth.factors': [{ authproviderid: 'password' }, { authproviderid: 'email-link' }, { authproviderid: 'google-oidc' }] });
+        expect(manager.checkFactorIds()).toEqual([]);
+      });
+    });
+
     test('a delegated credential is never a factor, even when listed', async () => {
       const manager = await started({ 'ngdpbase.auth.factors': [{ authproviderid: 'agent-token' }] });
-      manager.registerProvider({ id: 'agent-token', displayName: 'Agent', verify: vi.fn() });
+      (manager as unknown as { registerCoreProvider: (p: unknown) => boolean }).registerCoreProvider({ id: 'agent-token', displayName: 'Agent', verify: vi.fn() });
       expect(manager.getFactors()).toEqual([]);
     });
 
     test('a provider an add-on registers late is offered once registered', async () => {
-      const manager = await started({ 'ngdpbase.auth.factors': [{ authproviderid: 'password' }, { authproviderid: 'totp' }] });
+      const manager = await started({ 'ngdpbase.auth.factors': [{ authproviderid: 'password' }, { authproviderid: 'addon-otp' }] });
       expect(manager.getFactors()).toHaveLength(1);
-      manager.registerProvider(fake('totp', { ...OTP, primary: false }), 'totp-addon');
-      expect(manager.getFactors().map(f => f.provider)).toEqual(['password', 'totp']);
+      manager.registerProvider(fake('addon-otp', { ...OTP, primary: false }), 'otp-addon');
+      expect(manager.getFactors().map(f => f.provider)).toEqual(['password', 'addon-otp']);
     });
 
     test('config may lower what a provider gives', async () => {
@@ -146,7 +207,7 @@ describe('AuthManager', () => {
         { authproviderid: 'password', aal: 3, acr: 'phrh', amr: ['hwk'] },
         { authproviderid: 'totp', primary: true }
       ] });
-      manager.registerProvider(fake('totp', { ...OTP, primary: false }));
+      registerCore(manager, fake('totp', { ...OTP, primary: false }));
       expect(manager.getFactors()).toEqual([
         { provider: 'password', primary: true, amr: ['pwd'], aal: 1 },
         { provider: 'totp', primary: false, amr: ['otp'], aal: 1 }
@@ -161,7 +222,7 @@ describe('AuthManager', () => {
 
     test('the retired required-factors list in custom config is converted', async () => {
       const manager = await started({}, { 'ngdpbase.auth.required-factors': ['password', 'totp'] });
-      manager.registerProvider(fake('totp', { ...OTP, primary: false }));
+      registerCore(manager, fake('totp', { ...OTP, primary: false }));
       expect(manager.getFactors().map(f => [f.provider, f.primary])).toEqual([['password', true], ['totp', false]]);
     });
 
@@ -169,7 +230,7 @@ describe('AuthManager', () => {
       const factors = [{ authproviderid: 'password' }];
       const manager = await started({ 'ngdpbase.auth.factors': factors },
         { 'ngdpbase.auth.factors': factors, 'ngdpbase.auth.required-factors': ['password', 'totp'] });
-      manager.registerProvider(fake('totp', { ...OTP, primary: false }));
+      registerCore(manager, fake('totp', { ...OTP, primary: false }));
       expect(manager.getFactors().map(f => f.provider)).toEqual(['password']);
     });
 
@@ -257,6 +318,16 @@ describe('AuthManager', () => {
           expect(m.stepUpNeeded('config-manage', signIn(factor(1, 1), factor(2, 3)), ['admin'], false, NOW)).toBe(false);
         });
 
+        test('#421 slice 2c: a fresh password and a fresh authenticator code together reach an admin\'s AAL2; one stale does not', async () => {
+          const m = await withRoles({ admin: 2, reader: 1 }, STEP_UP);
+          const otp = (minutesAgo: number, aal = 1) => ({ provider: 'totp', amr: ['otp'], aal, at: new Date(NOW - minutesAgo * 60_000).toISOString() });
+          expect(m.stepUpNeeded('config-manage', signIn(factor(1, 1), otp(1)), ['admin'], false, NOW)).toBe(false);
+          expect(m.stepUpNeeded('config-manage', signIn(factor(1, 30), otp(1)), ['admin'], false, NOW)).toBe(true);
+          expect(m.stepUpNeeded('config-manage', signIn(otp(1)), ['admin'], false, NOW)).toBe(true);
+          // A known device (aal 0) never lifts one with another.
+          expect(m.stepUpNeeded('config-manage', signIn(factor(0, 0), otp(1)), ['admin'], false, NOW)).toBe(true);
+        });
+
         test('a known device (aal 0) never counts, and a delegated credential never satisfies it', async () => {
           const m = await withRoles({ admin: 2, reader: 1 }, STEP_UP);
           expect(m.stepUpNeeded('account-security', signIn(factor(0, 0)), ['reader'], false, NOW)).toBe(true);
@@ -268,6 +339,20 @@ describe('AuthManager', () => {
           expect(off.stepUpNeeded('account-security', undefined, ['reader'], false, NOW)).toBe(false);
           const zero = await withRoles({ reader: 1 }, { 'ngdpbase.auth.step-up': { 'max-age-minutes': 0, permissions: ['account-security'] } });
           expect(zero.stepUpNeeded('account-security', undefined, ['reader'], false, NOW)).toBe(false);
+        });
+
+        test('#2193: whether a sign-in is fresh enough for any step-up permission, for a page waiting on its prompt', async () => {
+          const m = await withRoles({ admin: 2, reader: 1 }, STEP_UP);
+          expect(m.signInFresh(signIn(factor(1, 2)), ['reader'], false, NOW)).toBe(true);
+          expect(m.signInFresh(signIn(factor(1, 6)), ['reader'], false, NOW)).toBe(false);
+          expect(m.signInFresh(undefined, ['reader'], false, NOW)).toBe(false);
+          // At the roles' level: a fresh password is not enough for an admin.
+          expect(m.signInFresh(signIn(factor(1, 1)), ['admin'], false, NOW)).toBe(false);
+          expect(m.signInFresh(signIn(factor(2, 1)), ['admin'], false, NOW)).toBe(true);
+          // A delegated credential never is; with step-up off, every sign-in is.
+          expect(m.signInFresh(signIn(factor(2, 0)), ['reader'], true, NOW)).toBe(false);
+          const off = await withRoles({ reader: 1 }, {});
+          expect(off.signInFresh(undefined, ['reader'], false, NOW)).toBe(true);
         });
 
         test('#1638: a step-up permissions list in a custom config (the old shape) is still honoured', async () => {
@@ -302,14 +387,14 @@ describe('AuthManager', () => {
 
       test('AAL2 becomes reachable once a second factor of another type is available', async () => {
         const manager = await withRoles({ admin: 2 }, { 'ngdpbase.auth.factors': [{ authproviderid: 'password' }, { authproviderid: 'totp' }] });
-        manager.registerProvider(fake('totp', { amr: ['otp'], aal: 1, primary: false }), 'totp-addon');
+        registerCore(manager, fake('totp', { amr: ['otp'], aal: 1, primary: false }));
         expect(manager.unreachableRequiredAal()).toEqual([]);
       });
 
       test('a SHIPPED level no factor reaches acts at what is reachable and degrades; it does not refuse the boot (#448)', async () => {
         const manager = await withRoles({ admin: 2, reader: 1 }, {}, {});
         expect(manager.checkRequiredAal()).toEqual([]);
-        expect(manager.getManagerStatus()).toEqual(expect.objectContaining({ state: 'degraded', configKey: 'ngdpbase.auth.factors' }));
+        expect(manager.getManagerStatus()).toEqual(expect.objectContaining({ state: 'degraded', configKey: 'ngdpbase.application.base-url' }));
         expect(manager.requiredAalFor(['admin'])).toBe(1);
         expect(manager.rolesAtSignIn(['admin', 'reader'], 1)).toEqual({ kept: ['admin', 'reader'], steppedDown: [] });
       });
@@ -384,7 +469,7 @@ describe('AuthManager', () => {
             UserManager: { getUser: async () => ({ username: 'admin' }) }
           }));
           await manager.initialize();
-          manager.registerProvider(fake('passkey', { amr: ['hwk', 'user'], aal: 2, acr: 'phr', primary: true }));
+          (manager as unknown as { registerCoreProvider: (p: unknown) => boolean }).registerCoreProvider(fake('passkey', { amr: ['hwk', 'user'], aal: 2, acr: 'phr', primary: true }));
           (manager as unknown as { credentials: unknown }).credentials = { list: () => (enrolled ? [{ kind: 'passkey' }] : []) };
           return manager;
         };
@@ -874,6 +959,66 @@ describe('AuthManager', () => {
         const manager = await bareManager();
         manager.registerProvider(stub('addon-sso'), 'addon-a');
         expect(() => manager.registerProvider(stub('addon-sso'), 'addon-b')).not.toThrow();
+      });
+    });
+
+    // #2223: an add-on brings its own verify() and AAL, so a core id it could
+    // take where core left it unregistered would be trusted by a factors entry.
+    describe('core ids and the oidc: prefix are reserved for core', () => {
+      const PHISHING_RESISTANT = { primary: true, amr: ['hwk', 'user'], aal: 2, acr: 'phr' };
+
+      test('an add-on registering passkey on an http site is refused, logged, and the factor stays off', async () => {
+        const logger = (await import('../../utils/logger')).default;
+        const error = vi.spyOn(logger, 'error');
+        const cm = makeConfigManager({ properties: { 'ngdpbase.auth.factors': [{ authproviderid: 'password' }, { authproviderid: 'passkey' }] } });
+        cm.getBaseURL.mockReturnValue('http://wiki.example.com');
+        const manager = new AuthManager(makeEngine(cm));
+        await manager.initialize();
+        expect(manager.isEnabled('passkey')).toBe(false);
+
+        expect(manager.registerProvider(stub('passkey', { factor: PHISHING_RESISTANT }), 'evil-addon')).toBe(false);
+        expect(manager.isEnabled('passkey')).toBe(false);
+        expect(manager.getFactors().map((f) => f.provider)).toEqual(['password']);
+        expect(error).toHaveBeenCalledWith(expect.stringMatching(/Rejected provider 'passkey' from evil-addon: .*reserved for core/));
+        error.mockRestore();
+      });
+
+      test('an add-on registering oidc:google is refused, whether or not core registered it', async () => {
+        const manager = await bareManager();
+        expect(manager.registerProvider(stub('oidc:google'), 'evil-addon')).toBe(false);
+        expect(manager.registerProvider(stub('oidc:anything'), 'evil-addon')).toBe(false);
+        expect(manager.isEnabled('oidc:google')).toBe(false);
+      });
+
+      test('every core id is refused from an add-on, with no source named too', async () => {
+        const manager = await bareManager();
+        for (const id of ['password', 'magic-link', 'passkey', 'cloudflare-access', 'authentik-bearer', 'agent-token', 'oidc-bearer']) {
+          expect(manager.registerProvider(stub(id))).toBe(false);
+        }
+        expect(manager.getProviders().map((p) => p.id)).toEqual(['password']);
+      });
+
+      test('an id getter that answers harmless, then passkey, is refused', async () => {
+        const manager = await bareManager();
+        const reads = ['harmless', 'passkey'];
+        const shifty = { displayName: 'Shifty', verify: vi.fn().mockResolvedValue(null), get id() { return reads.shift() ?? 'passkey'; } };
+        expect(manager.registerProvider(shifty as never, 'evil-addon')).toBe(false);
+        expect(manager.isEnabled('passkey')).toBe(false);
+        expect(manager.isEnabled('harmless')).toBe(false);
+      });
+
+      test('core registers its own ids: password on a bare boot, agent-token when configured', async () => {
+        const cm = makeConfigManager({ properties: { 'ngdpbase.auth.agent-token.enabled': true } });
+        const manager = new AuthManager(makeEngine(cm));
+        await manager.initialize();
+        expect(manager.isEnabled('password')).toBe(true);
+        expect(manager.isEnabled('agent-token')).toBe(true);
+      });
+
+      test('an id that only starts like a core one is the add-on\'s to register', async () => {
+        const manager = await bareManager();
+        expect(manager.registerProvider(stub('passkey-plus'), 'my-addon')).toBe(true);
+        expect(manager.registerProvider(stub('my-oidc:x'), 'my-addon')).toBe(true);
       });
     });
 

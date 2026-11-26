@@ -2,7 +2,7 @@
 
 <div class="container-fluid">
     <div class="row">
-        <div class="col-md-8 offset-md-2">
+        <div class="col-12">
             <div class="card mt-4">
                 <div class="card-header">
                     <h4><i class="fas fa-user"></i> User Profile</h4>
@@ -22,12 +22,12 @@
                     
                     <!-- User Information Display -->
                     <div class="row mb-4">
-                        <div class="col-md-6">
+                        <div class="col-12">
                             <div class="card">
-                                <div class="card-header">
-                                    <h6><i class="fas fa-info-circle"></i> Account Information</h6>
-                                </div>
-                                <div class="card-body">
+                                <div class="card-body py-2">
+                                    <details id="profile-account-information" open>
+                                        <%- include('_card-summary', { icon: 'fa-info-circle', title: 'Account Information' }) %>
+                                        <div class="mt-3">
                                     <p><strong>Username:</strong> <%= user.username %></p>
                                     <p><strong>Email:</strong> <%= user.email %></p>
                                     <p><strong>Display Name:</strong> <%= user.displayName %></p>
@@ -50,25 +50,29 @@
                                     <% if (user.lastLogin) { %>
                                         <p><strong>Last Login:</strong> <%= new Date(user.lastLogin).toLocaleString() %></p>
                                     <% } %>
+                                        </div>
+                                    </details>
                                 </div>
                             </div>
                         </div>
                         
-                        <div class="col-md-6">
+                        <div class="col-12">
                             <div class="card">
-                                <div class="card-header">
-                                    <h6><i class="fas fa-shield-alt"></i> Permissions</h6>
-                                </div>
-                                <div class="card-body" style="max-height: 200px; overflow-y: auto;">
+                                <div class="card-body py-2">
+                                    <details id="profile-permissions">
+                                        <%- include('_card-summary', { icon: 'fa-shield-alt', title: 'Permissions' }) %>
+                                        <div class="mt-3" style="max-height: 200px; overflow-y: auto;">
                                     <% if (permissions && permissions.length > 0) { %>
                                         <%# #1539: a grant that applies only somewhere says where. %>
                                         <% permissions.forEach(grant => { %>
                                             <% const _p = typeof grant === 'string' ? { action: grant, limited: false, where: [] } : grant; %>
-                                            <span class="badge <%= _p.limited ? 'bg-info text-dark' : 'bg-success' %> me-1 mb-1"<% if (_p.limited) { %> title="<%= _p.where.includes('vault') ? 'Only in your own vaults' : 'Only on some pages' %>"<% } %>><%= _p.action %><% if (_p.limited) { %> <small>(<%= _p.where.includes('vault') ? 'your vaults' : 'some pages' %>)</small><% } %></span>
+                                            <span class="badge <%= _p.limited ? 'bg-info text-dark' : 'bg-success' %> me-1 mb-1"<% if (_p.limited) { %> title="<%= _p.where.every((w) => w === 'vault') ? 'Only in your own vaults' : 'Only on some pages' %>"<% } %>><%= _p.action %><% if (_p.limited) { %> <small>(<%= _p.where.every((w) => w === 'vault') ? 'your vaults' : 'some pages' %>)</small><% } %></span>
                                         <% }) %>
                                     <% } else { %>
                                         <p class="text-muted">No specific permissions assigned</p>
                                     <% } %>
+                                        </div>
+                                    </details>
                                 </div>
                             </div>
                         </div>
@@ -83,10 +87,10 @@
                     <div class="row mb-4">
                         <div class="col-12">
                             <div class="card">
-                                <div class="card-header">
-                                    <h6><i class="fas fa-star"></i> My Contributions</h6>
-                                </div>
-                                <div class="card-body p-0">
+                                <div class="card-body py-2">
+                                    <details id="profile-my-contributions">
+                                        <%- include('_card-summary', { icon: 'fa-star', title: 'My Contributions' }) %>
+                                        <div class="mt-3">
                                     <ul class="list-group list-group-flush">
                                         <li class="list-group-item d-flex align-items-center justify-content-between">
                                             <a href="/my/vaults" class="text-decoration-none">
@@ -137,7 +141,7 @@
                                         </li>
                                         <li class="list-group-item d-flex align-items-center justify-content-between">
                                             <a href="/my/links" class="text-decoration-none">
-                                                <i class="fas fa-link"></i> My Links
+                                                <i class="fas fa-link"></i> Pinned pages
                                             </a>
                                             <span class="badge bg-secondary">
                                                 <%= typeof contributions !== 'undefined' && contributions && contributions.links !== undefined ? contributions.links : '–' %>
@@ -160,6 +164,8 @@
                                             </span>
                                         </li>
                                     </ul>
+                                        </div>
+                                    </details>
                                 </div>
                             </div>
                         </div>
@@ -170,14 +176,14 @@
                     <div class="row mb-4">
                         <div class="col-12">
                             <div class="card">
-                                <div class="card-header">
-                                    <h6><i class="fas fa-share-nodes"></i> Share Links <%- include('_help-icon', { slug: 'share-links', label: 'Share Links' }) %></h6>
-                                </div>
-                                <div class="card-body p-0">
+                                <div class="card-body py-2">
+                                    <details id="profile-share-links">
+                                        <%- include('_card-summary', { icon: 'fa-share-nodes', title: 'Shared links', helpSlug: 'share-links', helpLabel: 'Shared links' }) %>
+                                        <div class="mt-3">
                                     <ul class="list-group list-group-flush">
                                         <li class="list-group-item d-flex align-items-center justify-content-between">
-                                            <a href="/shares" class="text-decoration-none">
-                                                <i class="fas fa-share-nodes"></i> Manage My Share Links
+                                            <a href="/my/shares" class="text-decoration-none">
+                                                <i class="fas fa-share-nodes"></i> Manage my shared links
                                             </a>
                                             <span>
                                                 <span class="badge bg-success" title="Active"><%= myShares.active %> active</span>
@@ -185,6 +191,8 @@
                                             </span>
                                         </li>
                                     </ul>
+                                        </div>
+                                    </details>
                                 </div>
                             </div>
                         </div>
@@ -198,10 +206,10 @@
                     <div class="row mb-4" id="your-consents">
                         <div class="col-12">
                             <div class="card">
-                                <div class="card-header">
-                                    <h6><i class="fas fa-file-signature"></i> Your consents <%- include('_help-icon', { slug: 'your-consents', label: 'Your consents' }) %></h6>
-                                </div>
-                                <div class="card-body">
+                                <div class="card-body py-2">
+                                    <details id="profile-your-consents">
+                                        <%- include('_card-summary', { icon: 'fa-file-signature', title: 'Your consents', helpSlug: 'your-consents', helpLabel: 'Your consents' }) %>
+                                        <div class="mt-3">
                                     <% if (yourConsents.length === 0) { %>
                                     <p class="text-muted small mb-2">This site asks you to accept no documents.</p>
                                     <% } %>
@@ -233,10 +241,12 @@
                                         <li class="list-group-item small" data-consent-app="<%= a.grantId %>">App or device <strong><%= a.name %></strong> may see <%= a.scopes.join(', ') %><% if (a.approvedAt) { %>, approved <time datetime="<%= a.approvedAt %>" data-local-time><%= a.approvedAt.slice(0, 16).replace('T', ' ') %> UTC</time><% } %> <span class="text-muted">(revoke it under My tokens and devices)</span></li>
                                         <% }) %>
                                         <% if (typeof myShares !== 'undefined' && myShares) { %>
-                                        <li class="list-group-item small">Share links: <%= myShares.active %> active <a href="/shares" class="ms-1">Manage</a></li>
+                                        <li class="list-group-item small">Shared links: <%= myShares.active %> active <a href="/my/shares" class="ms-1">Manage</a></li>
                                         <% } %>
                                     </ul>
                                     <% } %>
+                                        </div>
+                                    </details>
                                 </div>
                             </div>
                         </div>
@@ -251,10 +261,10 @@
                     <div class="row mb-4" id="vault-repairs">
                         <div class="col-12">
                             <div class="card">
-                                <div class="card-header">
-                                    <h6><i class="fas fa-lock-open"></i> Vault pages with data outside their vault</h6>
-                                </div>
-                                <div class="card-body">
+                                <div class="card-body py-2">
+                                    <details id="profile-vault-repairs">
+                                        <%- include('_card-summary', { icon: 'fa-lock-open', title: 'Vault pages with data outside their vault' }) %>
+                                        <div class="mt-3">
                                     <% if (repairNotice) { %><div class="alert alert-success small"><%= repairNotice %></div><% } %>
                                     <% if (repairError) { %><div class="alert alert-danger small"><%= repairError %></div><% } %>
                                     <% if (ownRepairs.length > 0) { %>
@@ -291,6 +301,8 @@
                                     </form>
                                     <% } %>
                                     <% } %>
+                                        </div>
+                                    </details>
                                 </div>
                             </div>
                         </div>
@@ -302,10 +314,10 @@
                     <div class="row mb-4">
                         <div class="col-12">
                             <div class="card">
-                                <div class="card-header">
-                                    <h6><i class="fas fa-box-open"></i> Unused files in your vaults</h6>
-                                </div>
-                                <div class="card-body">
+                                <div class="card-body py-2">
+                                    <details id="profile-unused-vault-files">
+                                        <%- include('_card-summary', { icon: 'fa-box-open', title: 'Unused files in your vaults' }) %>
+                                        <div class="mt-3">
                                     <p class="small text-muted">Files in your vaults that no page in that vault uses — for example a copy left behind when a page moved to another vault. Only you see this.</p>
                                     <% unusedVaultFiles.forEach(function(v) { %>
                                         <h6 class="mt-3"><i class="fas fa-lock"></i> <%= v.vault %></h6>
@@ -327,6 +339,8 @@
                                             </ul>
                                         <% } %>
                                     <% }); %>
+                                        </div>
+                                    </details>
                                 </div>
                             </div>
                         </div>
@@ -339,14 +353,14 @@
                     <% const ownCredentials = typeof credentials !== 'undefined' ? credentials.filter(function (c) { return c.kind !== 'identity'; }) : []; %>
                     <% const identities = typeof connectedIdentities !== 'undefined' ? connectedIdentities : []; %>
                     <% const connectable = typeof connectableProviders !== 'undefined' ? connectableProviders : []; %>
-                    <% if ((typeof passkeyHost !== 'undefined' && passkeyHost) || signInWithPassword || ownCredentials.length > 0 || identities.length > 0 || connectable.length > 0 || (typeof credentialsUnavailable !== 'undefined' && credentialsUnavailable)) { %>
+                    <% if ((typeof passkeyHost !== 'undefined' && passkeyHost) || (typeof totpEnrolable !== 'undefined' && totpEnrolable) || signInWithPassword || ownCredentials.length > 0 || identities.length > 0 || connectable.length > 0 || (typeof credentialsUnavailable !== 'undefined' && credentialsUnavailable)) { %>
                     <div class="row mb-4" id="sign-in-methods">
                         <div class="col-12">
                             <div class="card">
-                                <div class="card-header">
-                                    <h6 class="mb-0"><i class="fas fa-key"></i> Sign-in methods</h6>
-                                </div>
-                                <div class="card-body">
+                                <div class="card-body py-2">
+                                    <details id="profile-sign-in-methods">
+                                        <%- include('_card-summary', { icon: 'fa-key', title: 'Sign-in methods' }) %>
+                                        <div class="mt-3">
                                     <% if (typeof credentialsUnavailable !== 'undefined' && credentialsUnavailable) { %>
                                     <%# #1738: never show a list that could not be read as an empty one. %>
                                     <div class="alert alert-warning small" role="alert">Your passkeys and other sign-in methods could not be loaded just now. They have not been removed. Reload the page; if this keeps happening, sign out and back in.</div>
@@ -440,6 +454,14 @@
                                     <div id="passkey-enrol-error" class="alert alert-danger small mt-2 mb-0 d-none" role="alert"></div>
                                     <script src="/js/passkey.js" defer></script>
                                     <% } %>
+                                    <% if (typeof totpEnrolable !== 'undefined' && totpEnrolable) { %>
+                                    <p class="small text-muted mb-2 mt-3">
+                                        An authenticator app (Google Authenticator, 1Password, Aegis and others) gives a six-digit code that changes every 30 seconds.
+                                    </p>
+                                    <a class="btn btn-sm btn-outline-primary" href="/profile/totp"><i class="fas fa-mobile-alt"></i> Add an authenticator app</a>
+                                    <% } %>
+                                        </div>
+                                    </details>
                                 </div>
                             </div>
                         </div>
@@ -453,15 +475,15 @@
                     <div class="row mb-4" id="tokens-and-devices">
                         <div class="col-12">
                             <div class="card">
-                                <div class="card-header d-flex align-items-center justify-content-between">
-                                    <h6 class="mb-0"><i class="fas fa-key"></i> My tokens and devices</h6>
+                                <div class="card-body py-2">
+                                    <details id="profile-tokens-and-devices">
+                                        <%- include('_card-summary', { icon: 'fa-key', title: 'My tokens and devices' }) %>
+                                        <div class="mt-3">
                                     <% if (mayMint) { %>
-                                    <button type="button" class="btn btn-sm btn-primary" id="agent-token-new-btn">
+                                    <button type="button" class="btn btn-sm btn-primary mb-2" id="agent-token-new-btn">
                                         <i class="fas fa-plus"></i> New token
                                     </button>
                                     <% } %>
-                                </div>
-                                <div class="card-body">
                                     <p class="text-muted small">
                                         Everything you have let act for you: tokens you made for programs, and apps and
                                         devices you approved. None can do anything you cannot already do, and each stops
@@ -524,6 +546,8 @@
                                     <% } else { %>
                                     <%- include('_delegations', { items: delegations, csrfToken: csrfToken, canExtend: typeof agentTokensCanExtend !== 'undefined' && agentTokensCanExtend === true }) %>
                                     <% } %>
+                                        </div>
+                                    </details>
                                 </div>
                             </div>
                         </div>
@@ -536,10 +560,10 @@
                     <div class="row mb-4" id="proxy-access">
                         <div class="col-12">
                             <div class="card">
-                                <div class="card-header">
-                                    <h6 class="mb-0"><i class="fas fa-user-friends" aria-hidden="true"></i> Proxy access</h6>
-                                </div>
-                                <div class="card-body">
+                                <div class="card-body py-2">
+                                    <details id="profile-proxy-access">
+                                        <%- include('_card-summary', { icon: 'fa-user-friends', title: 'Proxy access' }) %>
+                                        <div class="mt-3">
                                     <% if (proxyAccess.given !== null) { %>
                                     <p class="text-muted small">
                                         Let someone you trust, such as a family member or a caregiver, act for you on this site.
@@ -564,6 +588,8 @@
                                         <a class="btn btn-sm btn-outline-primary" href="/account/acting-for">Choose whom to act for</a>
                                     </div>
                                     <% } %>
+                                        </div>
+                                    </details>
                                 </div>
                             </div>
                         </div>
@@ -576,10 +602,10 @@
                     <div class="row mb-4">
                         <div class="col-12">
                             <div class="card">
-                                <div class="card-header">
-                                    <h6><i class="fas fa-cogs"></i> User Preferences</h6>
-                                </div>
-                                <div class="card-body">
+                                <div class="card-body py-2">
+                                    <details id="profile-user-preferences">
+                                        <%- include('_card-summary', { icon: 'fa-cogs', title: 'User Preferences' }) %>
+                                        <div class="mt-3">
                                     <form action="/preferences" method="POST">
                                         <input type="hidden" name="_csrf" value="<%= csrfToken %>">
                                         <div class="row">
@@ -638,6 +664,18 @@
                                                     </select>
                                                 </div>
                                                 
+                                                <% var lineLengthPref = (user.preferences && user.preferences['display.line-length']) || 'site'; %>
+                                                <div class="form-group mb-3">
+                                                    <label for="lineLength" class="form-label"><strong>Line Length</strong></label>
+                                                    <select class="form-control" id="lineLength" name="display.line-length">
+                                                        <%# What "the site's setting" is right now: the site's choice, else the theme's (#2399). %>
+                                                        <option value="site" <%= lineLengthPref === 'site' ? 'selected' : '' %>>Use the site's setting<%= typeof siteLineLength !== 'undefined' && siteLineLength ? ' (currently ' + (siteLineLength === 'short' ? 'short lines' : 'full width') + ')' : '' %></option>
+                                                        <option value="short" <%= lineLengthPref === 'short' ? 'selected' : '' %>>Short lines</option>
+                                                        <option value="full" <%= lineLengthPref === 'full' ? 'selected' : '' %>>Full width</option>
+                                                    </select>
+                                                    <small class="form-text text-muted">Short lines keep text and pictures about as wide as a book page, which is easier to read. Full width lets them fill the screen.</small>
+                                                </div>
+
                                                 <div class="form-check mb-3">
                                                     <input class="form-check-input" type="checkbox" id="showToolTips" name="display.tooltips" 
                                                            <%= (user.preferences && user.preferences['display.tooltips']) ? 'checked' : '' %>>
@@ -791,9 +829,12 @@
                                         <%# saveProfileSection() handler. Sections render in registration order. %>
                                         <% if (addonProfileSections && addonProfileSections.length > 0) { %>
                                             <% addonProfileSections.forEach(function(section) { %>
+                                                <%# #1541: core draws each section's card and header, so every add-on's section collapses like the rest. %>
                                                 <div class="card mt-4" data-addon="<%= section.addonName %>">
-                                                    <div class="card-header"><h6 class="mb-0"><%= section.title %></h6></div>
-                                                    <div class="card-body"><%- section.html %>
+                                                    <div class="card-body py-2">
+                                                    <details id="profile-addon-<%= section.addonName %>">
+                                                    <%- include('_card-summary', { icon: section.icon || 'fa-puzzle-piece', title: section.title, hint: section.hint }) %>
+                                                    <div class="mt-3"><%- section.html %>
                                                         <%# #1603: what this add-on asks you to accept before it turns on, recorded before its switch flips. %>
                                                         <% const asks = (typeof addonConsentPending !== 'undefined' && addonConsentPending[section.addonName]) || []; %>
                                                         <% if (asks.length > 0) { %>
@@ -812,6 +853,8 @@
                                                         </div>
                                                         <% } %>
                                                     </div>
+                                                    </details>
+                                                    </div>
                                                 </div>
                                             <% }); %>
                                         <% } %>
@@ -826,6 +869,8 @@
                                             </button>
                                         </div>
                                     </form>
+                                        </div>
+                                    </details>
                                 </div>
                             </div>
                         </div>
@@ -835,7 +880,7 @@
                     <form action="/profile" method="POST">
                         <input type="hidden" name="_csrf" value="<%= csrfToken %>">
                         <div class="row">
-                            <div class="col-md-6">
+                            <div class="col-12">
                                 <h5><i class="fas fa-edit"></i> Update Profile</h5>
                                 
                                 <%# #2073: the name and email are changed under Contact details. %>
@@ -862,7 +907,7 @@
                             
                             <!-- Password Change Section - Only for Local Users -->
                             <% if (!user.isExternal) { %>
-                            <div class="col-md-6" id="change-password">
+                            <div class="col-12" id="change-password">
                                 <h5><i class="fas fa-key"></i> Change Password</h5>
                                 <p class="text-muted small">Leave blank to keep current password</p>
                                 
@@ -885,7 +930,7 @@
                                 </div>
                             </div>
                             <% } else { %>
-                            <div class="col-md-6">
+                            <div class="col-12">
                                 <%# #1026: isExternal covers every passwordless account, not just
                                     OAuth — magic-link signups are external too, and telling those
                                     users to go change a password at "their OAuth provider" names a
@@ -990,6 +1035,7 @@ function resetPreferences() {
         document.getElementById('pageSize').value = '25';
         document.getElementById('dateFormat').value = 'default';
         document.getElementById('siteTheme').value = 'system';
+        document.getElementById('lineLength').value = 'site';
     }
 }
 
@@ -1134,6 +1180,19 @@ document.addEventListener('DOMContentLoaded', function() {
         errorEl.classList.remove('d-none');
     }
 
+    // #2445: a stale sign-in sends the page to the fresh sign-in prompt and back,
+    // which reloads it. public/js/reauth-draft.js keeps what was typed (never the
+    // token's secret) and fills the form again without sending it: Create is
+    // pressed again, by the person, to make the token.
+    if (window.reauthDraft.restore('agent-token', form, {
+        press: 'Create',
+        onRestore: () => {
+            form.classList.remove('d-none');
+            const details = document.getElementById('profile-tokens-and-devices');
+            if (details) details.open = true;
+        }
+    })) form.scrollIntoView?.({ block: 'nearest' });
+
     newBtn?.addEventListener('click', () => {
         form.classList.toggle('d-none');
         errorEl.classList.add('d-none');
@@ -1158,6 +1217,9 @@ document.addEventListener('DOMContentLoaded', function() {
                 })
             });
             const data = await res.json().catch(() => ({}));
+            // Step-up: a stale sign-in is sent to the prompt, and comes back here
+            // with the form filled in again (#2445), not submitted.
+            if (window.followReauth(data, () => window.reauthDraft.keep('agent-token', form))) return;
             if (!res.ok || !data.success) {
                 showError(data.error || ('Could not create token (HTTP ' + res.status + ')'));
                 return;
@@ -1196,7 +1258,7 @@ document.addEventListener('DOMContentLoaded', function() {
                     body: '{}'
                 });
                 const data = await res.json().catch(() => ({}));
-                if (data.reauth) { window.location.href = data.reauth; return; }
+                if (window.followReauth(data)) return;
                 if (!res.ok || !data.success) {
                     window.alert(data.error || ('Could not extend the token (HTTP ' + res.status + ')'));
                     btn.disabled = false;
@@ -1230,6 +1292,21 @@ document.addEventListener('DOMContentLoaded', function() {
       }
     });
   });
+})();
+</script>
+
+<script nonce="<%= locals.cspNonce %>">
+// #2248: cards start collapsed, so a deep link such as /profile#sign-in-methods
+// opens the card it points at.
+(function () {
+    function openTarget() {
+        var el = location.hash.length > 1 ? document.getElementById(decodeURIComponent(location.hash.slice(1))) : null;
+        if (!el) return;
+        var d = el.tagName === 'DETAILS' ? el : el.querySelector('details');
+        if (d) { d.open = true; el.scrollIntoView(); }
+    }
+    openTarget();
+    window.addEventListener('hashchange', openTarget);
 })();
 </script>
 

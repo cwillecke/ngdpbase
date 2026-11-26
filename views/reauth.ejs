@@ -1,11 +1,31 @@
 <%- include('header', { pageName: '' }) %>
-<%# #1525 — step-up: a sensitive action asked for a fresh sign-in. The passkey or
-    password proves the person at the keyboard is the account holder now, and the
-    browser returns to the page that asked. %>
+<%# #1525 — step-up: a sensitive action asked for a fresh sign-in. The passkey,
+    password or authenticator app's code (#421) proves the person at the keyboard
+    is the account holder now, and the browser returns to the page that asked. %>
 <div class="container">
   <div class="row justify-content-center">
     <div class="col-lg-6">
-      <div class="card mt-4">
+      <%# #2445: said at the top, where an action asked for this sign-in: the page redid its request (the continue
+          path), or a script is waiting for the prompt. The sentence that typed entries are kept is for the redone
+          request that holds some (#2485: a Revoke button's form holds none), and for a page that kept its entries in
+          this tab (the script below): a script's prompt for Revoke or Extend has typed nothing. The lower-sign-in
+          notice's "Sign in again" link carries neither, so it shows no banner. %>
+      <% const _replay = typeof next === 'string' && next.indexOf('/auth/reauth/continue') === 0;
+         const _asked = _replay || Boolean(prompt);
+         const _kept = _replay && (typeof typed === 'undefined' || typed); %>
+      <div class="alert alert-warning mt-4 mb-0" role="alert" data-reauth-expired<%= _asked ? '' : ' hidden' %>>
+        <strong>It has been a while since you signed in.</strong> Confirm it is you below.
+        <span data-reauth-kept<%= _kept ? '' : ' hidden' %>>What you typed will be kept.</span>
+      </div>
+      <% if (!_replay) { %>
+      <script nonce="<%= locals.cspNonce %>">
+        if (window.reauthDraft && window.reauthDraft.pending()) {
+          document.querySelector('[data-reauth-expired]').hidden = false;
+          document.querySelector('[data-reauth-kept]').hidden = false;
+        }
+      </script>
+      <% } %>
+      <div class="card mt-3">
         <div class="card-header">
           <h4 class="mb-0"><i class="fas fa-user-shield"></i> Confirm it is you</h4>
         </div>
@@ -14,13 +34,22 @@
             <div class="alert alert-danger" role="alert"><%= error %></div>
           <% } %>
           <p>This change protects your account, so it needs a fresh sign-in. You are then sent back to finish it.</p>
+          <%# #2356: what this account can add or use here (AuthManager.strongerSignInWays), never the site's whole list. %>
+          <% const _ways = typeof ways !== 'undefined' && ways ? ways : {};
+             const _totp = typeof hasTotp !== 'undefined' && hasTotp; %>
           <% if (needsPasskey) { %>
-            <p class="small text-muted">Your role needs a passkey for this; a password is not enough.</p>
+            <% if (hasPasskey || _ways.addPasskey) { %>
+            <p class="small text-muted">Your role needs a passkey<%= _totp ? ', or your password with your authenticator app\'s code,' : '' %> for this; a password alone is not enough.</p>
+            <% } else if (_totp || (_ways.addTotp && hasPassword)) { %>
+            <p class="small text-muted">Your role needs your password with your authenticator app's code for this; a password alone is not enough.</p>
+            <% } else { %>
+            <p class="small text-muted">Your role needs a stronger sign-in for this; a password alone is not enough.</p>
+            <% } %>
           <% } %>
 
           <% if (hasPasskey) { %>
             <button type="button" class="btn btn-primary w-100 mb-3 d-none" data-passkey-reauth
-                    data-next="<%= next %>" data-error-target="reauth-passkey-error">
+                    data-next="<%= next %>"<% if (prompt) { %> data-prompt="<%= prompt %>"<% } %> data-error-target="reauth-passkey-error">
               <i class="fas fa-key"></i> Confirm with a passkey
             </button>
             <div id="reauth-passkey-error" class="alert alert-danger small d-none" role="alert"></div>
@@ -31,6 +60,7 @@
             <form method="POST" action="/auth/reauth" autocomplete="off">
               <input type="hidden" name="_csrf" value="<%= csrfToken %>">
               <input type="hidden" name="next" value="<%= next %>">
+              <% if (prompt) { %><input type="hidden" name="prompt" value="<%= prompt %>"><% } %>
               <div class="mb-3">
                 <label class="form-label" for="reauthPassword">Password</label>
                 <input type="password" class="form-control" id="reauthPassword" name="password" autocomplete="current-password" required autofocus>
@@ -39,11 +69,46 @@
             </form>
           <% } %>
 
-          <% if (!hasPasskey && (needsPasskey || !hasPassword)) { %>
-            <p class="mb-0">This account has no way to confirm here<%= needsPasskey ? ' that reaches the level your role needs' : '' %>. Add a passkey on your <a href="/profile">profile</a>, or ask an administrator.</p>
+          <% if (typeof hasTotp !== 'undefined' && hasTotp) { %>
+            <%# #421 slice 2c: the code the app shows now; at AAL2, with the password, which the two reach together. %>
+            <form method="POST" action="/auth/reauth/totp" autocomplete="off" class="mb-3" data-totp-reauth>
+              <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+              <input type="hidden" name="next" value="<%= next %>">
+              <% if (prompt) { %><input type="hidden" name="prompt" value="<%= prompt %>"><% } %>
+              <% if (needsPasskey) { %>
+              <div class="mb-3">
+                <label class="form-label" for="reauthTotpPassword">Password</label>
+                <input type="password" class="form-control" id="reauthTotpPassword" name="password" autocomplete="current-password" required>
+              </div>
+              <% } %>
+              <div class="mb-3">
+                <label class="form-label" for="reauthTotpCode">Code from your authenticator app</label>
+                <input type="text" class="form-control" id="reauthTotpCode" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6,7}" maxlength="7" required>
+              </div>
+              <button type="submit" class="btn btn-outline-primary w-100"><i class="fas fa-mobile-alt"></i> Confirm with <%= needsPasskey ? 'your password and the code' : 'the code' %></button>
+            </form>
           <% } %>
 
-          <p class="small mt-3 mb-0"><a href="<%= next %>">Cancel</a></p>
+          <% if (!hasPasskey && !_totp && (needsPasskey || !hasPassword)) { %>
+            <%# A passkey first, as before; the app only where it would confirm (at AAL2 it needs the password). %>
+            <% const _add = _ways.addPasskey ? 'a passkey' : (_ways.addTotp && (!needsPasskey || hasPassword)) ? 'an authenticator app' : '';
+               const _outside = Array.isArray(_ways.outside) ? _ways.outside : []; %>
+            <p class="mb-0">This account has no way to confirm here<%= needsPasskey ? ' that reaches the level your role needs' : '' %>.
+            <% if (_add) { %>Add <%= _add %> on your <a href="/profile">profile</a>, or ask an administrator.<% } else if (_outside.length > 0) { %>Sign out, then sign in with <%= _outside.join(' or ') %>, or ask an administrator.<% } else { %>Ask an administrator.<% } %></p>
+          <% } %>
+
+          <%# #2193: a script's prompt is cancelled on the server too, so the page
+              waiting on it stops, in a popup or a new tab alike. %>
+          <% if (prompt) { %>
+            <form method="POST" action="/auth/reauth/cancel" class="small mt-3 mb-0">
+              <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+              <input type="hidden" name="next" value="<%= next %>">
+              <input type="hidden" name="prompt" value="<%= prompt %>">
+              <button type="submit" class="btn btn-link btn-sm p-0">Cancel</button>
+            </form>
+          <% } else { %>
+            <p class="small mt-3 mb-0"><a href="<%= next %>">Cancel</a></p>
+          <% } %>
         </div>
       </div>
     </div>

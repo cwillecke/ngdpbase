@@ -313,6 +313,149 @@ restart_server() {
 }
 ```
 
+## Updating an Instance
+
+`./server.sh update [<ref>] [env]` brings a source-run instance to new code and restarts it, in one
+command ([#2208](https://github.com/jwilleke/ngdpbase/issues/2208)).
+
+```bash
+./server.sh update            # tip of master
+./server.sh update v5.41.0    # a tag or commit
+./server.sh update master dev # restart in development mode
+```
+
+In order, it:
+
+1. Refuses if `git status --porcelain` shows uncommitted changes, and lists them.
+2. Notes the current commit and the version in `package.json`.
+3. Runs `git fetch --tags origin`, then `git pull --ff-only origin master` (no ref) or
+   `git checkout <ref>`. A pull that is not a fast-forward is refused; nothing is ever forced.
+   If nothing was pulled (the commit is the one it started from) and `dist/.built-from` holds
+   that same commit, and PM2 lists the app as online, it prints
+   `<app> is already at <version> (<sha>), nothing to do`, runs no install, build or restart,
+   and exits 0 ([#2532](https://github.com/jwilleke/ngdpbase/issues/2532)). If the app is not
+   online (stopped, or left down by an earlier failure), it says so, skips install and build,
+   and restarts it as step 6 does. A successful build writes
+   `dist/.built-from` with the commit it built; a build starts by deleting it, so a failed
+   build, a missing `dist/` or a build of another commit never matches and the update does the
+   full job. A site built before this existed has no such file, so its next update builds once.
+   A different `<ref>`, or a pull that brought new commits, always does the full job below.
+4. Runs `npm install`, every time (see `.claude/commands/othersites.md` step 2 for why).
+   Then it puts the committed `package-lock.json` back (`git checkout -- package-lock.json`),
+   because `npm install` rewrites a lockfile that disagrees with `package.json` and the next
+   update would refuse the dirty tree ([#2519](https://github.com/jwilleke/ngdpbase/issues/2519)).
+   CI checks that `npm install --package-lock-only` leaves the lockfile unchanged.
+5. Runs `npm run build`.
+6. Restarts the same way `restart` does: `stop`, then `start` with the env argument, if given.
+7. Waits for `/health/readiness` on `localhost:$PORT` to answer 200, up to
+   `UPDATE_READY_TIMEOUT` seconds (default 120). `PORT` comes from the `.env` files, as for
+   `start`. Every 2 seconds it asks `https://localhost:$PORT/health/readiness` without checking
+   the certificate (`curl -sk`), then `http://localhost:$PORT/health/readiness`, and stops at the
+   first 200. It prints both URLs while it waits and the one that answered. A site with TLS
+   configured answers plain http with a 301 to its public hostname
+   ([#1163](https://github.com/jwilleke/ngdpbase/issues/1163)); that redirect is never followed,
+   since the hostname may not resolve from the host itself
+   ([#2241](https://github.com/jwilleke/ngdpbase/issues/2241)). On a timeout it prints the last
+   answer from each.
+8. Prints `<old version> (<old sha>) → <new version> (<new sha>)`.
+
+Steps 1 and 3 refuse before anything changes. If install, build, start or the readiness check
+fails, it checks the old commit out again (back on the branch it was on), installs, builds,
+restarts and waits for readiness, says it rolled back, and exits 1. If the rollback fails too it
+exits 2 and says the instance may be down. It never prompts.
+
+The server keeps running the old code while install and build run, so the only downtime is the
+restart itself.
+
+## Updating every checkout on this host
+
+`./server.sh update all [--dry-run] [ref] [env]` asks PM2 which ngdpbase checkouts are running
+and updates each one by calling that checkout's own `./server.sh update [ref] [env]`, one at a
+time, with the checkout you ran it from last. Run it from any checkout that has this command.
+The word `all` is the command, not a git ref. `./server.sh update v1.2.3` is unchanged. To check
+out a ref that is literally named `all`, run `./server.sh update refs/heads/all` on that one
+checkout.
+
+```bash
+./server.sh update all --dry-run
+./server.sh update all
+./server.sh update all v5.43.0
+```
+
+There is no configuration. Every checkout PM2 runs is updated unless it is skipped for one of
+these reasons, each printed as one line under the checkout's name:
+
+| Printed reason | When |
+| --- | --- |
+| `skip: not online in PM2` | PM2 lists it as stopped or errored. It is left stopped. |
+| `skip: not the top of its own git repository` | The directory sits inside another repo, so git would act on the parent. |
+| `skip: owned by another user` | The directory is not owned by the user running the command. |
+| `skip: git index is locked (another git command is running)` | `.git/index.lock` exists. |
+| `skip: detached HEAD, not on a branch` | The checkout is not on a branch. |
+| `skip: on branch <name>, not master` | The checkout is on a branch other than `master`, even one with no commits of its own. It is not switched to `master`. |
+| `skip: git status failed, so uncommitted changes could not be ruled out` | `git status` exited with an error. |
+| `skip: N uncommitted or untracked file(s), first: <file>` | `git status` shows changes, staged or not, or untracked files. |
+| `skip: git ls-files failed, so hidden changes could not be ruled out` | `git ls-files -v` exited with an error. |
+| `skip: files hidden from git status (assume-unchanged or skip-worktree)` | A tracked file is marked `git update-index --assume-unchanged` or `--skip-worktree`. `git status` does not show edits to it, and a failed update's rollback might overwrite them. To keep a local edit, clear the mark with `git update-index --no-assume-unchanged --no-skip-worktree <file>` and commit or move the edit. A sparse checkout is refused too, because `git sparse-checkout` marks every file outside the sparse set skip-worktree; update it by hand, since clearing the marks would undo the sparse layout. |
+| `skip: could not fetch origin/master to check for local commits` | The fetch before the ahead check failed. |
+| `skip: cannot compare with origin/master, so local commits could not be ruled out` | `origin/master` does not exist in the checkout after the fetch, or `git rev-list` failed. |
+| `skip: N commit(s) ahead of origin/master` | The branch has commits that are not on `refs/remotes/origin/master`. The full ref name is used, so a local branch or tag named `origin/master` cannot hide them. |
+
+A skipped checkout is not touched, so `update`'s rollback (`git checkout -f`, `git reset --hard`)
+never runs on it. It does not pull before the per-checkout `update`, which fetches and
+fast-forwards itself; it does fetch `origin/master` first, so the ahead check is current. A
+`--dry-run` fetches nothing and compares against the last fetch. A checkout on another branch is
+skipped even when a ref is given; run `./server.sh update [ref]` in it by hand to move it.
+
+Plain `./server.sh update` also refuses, before it changes anything, a checkout with files marked
+assume-unchanged or skip-worktree, and lists them. That includes a sparse checkout; update one by
+hand.
+
+Before any git check, `update all` unsets every inherited `GIT_*` variable except `GIT_SSH`,
+`GIT_SSH_COMMAND` and `GIT_TERMINAL_PROMPT`. A `GIT_DIR` or `GIT_INDEX_FILE` left by a git hook,
+a shell or a `.env` would otherwise make the checks read another repository. A `GIT_*` variable
+that cannot be unset, because a `.env` declared it `readonly`, stops the run with exit 2 before
+any check, naming the variable.
+
+To pass an env with no ref, give an empty ref: `./server.sh update all "" production` runs
+`./server.sh update "" production` in each checkout, which updates to the tip of `master` and
+starts in production.
+
+It refuses to run as root, because it would run `npm` and the build as root in other users'
+trees. PM2 `watch` restarts a process when files change. It is not a release update, and it does
+not include or exclude a checkout.
+
+Checkouts are updated one at a time. One failure does not stop the others. Two `update all`
+runs do not overlap: the lock is a symlink in `~/.config/ngdpbase/update-all.lock` whose target
+is the holder's pid, and the second run exits and updates nothing. A lock that holds no pid is
+never taken over; remove it by hand once you know nothing is running. A dead holder's lock is
+replaced. `--dry-run` shows the same plan with no `update` run, and takes no lock.
+
+The command ends with a summary: updated (or would update), unchanged (already at that commit
+with a matching build, so nothing was installed, built or restarted; not shown in a dry run),
+not online, held by git (any of the other skip reasons), and failed. An unchanged checkout is
+still checked for uncommitted changes first, so a held checkout is never counted as unchanged.
+A checkout is recognised only when the PM2 working directory itself holds its `server.sh`.
+Exit codes:
+
+| Code | When |
+| --- | --- |
+| 0 | Every online checkout was updated or unchanged (or would be updated, in a dry run), or PM2 runs no processes at all. |
+| 1 | A checkout was held by git, or its update failed. |
+| 2 | Nothing was updated because: an unknown option, more than two arguments, `all` given as the ref, a ref or env that starts with `-` or holds a space, a recursive `update all`, a `GIT_*` variable set read-only, it was run as root, no temporary directory could be made, another `update all` holds the lock (or the lock holds no pid), `node` or `scripts/update-all-scan.mjs` is missing, or the PM2 list could not be read or was not usable. |
+| 3 | PM2 lists processes but none is an ngdpbase checkout. |
+
+PM2 can print a notice before its process list, for example `In-memory PM2 is out-of-date` when
+the PM2 daemon is older than the installed PM2. Those lines are ignored: the list is the one
+line of `pm2 jlist` output that is a JSON array. When no line is, or more than one is, the run
+stops with exit 2 and updates nothing. Control characters in a PM2 app name are shown as `?`. A
+PM2 directory, or its real path, that holds a control character is not treated as a checkout.
+
+The child `update` is started with a clean environment plus `PATH`, `HOME`, and the ssh/proxy
+variables git and npm need (`UPDATE_READY_TIMEOUT` too). It then loads that checkout's own
+`.env`. The raw PM2 list is never printed. It is reduced to name, directory, script, status and
+watch before it is read, and the process environment is dropped.
+
 ## Validation Steps (Pre-Start Checklist)
 
 Before starting server, `./server.sh start` should verify:

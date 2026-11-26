@@ -70,7 +70,8 @@ describe('ConsentManager (#1603)', () => {
       'terms-of-service': { title: 'Terms of Service', version: 1, effective: new Date('2026-10-22T00:00:00Z') },
       'privacy-policy': { title: 'Privacy Policy', version: '1', effective: '2026-10-22' },
       'recovery-words': { title: 'Your Recovery Words', version: 1, effective: '2026-10-29' },
-      'shared-folders-recovery-words': { title: 'Shared Folders Recovery Words', version: 1, effective: '2026-10-29' }
+      'shared-folders-recovery-words': { title: 'Shared Folders Recovery Words', version: 1, effective: '2026-10-29' },
+      'remember-browser': { title: 'Remember This Browser', version: 1, effective: '2026-11-01' }
     };
     users = { ann: { username: 'ann', createdAt: '2026-01-01T00:00:00.000Z' }, bob: { username: 'bob' } };
     holdsProfileManage = new Set(['ann', 'bob']);
@@ -227,7 +228,8 @@ describe('ConsentManager (#1603)', () => {
       pages['terms-of-service'] = null;
       expect((await cm.pendingFor('ann')).map((d) => d.id)).toEqual(['privacy-policy']);
       expect(cm.getManagerStatus()).toMatchObject({ state: 'degraded', kind: 'attention' });
-      expect(cm.getManagerStatus().reason).toMatch(/No 'terms-of-service' page/);
+      expect(cm.getManagerStatus().reason).toMatch(/^The 'terms-of-service' page is missing, so nobody is asked to accept it\. Restore it with Required Pages Sync, or remove it from the consent documents setting\./);
+      expect(cm.getManagerStatus().configKey).toBe('ngdpbase.consent.documents');
 
       pages['privacy-policy'] = null;
       expect(await cm.pendingFor('ann')).toEqual([]);
@@ -243,11 +245,36 @@ describe('ConsentManager (#1603)', () => {
       expect((await cm.pendingFor('ann')).map((d) => d.id)).toEqual(['terms-of-service']);
       expect(cm.getManagerStatus().reason).toMatch(/'privacy-policy' page has no version/);
     });
+
+    test('a page with no version: says to add the line in the raw editor, and links there (#2385)', async () => {
+      pages['privacy-policy'] = { title: 'Privacy Policy' };
+      await cm.pendingFor('ann');
+      const status = cm.getManagerStatus();
+      expect(status.reason).toBe("The 'privacy-policy' page has no version number, so nobody is asked to accept it. Open this page in the raw editor and add the line version: 1 at the top, between the --- lines, so the site knows which version of the page people have accepted.");
+      expect(status.fixUrl).toBe('/admin/edit-raw/privacy-policy');
+      expect(status.fixLabel).toBe("Open the 'privacy-policy' page in the raw editor");
+      expect(status.configKey).toBeUndefined();
+    });
+
+    test('a recovery-words page with no version: is told to restore it, not to add a version', async () => {
+      pages['recovery-words'] = { title: 'Your Recovery Words' };
+      expect(await cm.pendingFor('ann', 'recovery-words', 'words-set-1')).toEqual([]);
+      expect(cm.getManagerStatus().reason).toBe("The 'recovery-words' page has no version number, so nobody is asked to accept it. Restore it with Required Pages Sync.");
+    });
   });
 
   describe('add-ons', () => {
     beforeEach(() => {
       pages['phr-terms-of-service'] = { title: 'PHR Terms', version: 3, effective: '2026-10-01' };
+    });
+
+    test('an add-on\'s missing page is not fixed by Required Pages Sync, so it does not say so or link there', async () => {
+      cm.registerAddonDocuments('phr', { documents: ['phr-terms-of-service'], paths: ['/phr/'] });
+      pages['phr-terms-of-service'] = null;
+      expect(await cm.pendingFor('ann', 'phr')).toEqual([]);
+      const status = cm.getManagerStatus();
+      expect(status.reason).toBe("The 'phr-terms-of-service' page is missing, so nobody is asked to accept it. It comes with an add-on; update or reinstall that add-on.");
+      expect(status.fixUrl).toBeUndefined();
     });
 
     test('an add-on registers its own documents, asked separately from core\'s', async () => {
@@ -268,7 +295,7 @@ describe('ConsentManager (#1603)', () => {
       expect(cm.addonForPath('/phr/records')).toBe('phr');
       expect(cm.addonForPath('/api/phr/x')).toBe('phr');
       expect(cm.addonForPath('/phrase')).toBeNull();
-      expect(cm.allDocumentIds()).toEqual(['terms-of-service', 'privacy-policy', 'recovery-words', 'shared-folders-recovery-words', 'phr-terms-of-service']);
+      expect(cm.allDocumentIds()).toEqual(['terms-of-service', 'privacy-policy', 'recovery-words', 'shared-folders-recovery-words', 'remember-browser', 'phr-terms-of-service']);
     });
 
     test('an add-on may register only documents named <slug>-…, and only when it is per-person', () => {
@@ -325,7 +352,10 @@ describe('ConsentManager (#1603)', () => {
     test('a missing page asks nothing and needs attention', async () => {
       pages['recovery-words'] = null;
       expect(await cm.pendingFor('ann', 'recovery-words', WORDS)).toEqual([]);
-      expect(cm.getManagerStatus().reason).toMatch(/No 'recovery-words' page/);
+      expect(cm.getManagerStatus().reason).toMatch(/^The 'recovery-words' page is missing, so nobody is asked to accept it\. Restore it with Required Pages Sync\.$/);
+      expect(cm.getManagerStatus().reason).not.toMatch(/consent documents setting/);
+      expect(cm.getManagerStatus().configKey).toBeUndefined();
+      expect(cm.getManagerStatus().fixUrl).toBe('/admin/required-pages');
     });
 
     test('no add-on may take its scope', () => {
@@ -361,7 +391,31 @@ describe('ConsentManager (#1603)', () => {
     test('a missing page asks nothing and needs attention', async () => {
       pages[SCOPE] = null;
       expect(await cm.pendingFor('ann', SCOPE, ORG_WORDS)).toEqual([]);
-      expect(cm.getManagerStatus().reason).toMatch(/No 'shared-folders-recovery-words' page/);
+      expect(cm.getManagerStatus().reason).toMatch(/^The 'shared-folders-recovery-words' page is missing, so nobody is asked to accept it\. Restore it with Required Pages Sync\.$/);
+      expect(cm.getManagerStatus().reason).not.toMatch(/consent documents setting/);
+      expect(cm.getManagerStatus().configKey).toBeUndefined();
+      expect(cm.getManagerStatus().fixUrl).toBe('/admin/required-pages');
+    });
+  });
+
+  describe('remembered browsers (#1523 slice 1c)', () => {
+    const SCOPE = 'remember-browser';
+
+    test('withdrawing a browser\'s agreement is recorded first, then appended; that browser no longer counts and others are untouched', async () => {
+      await cm.accept(person('ann'), SCOPE, [{ id: SCOPE, version: '1' }], 'sign-in', 'device-a');
+      await cm.accept(person('ann'), SCOPE, [{ id: SCOPE, version: '1' }], 'sign-in', 'device-b');
+      audited.length = 0;
+      const [line, ...more] = await cm.withdraw('ann', SCOPE, 'device-a', person('ann'), 'removed');
+      expect(more).toEqual([]);
+      expect(line).toMatchObject({ kind: 'withdraw', document: SCOPE, scope: SCOPE, version: '1', subject: 'device-a', account: '2026-01-01T00:00:00.000Z', context: { by: 'ann', how: 'removed' } });
+      expect(Number.isNaN(Date.parse(line.withdrawnAt ?? ''))).toBe(false);
+      expect(audited).toEqual([expect.objectContaining({ eventType: 'consent-withdraw', reason: 'removed', metadata: expect.objectContaining({ scope: SCOPE, subject: 'device-a' }) })]);
+      const kinds = fs.readFileSync(path.join(dir, 'ann.jsonl'), 'utf8').trim().split('\n').map((l) => (JSON.parse(l) as { kind: string; subject: string }));
+      expect(kinds.map((r) => [r.kind, r.subject])).toEqual([['accept', 'device-a'], ['accept', 'device-b'], ['withdraw', 'device-a']]);
+      expect(await cm.pendingFor('ann', SCOPE, 'device-a')).toHaveLength(1);
+      expect(await cm.pendingFor('ann', SCOPE, 'device-b')).toEqual([]);
+      // Nothing left to withdraw writes nothing.
+      expect(await cm.withdraw('ann', SCOPE, 'device-a', person('ann'), 'removed')).toEqual([]);
     });
   });
 

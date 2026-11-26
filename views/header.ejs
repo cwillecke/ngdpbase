@@ -5,7 +5,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="csrf-token" content="<%= typeof csrfToken !== 'undefined' ? csrfToken : '' %>">
-    <title><% if (typeof pageName !== 'undefined' && pageName) { %><%= pageName %> | <% } %><%= typeof applicationName !== 'undefined' ? applicationName : 'ngdpbase' %></title>
+    <meta name="current-user" content="<%= typeof currentUser !== 'undefined' && currentUser && currentUser.isAuthenticated ? currentUser.username : '' %>">
+    <title><% if (typeof tabTitle !== 'undefined' && tabTitle) { %><%= tabTitle %> | <% } else if (typeof pageName !== 'undefined' && pageName) { %><%= pageName %> | <% } %><%= typeof applicationName !== 'undefined' ? applicationName : 'ngdpbase' %></title>
     <%# #886 — OpenGraph / Twitter card tags. Built by
         src/utils/buildSocialMeta.ts and populated by viewPage(); absent on
         every other route, and empty unless ngdpbase.seo.enabled is on.
@@ -32,6 +33,10 @@
     <link rel="stylesheet" href="<%= typeof variablesCssPath !== 'undefined' ? variablesCssPath : '/themes/default/css/variables.css' %>?v=3.0.7">
     <link rel="stylesheet" href="<%= typeof coreCssPath !== 'undefined' ? coreCssPath : '/themes/core.css' %>?v=3.0.7">
     <link rel="stylesheet" href="<%= typeof locationCssPath !== 'undefined' ? locationCssPath : '/themes/plugins/location.css' %>?v=3.0.7">
+    <!-- Theme stylesheets (theme.json stylesheets[]) load after core so one site can adjust layout -->
+    <% if (typeof themeStylesheets !== 'undefined' && themeStylesheets && themeStylesheets.length) { %>
+    <% themeStylesheets.forEach(function(url) { %><link rel="stylesheet" href="<%= url %>?v=3.0.7">
+    <% }); %><% } %>
     <!-- Add-on stylesheets (registered via AddonsManager.registerStylesheet()) -->
     <% if (typeof addonStylesheets !== 'undefined' && addonStylesheets && addonStylesheets.length) { %>
     <% addonStylesheets.forEach(function(url) { %><link rel="stylesheet" href="<%= url %>">
@@ -39,6 +44,10 @@
 
     <!-- CSRF token helpers (#663) — must load before any script that does fetch -->
     <script src="/js/csrf.js"></script>
+    <script src="/js/reauth-draft.js"></script>
+
+    <!-- Trail dropdown storage and drawing (#2390) -->
+    <script src="/js/nav-trail.js"></script>
 
     <!-- Session idle timeout warning (#1546): only when a limit applies to this signed-in person -->
     <% if (typeof idleTimeoutMs !== 'undefined' && idleTimeoutMs > 0 && typeof currentUser !== 'undefined' && currentUser && currentUser.isAuthenticated) { %>
@@ -60,6 +69,9 @@
     <!-- Pagination helper -->
     <script src="/js/wiki-pagination.js"></script>
 
+    <!-- Delete-a-file wording for the search picker (#2534) -->
+    <script src="/js/asset-delete.js"></script>
+
     <!-- Summary-stat filter bar helper (#1303) -->
     <script src="/js/wiki-stat-filters.js"></script>
 
@@ -70,7 +82,7 @@
 
     <%# JSON-LD structured data emission happens inside views/view.ejs via the unified pageToArticle → buildPageJsonLd pipeline. Per #792 cleanup the legacy pageSchema / siteSchema hooks here were removed — they were never assigned by any route handler. %>
 </head>
-<body>
+<body<% if (typeof lineLength !== 'undefined' && lineLength) { %> data-line-length="<%= lineLength %>"<% } %>>
     <!-- JSPWiki-style header (#371, #375) -->
     <nav class="navbar navbar-expand-md jspwiki-header border-bottom py-1 py-md-2">
         <div class="container-fluid">
@@ -202,7 +214,6 @@
                                 <i class="fas fa-bars"></i>
                             </button>
                         </li>
-                    <% if (typeof pageName !== 'undefined' && pageName) { %>
                         <!-- Breadcrumb trail dropdown (desktop only) -->
                         <li class="nav-item dropdown d-none d-md-block" id="trail">
                             <button class="btn btn-outline-secondary btn-sm dropdown-toggle" data-bs-toggle="dropdown" aria-expanded="false" title="Navigation Trail">
@@ -213,7 +224,6 @@
                                 <li><span class="dropdown-item-text text-muted">No trail available</span></li>
                             </ul>
                         </li>
-                    <% } %>
                     </ul>
                 </div>
 
@@ -286,20 +296,17 @@
                                 <i class="fas fa-info-circle"></i> Info
                             </button>
                             <ul class="dropdown-menu">
-                                <li><a class="dropdown-item" href="#" onclick="showPageInfo()">
+                                <li><a class="dropdown-item" href="#" onclick="showPageInfo(); return false;">
                                     <i class="fas fa-info"></i> Page Information
                                 </a></li>
-                                <li><a class="dropdown-item" href="#" onclick="showPageHistory()">
+                                <li><a class="dropdown-item" href="#" onclick="showPageHistory(); return false;">
                                     <i class="fas fa-history"></i> Page History
                                 </a></li>
-                                <li><a class="dropdown-item" href="#" onclick="showPageSource()">
+                                <li><a class="dropdown-item" href="#" onclick="showPageSource(); return false;">
                                     <i class="fas fa-code"></i> View Page Source
                                 </a></li>
                                 <li><a class="dropdown-item" href="#" onclick="showPageStats(); return false;">
                                     <i class="fas fa-chart-bar"></i> Page Statistics
-                                </a></li>
-                                <li><a class="dropdown-item" href="/view/Recent%20Changes">
-                                    <i class="fas fa-clock"></i> Recent Changes
                                 </a></li>
                             </ul>
                         </div>
@@ -314,6 +321,22 @@
                         <% } %>
 
                         <!-- More Dropdown -->
+                        <%
+                            // #2174: leave the group out when it would have no items (as the mobile menu does with _showPageActions).
+                            const _moreAuthed = typeof currentUser !== 'undefined' && currentUser && currentUser.isAuthenticated;
+                            const _moreJournal = typeof listKind !== 'undefined' && listKind === 'journal' && typeof journalEnabled !== 'undefined' && journalEnabled && _moreAuthed;
+                            const _moreShare = typeof shareEnabled !== 'undefined' && shareEnabled && _moreAuthed && (typeof can === 'function' && can('share-create'))
+                                && typeof metadata !== 'undefined' && metadata && Array.isArray(metadata['user-keywords'])
+                                && metadata['user-keywords'].some(function(k) { return k && k !== 'owner-only'; });
+                            const _morePinUrl = (typeof pageName !== 'undefined' && pageName)
+                                || (typeof currentUrl !== 'undefined' && currentUrl)
+                                || (typeof req !== 'undefined' && req && req.originalUrl);
+                            const _showMore = (typeof pageName !== 'undefined' && pageName)
+                                || (typeof canCreatePage !== 'undefined' && canCreatePage)
+                                || (typeof can === 'function' && can('page-create'))
+                                || _moreJournal || _moreShare || (_moreAuthed && _morePinUrl);
+                        %>
+                        <% if (_showMore) { %>
                         <div class="btn-group" role="group">
                             <button type="button" class="btn btn-outline-secondary btn-sm dropdown-toggle" data-bs-toggle="dropdown" aria-expanded="false">
                                 <i class="fas fa-ellipsis-h"></i> More
@@ -339,7 +362,7 @@
                                 <% } %>
                                 <%
                                     // #842: Share entries — one per user-keyword on this page, opening
-                                    // /shares with the keyword prefilled. Shares are keyword-scoped;
+                                    // /my/shares with the keyword prefilled. Shares are keyword-scoped;
                                     // gated on the same roles that may create shares (decision 2).
                                     const _shareKws = (typeof shareEnabled !== 'undefined' && shareEnabled
                                         && typeof currentUser !== 'undefined' && currentUser && currentUser.isAuthenticated
@@ -355,14 +378,14 @@
                                         && typeof pageName === 'string' && pageName.indexOf('vaults/' + currentUser.username + '/') === 0;
                                 %>
                                 <% if (_ownVaultPage) { %>
-                                    <li><a class="dropdown-item" href="/my/vaults/links?page=<%= encodeURIComponent(pageName) %>" title="Make a read-only link to this page, and others in its vault">
+                                    <li><a class="dropdown-item" href="/my/shares?share=vault&page=<%= encodeURIComponent(pageName) %>" title="Make a read-only link to this page, and others in its vault">
                                         <i class="fas fa-link"></i> Share this page&hellip;
                                     </a></li>
                                     <li><hr class="dropdown-divider"></li>
                                 <% } %>
                                 <% if (_shareKws.length > 0) { %>
                                     <% _shareKws.forEach(function(kw) { %>
-                                        <li><a class="dropdown-item" href="/shares?keyword=<%= encodeURIComponent(kw) %>" title="Create a share link for everything tagged '<%= kw %>'">
+                                        <li><a class="dropdown-item" href="/my/shares?share=tag&tag=<%= encodeURIComponent(kw) %>" title="Create a share link for everything tagged '<%= kw %>'">
                                             <i class="fas fa-share-nodes"></i> Share &lsquo;<%= kw %>&rsquo;&hellip;
                                         </a></li>
                                     <% }); %>
@@ -405,21 +428,27 @@
                                 <li><hr class="dropdown-divider"></li>
                                 <% if (_isPinned) { %>
                                 <li><a class="dropdown-item" href="#" onclick="removePinnedItem('<%= _escJs(_pinUrl) %>'); return false;">
-                                    <i class="fas fa-bookmark me-2 text-primary"></i> Remove from My Links
+                                    <i class="fas fa-bookmark me-2 text-primary"></i> Remove from pinned pages
                                 </a></li>
                                 <% } else { %>
                                 <li><a class="dropdown-item" href="#" onclick="addPinnedItem('<%= _escJs(_pinUrl) %>', '<%= _escJs(_pinTitle) %>'<%= _hasPageHere ? ", '" + _escJs(pageName) + "'" : '' %>); return false;">
-                                    <i class="fas fa-bookmark me-2"></i> Add to My Links
+                                    <i class="fas fa-bookmark me-2"></i> Add to pinned pages
                                 </a></li>
                                 <% } %>
                                 <% } %>
                                 <% } %>
+                                <% if (typeof pageName !== 'undefined' && pageName) { %>
                                 <li><hr class="dropdown-divider"></li>
-                                <li><a class="dropdown-item" href="/export">
-                                    <i class="fas fa-download"></i> Export
+                                <% if (typeof currentUser !== 'undefined' && currentUser && currentUser.isAuthenticated && typeof can === 'function' && can('page-export')) { %>
+                                <%# #2120: export starts from the page: its Export action offers only the formats that fit it. %>
+                                <li><a class="dropdown-item" href="/export/page/<%= encodeURIComponent(pageName) %>">
+                                    <i class="fas fa-download"></i> Export this page&hellip;
                                 </a></li>
+                                <% } %>
+                                <% } %>
                             </ul>
                         </div>
+                        <% } %>
                     </div>
                 </div>
             </div>
@@ -486,11 +515,11 @@
                 <% if (_authed && _pinUrl) { %>
                     <% if (_isPinned) { %>
                     <a class="nav-link py-2" href="#" onclick="removePinnedItem('<%= _escJs(_pinUrl) %>'); <%- _hideOC %> return false;">
-                        <i class="fas fa-bookmark me-2 text-primary"></i> Remove from My Links
+                        <i class="fas fa-bookmark me-2 text-primary"></i> Remove from pinned pages
                     </a>
                     <% } else { %>
                     <a class="nav-link py-2" href="#" onclick="addPinnedItem('<%= _escJs(_pinUrl) %>', '<%= _escJs(_pinTitle) %>'<%= _hasPage ? ", '" + _escJs(pageName) + "'" : '' %>); <%- _hideOC %> return false;">
-                        <i class="fas fa-bookmark me-2"></i> Add to My Links
+                        <i class="fas fa-bookmark me-2"></i> Add to pinned pages
                     </a>
                     <% } %>
                 <% } %>
@@ -524,9 +553,6 @@
                 <a class="nav-link py-2" href="/view/Recent%20Changes">
                     <i class="fas fa-clock me-2"></i> Recent Changes
                 </a>
-                <a class="nav-link py-2" href="/export">
-                    <i class="fas fa-download me-2"></i> Export
-                </a>
             </nav>
             <% } %>
 
@@ -558,7 +584,7 @@
                          const _tmplEscJs = function(s) { return String(s == null ? '' : s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"); };
                     %>
                     <div class="my-links-sidebar mt-2">
-                      <h6 class="sidebar-heading text-muted fw-semibold mb-1">My Links</h6>
+                      <h6 class="sidebar-heading text-muted fw-semibold mb-1">Pinned pages</h6>
                       <div style="max-height:200px;overflow-y:auto;">
                         <ul class="list-unstyled mb-0">
                           <% _tmplPinned.forEach(function(p) {
@@ -578,7 +604,7 @@
 
                     <%# #796 — extension slot for addon-defined sidebar
                         widgets rendered below the core sidebar content
-                        (leftMenu + My Links). Empty by default; route
+                        (leftMenu + Pinned pages). Empty by default; route
                         handlers set `extraSidebarWidgets` to a
                         pre-rendered HTML string on pages where the
                         addon claims sidebar real estate (e.g. journal
@@ -617,27 +643,51 @@
                 </div>
                 <% } %>
                 <% if (typeof aalStepDown !== 'undefined' && aalStepDown && aalStepDown.roles.length > 0) { %>
-                <%# #448: a role above this sign-in's level is off for this session; say so, and offer the way back. %>
-                <div class="alert alert-warning d-flex flex-wrap align-items-center gap-2 mt-2" role="alert">
+                <%# #448: a role above this sign-in's level is off for this session; say so, and offer the way back.
+                    #2356: only a way this account can add or use here (AuthManager.strongerSignInWays). %>
+                <% const _sd = aalStepDown.ways || {};
+                   const _sdOne = aalStepDown.roles.length === 1;
+                   // A way usable now comes before one to add: the app with the password restores the role at once.
+                   const _sdWay = _sd.usePasskey ? 'use-passkey' : (_sd.useTotp && _sd.password) ? 'use-totp'
+                     : _sd.addPasskey ? 'add-passkey' : (_sd.addTotp && _sd.password) ? 'add-totp'
+                     : (_sd.outside && _sd.outside.length > 0) ? 'outside' : 'none'; %>
+                <div class="alert alert-warning d-flex flex-wrap align-items-center gap-2 mt-2" role="alert" data-aal-step-down="<%= _sdWay %>">
                     <i class="fas fa-key"></i>
                     <span>
-                        Your <strong><%= aalStepDown.roles.join(', ') %></strong> role<%= aalStepDown.roles.length === 1 ? ' needs' : 's need' %> a passkey sign-in, so <%= aalStepDown.roles.length === 1 ? 'it is' : 'they are' %> off while you are signed in with a password.
+                        Your <strong><%= aalStepDown.roles.join(', ') %></strong> role<%= _sdOne ? ' needs' : 's need' %>
+                        <% if (_sdWay === 'use-passkey' || _sdWay === 'add-passkey') { %>
+                        a passkey sign-in, so <%= _sdOne ? 'it is' : 'they are' %> off while you are signed in with a password.
+                        <% } else if (_sdWay === 'use-totp') { %>
+                        a sign-in with your authenticator app's code, so <%= _sdOne ? 'it is' : 'they are' %> off while you are signed in with a password alone.
+                        <% } else if (_sdWay === 'add-totp') { %>
+                        a sign-in with an authenticator app's code, so <%= _sdOne ? 'it is' : 'they are' %> off while you are signed in with a password alone.
+                        <% } else if (_sdWay === 'outside') { %>
+                        a stronger sign-in, so <%= _sdOne ? 'it is' : 'they are' %> off for now. Sign out, then sign in with <%= _sd.outside.join(' or ') %>.
+                        <% } else { %>
+                        a stronger sign-in than this account can make here, so <%= _sdOne ? 'it is' : 'they are' %> off for now. Ask an administrator.
+                        <% } %>
                     </span>
-                    <% if (aalStepDown.hasPasskey) { %>
+                    <% if (_sdWay === 'use-passkey') { %>
                     <button type="button" class="btn btn-sm btn-warning d-none ms-auto" data-passkey-signin data-redirect="<%= typeof originalUrl !== 'undefined' && originalUrl ? originalUrl : '/' %>" data-error-target="aal-stepdown-error">Sign in with your passkey</button>
                     <script src="/js/passkey.js" defer></script>
-                    <% } else if (aalStepDown.passkeysAvailable) { %>
+                    <% } else if (_sdWay === 'add-passkey') { %>
                     <a class="btn btn-sm btn-warning ms-auto" href="/profile">Add a passkey</a>
+                    <% } else if (_sdWay === 'use-totp') { %>
+                    <span class="ms-auto d-inline-flex align-items-center gap-2">
+                        <a class="btn btn-sm btn-warning" href="/auth/reauth?next=<%= encodeURIComponent(typeof originalUrl !== 'undefined' && originalUrl ? originalUrl : '/') %>">Sign in again</a>
+                        <% if (_sd.addPasskey) { %>
+                        <a class="small text-nowrap" href="/profile" data-aal-step-down-secondary>or add a passkey</a>
+                        <% } %>
+                    </span>
+                    <% } else if (_sdWay === 'add-totp') { %>
+                    <a class="btn btn-sm btn-warning ms-auto" href="/profile#sign-in-methods">Add an authenticator app</a>
                     <% } %>
                     <div id="aal-stepdown-error" class="w-100 small text-danger d-none"></div>
                 </div>
                 <% } %>
                 <% if (typeof stepUpConfirmed !== 'undefined' && stepUpConfirmed) { %>
                 <%# #2145: back from "Confirm it is you" for a form, a button or a download, which a redirect cannot redo. Once. %>
-                <div class="alert alert-success d-flex align-items-center gap-2 mt-2" role="status" data-step-up-confirmed>
-                    <i class="fas fa-user-check" aria-hidden="true"></i>
-                    <span>Confirmed — you can do it now.</span>
-                </div>
+                <%- include('_step-up-confirmed', { stepUpNote: typeof stepUpNote !== 'undefined' ? stepUpNote : undefined }) %>
                 <% } %>
                 <% if (typeof aalEnrolNag !== 'undefined' && aalEnrolNag && aalEnrolNag.roles.length > 0) { %>
                 <%# #1690: the role is held at AAL1 only because no passkey is enrolled. Shown on every page,
@@ -645,9 +695,19 @@
                 <div class="alert alert-danger d-flex flex-wrap align-items-center gap-2 mt-2" role="alert" data-aal-enrol-nag>
                     <i class="fas fa-key"></i>
                     <span>
-                        Your <strong><%= aalEnrolNag.roles.join(', ') %></strong> role<%= aalEnrolNag.roles.length === 1 ? ' needs' : 's need' %> a passkey, and you have not added one. You are using <%= aalEnrolNag.roles.length === 1 ? 'it' : 'them' %> with a password alone until you do.
+                        <%# #2356: only what this account can add here; nothing it can add, an administrator.
+                            The app's code reaches the level only with a password, so the app needs one too. %>
+                        <% const _nag = aalEnrolNag.ways || {};
+                           const _nagAdd = [_nag.addPasskey ? 'a passkey' : '', (_nag.addTotp && _nag.password) ? 'an authenticator app' : ''].filter(Boolean); %>
+                        <% if (_nagAdd.length > 0) { %>
+                        Your <strong><%= aalEnrolNag.roles.join(', ') %></strong> role<%= aalEnrolNag.roles.length === 1 ? ' needs' : 's need' %> <%= _nagAdd.join(' or ') %>, and you have not added one. You are using <%= aalEnrolNag.roles.length === 1 ? 'it' : 'them' %> with a password alone until you do.
+                        <% } else { %>
+                        Your <strong><%= aalEnrolNag.roles.join(', ') %></strong> role<%= aalEnrolNag.roles.length === 1 ? ' needs' : 's need' %> a stronger sign-in than this account can set up here. You are using <%= aalEnrolNag.roles.length === 1 ? 'it' : 'them' %> with a password alone. Ask an administrator.
+                        <% } %>
                     </span>
-                    <a class="btn btn-sm btn-danger ms-auto" href="/profile#sign-in-methods">Add a passkey now</a>
+                    <% if (_nagAdd.length > 0) { %>
+                    <a class="btn btn-sm btn-danger ms-auto" href="/profile#sign-in-methods">Add one now</a>
+                    <% } %>
                 </div>
                 <% } %>
                 <% if (typeof consentNotice !== 'undefined' && consentNotice) { %>
@@ -815,6 +875,12 @@
         });
     }
 
+    /** The page's link: the server's (base-url plus the page's route, vault pages included), else this page's address without any query or fragment (#2304). */
+    function pageInfoUrl(metadata) {
+        if (metadata && metadata.url) return new URL(metadata.url, window.location.origin).href;
+        return window.location.origin + window.location.pathname;
+    }
+
     function extractClientSideMetadata(pageName) {
         // Extract basic metadata from the current page
         const content = document.querySelector('.wiki-content, .page-content, main');
@@ -839,7 +905,6 @@
             tags: [],
             created: null,
             lastModified: null,
-            lastAccessed: null,
             stats: {
                 wordCount: wordCount,
                 characterCount: characterCount,
@@ -1037,7 +1102,7 @@
                                         <tr><td><strong>Filesystem Name:</strong></td><td><code class="small">${metadata.filesystemName || 'Not available'}</code></td></tr>
                                         <tr><td><strong>System Category:</strong></td><td><span class="badge bg-primary">${metadata.category}</span></td></tr>
                                         <tr><td><strong>Status:</strong></td><td><span class="badge bg-success">${metadata.status}</span></td></tr>
-                                        <tr><td><strong>URL:</strong></td><td><small>${window.location.href}</small></td></tr>
+                                        <tr><td><strong>URL:</strong></td><td><small>${pageInfoUrl(metadata)}</small></td></tr>
                                     </table>
 
                                     <h6><i class="fas fa-tags"></i> Classification</h6>
@@ -1055,7 +1120,6 @@
                                     <table class="table table-bordered table-sm">
                                         <tr><td><strong>Created:</strong></td><td>${formatDate(metadata.created)}</td></tr>
                                         <tr><td><strong>Last Modified:</strong></td><td>${formatDate(metadata.lastModified)}</td></tr>
-                                        <tr><td><strong>Last Accessed:</strong></td><td>${formatDate(metadata.lastAccessed)}</td></tr>
                                     </table>
 
                                     <h6><i class="fas fa-chart-bar"></i> Content Statistics</h6>
@@ -1063,7 +1127,7 @@
                                         <tr><td><strong>Word Count:</strong></td><td>${metadata.stats.wordCount || 0} words</td></tr>
                                         <tr><td><strong>Character Count:</strong></td><td>${metadata.stats.characterCount || 0} characters</td></tr>
                                         <tr><td><strong>Line Count:</strong></td><td>${metadata.stats.lineCount || 0} lines</td></tr>
-                                        <tr><td><strong>File Size:</strong></td><td>${formatFileSize(metadata.stats.fileSize)}</td></tr>
+                                        <tr><td><strong>Content Size:</strong></td><td>${formatFileSize(metadata.stats.fileSize)}</td></tr>
                                     </table>
 
                                     ${metadata.schemaType ? `
@@ -1117,10 +1181,9 @@
             `Slug:          ${metadata.slug || 'Not set'}`,
             `UUID:          ${metadata.uuid || 'Not available'}`,
             `Version:       ${metadata.version || 'Not versioned'}`,
-            `URL:           ${window.location.href}`,
+            `URL:           ${pageInfoUrl(metadata)}`,
             `Created:       ${fmtDate(metadata.created)}`,
             `Last Modified: ${fmtDate(metadata.lastModified)}`,
-            `Last Accessed: ${fmtDate(metadata.lastAccessed)}`,
         ];
         if (metadata.author) lines.push(`Author:        ${metadata.author}`);
         if (metadata.editor) lines.push(`Editor:        ${metadata.editor}`);
@@ -1328,7 +1391,7 @@
                             <tr><td>Words</td><td class="text-end fw-bold">${fmtNum(s.wordCount)}</td></tr>
                             <tr><td>Characters</td><td class="text-end">${fmtNum(s.characterCount)}</td></tr>
                             <tr><td>Lines</td><td class="text-end">${fmtNum(s.lineCount)}</td></tr>
-                            <tr><td>File size</td><td class="text-end">${fmtSize(s.fileSize)}</td></tr>
+                            <tr><td>Content size</td><td class="text-end">${fmtSize(s.fileSize)}</td></tr>
                         </table>
                         <h6 class="mt-3"><i class="fas fa-link"></i> Links &amp; References</h6>
                         <table class="table table-bordered table-sm">
@@ -1648,7 +1711,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initializeLeftMenuState();
 
     // Initialize breadcrumb trail
-    initializeTrail();
+    ngdpTrail.init();
 });
 
 // Left menu toggle (desktop only — mobile uses Bootstrap offcanvas via data-bs-toggle)
@@ -1759,15 +1822,7 @@ function initializeLeftMenuState() {
     }
 }
 
-// Breadcrumb trail management
-let navigationTrail = JSON.parse(localStorage.getItem('navigationTrail') || '[]');
-
-// Clear trail function
-function clearTrail() {
-    navigationTrail = [];
-    localStorage.removeItem('navigationTrail');
-    updateTrailDropdown();
-}
+// Breadcrumb trail: stored and drawn by /js/nav-trail.js (#2390)
 
 // Check if user has changed (for clearing trail on user switch)
 function checkUserChange() {
@@ -1776,7 +1831,7 @@ function checkUserChange() {
     
     if (lastUser && lastUser !== currentUserInfo) {
         // User has changed, clear the trail
-        clearTrail();
+        ngdpTrail.clear();
     }
     
     // Store current user
@@ -1790,123 +1845,10 @@ function checkServerRestart() {
     
     if (lastServerTime && Math.abs(serverStartTime - lastServerTime) > 300000) { // 5 minutes difference
         // Server likely restarted, clear trail
-        clearTrail();
+        ngdpTrail.clear();
     }
     
     localStorage.setItem('lastServerTime', serverStartTime);
-}
-
-function addToTrail(pageName, pageTitle) {
-    // Don't add the same page consecutively 
-    if (navigationTrail.length > 0 && navigationTrail[0].page === pageName) {
-        return;
-    }
-    
-    // Remove any existing entry for this page from anywhere in the trail
-    navigationTrail = navigationTrail.filter(item => item.page !== pageName);
-    
-    // Use pageName if pageTitle is not provided or is generic
-    const displayTitle = (pageTitle && pageTitle !== 'Markdown Wiki' && pageTitle !== pageName) ? pageTitle : pageName;
-    
-    // Add to beginning of trail
-    navigationTrail.unshift({
-        page: pageName,
-        title: displayTitle,
-        timestamp: Date.now()
-    });
-    
-    // Keep only last 10 entries
-    navigationTrail = navigationTrail.slice(0, 10);
-    
-    // Save to localStorage
-    localStorage.setItem('navigationTrail', JSON.stringify(navigationTrail));
-    
-    // Debug log
-    console.log('Added to trail:', pageName, 'as', displayTitle);
-    
-    // Update dropdown
-    updateTrailDropdown();
-}
-
-function updateTrailDropdown() {
-    const dropdown = document.getElementById('breadcrumbTrail');
-    if (!dropdown) return;
-    
-    dropdown.innerHTML = '';
-    
-    // Get current page to exclude it from trail
-    const currentPage = ngdpCurrentPageRaw(false);
-    const currentPageDecoded = currentPage ? decodeURIComponent(currentPage) : null;
-    
-    // Show only trail items (excluding current page)
-    const trailItemsToShow = navigationTrail.filter(item => 
-        !currentPageDecoded || item.page !== currentPageDecoded
-    );
-    
-    if (trailItemsToShow.length === 0) {
-        dropdown.innerHTML = '<li><span class="dropdown-item-text text-muted">No trail available</span></li>';
-        return;
-    }
-    
-    trailItemsToShow.forEach((item, index) => {
-        const li = document.createElement('li');
-        const a = document.createElement('a');
-        a.className = 'dropdown-item';
-        a.href = `/view/${encodeURIComponent(item.page)}`;
-        
-        // Use the page name from the URL, not a potentially generic title
-        const displayName = item.page; // Always use the actual page name
-        a.innerHTML = `<i class="fas fa-file-alt me-2"></i>${displayName}`;
-        
-        // Add time indicator for recent items
-        const timeDiff = Date.now() - item.timestamp;
-        if (timeDiff < 300000) { // Less than 5 minutes
-            a.innerHTML += ' <small class="text-muted">(recent)</small>';
-        }
-        
-        li.appendChild(a);
-        dropdown.appendChild(li);
-    });
-    
-    // Add separator and clear option if there are items
-    if (trailItemsToShow.length > 0) {
-        const separator = document.createElement('li');
-        separator.innerHTML = '<hr class="dropdown-divider">';
-        dropdown.appendChild(separator);
-        
-        const clearLi = document.createElement('li');
-        const clearA = document.createElement('a');
-        clearA.className = 'dropdown-item text-danger';
-        clearA.href = '#';
-        clearA.innerHTML = '<i class="fas fa-trash me-2"></i>Clear Trail';
-        clearA.onclick = (e) => {
-            e.preventDefault();
-            clearTrail();
-        };
-        clearLi.appendChild(clearA);
-        dropdown.appendChild(clearLi);
-    }
-}
-
-// Initialize trail on page load
-function initializeTrail() {
-    const currentPage = ngdpCurrentPageRaw(false);
-    if (!currentPage) {
-        updateTrailDropdown();
-        return;
-    }
-    
-    const currentPageDecoded = decodeURIComponent(currentPage);
-    // Use the page name from URL, not the document title
-    const pageName = currentPageDecoded;
-    
-    // Only add to trail if it's a different page than the last one visited
-    if (navigationTrail.length === 0 || navigationTrail[0].page !== currentPageDecoded) {
-        addToTrail(currentPageDecoded, pageName);
-    } else {
-        // Just update the dropdown without adding
-        updateTrailDropdown();
-    }
 }
 
 // Edit form functions for navbar buttons

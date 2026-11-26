@@ -17,7 +17,7 @@
  */
 import type { ShareGrant } from './Share.js';
 import type { ProxyClaim } from '../managers/UserManager.js';
-import type { SignInRecord, PendingConnection, OutsideChoice, PendingStepUp } from '../managers/AuthManager.js';
+import type { SignInRecord, PendingConnection, OutsideChoice, PendingStepUp, StepUpPrompt } from '../managers/AuthManager.js';
 
 declare module 'express-session' {
   interface SessionData {
@@ -37,13 +37,30 @@ declare module 'express-session' {
     signIn?: SignInRecord;
     /** A pending WebAuthn challenge (#448): single-use, tied to its purpose, short-lived. */
     passkeyChallenge?: { value: string; purpose: 'register' | 'authenticate' | 'reauth'; expires: number };
+    /**
+     * #421: an authenticator-app seed offered on /profile/totp, until a code confirms it (10 minutes).
+     * Sealed for the account by `totpEnrolmentStart`; the plain seed never enters the session.
+     */
+    totpEnrolment?: { pending: string; expires: number };
     /** The step-up asked for and not yet given (#2145): its permission, where it returns, whether returning redoes it. */
     pendingStepUp?: PendingStepUp;
     /** The path whose next page view says "Confirmed — you can do it now" after a step-up (#2145). */
     stepUpConfirmed?: string;
+    /** Which note that page says (#2360): a fixed key, so Reset configuration's says to press Reset again. */
+    stepUpNote?: 'press-again';
+    /** A script's step-up prompts (#2193), the newest few: each id and whether it was confirmed or cancelled. */
+    stepUpPrompts?: StepUpPrompt[];
     /** A sign-in waiting for its second factor: the handle, and where to go after (#1523). No identity yet. */
     pendingSignIn?: string;
     pendingRedirect?: string;
+    /**
+     * #1523 slice 1c: "Remember this browser" was ticked and a second factor
+     * completed the sign-in; the next page has the browser make its key. The
+     * version of the page the person was shown, the sign-in's amr, where to go
+     * after, until when (epoch ms), and the id of the sign-in's audit record,
+     * which the remembered row names. Single use.
+     */
+    rememberBrowser?: { version: string; amr: string[]; next: string; until: number; auditId?: string };
     /** A verified outside identity no account has connected, waiting for the person to sign in another way (#1743). */
     pendingConnection?: PendingConnection;
     /** #2073: an outside sign-in whose email several accounts share, waiting for the person to choose one. */

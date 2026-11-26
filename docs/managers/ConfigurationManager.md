@@ -62,7 +62,7 @@ await configManager.setProperty('ngdpbase.application-name', 'My Wiki');
 | Method | Returns | Description |
 | -------- | --------- | ------------- |
 | `getProperty(key, default)` | `any` | Get property with optional default |
-| `setProperty(key, value)` | `Promise<void>` | Set and persist custom property |
+| `setProperty(key, value, ctx)` | `Promise<void>` | Set and persist a custom property, audited with `ctx`. What is in force afterwards is what a restart would merge: a list merged by `id` (the access policies) keeps the shipped and add-on entries beneath the site's; `undefined` takes the key out of the custom file (an empty list would replace every entry beneath it) ([#2126](https://github.com/jwilleke/ngdpbase/issues/2126)) |
 | `getAllProperties()` | `Object` | Get all merged properties |
 | `getCustomProperties()` | `Object` | Get only custom overrides |
 | `getDefaultProperties()` | `Object` | Get default values |
@@ -232,6 +232,10 @@ node scripts/configurationmanage-get-config.js ngdpbase.notifications --prefix -
 For complete property reference, admin interface details, and troubleshooting:
 
 - [ConfigurationManager-Complete-Guide.md](ConfigurationManager-Complete-Guide.md)
+
+## Removed vault keys in the custom config (#2246)
+
+At start, after the merge, every `ngdpbase.stores.<kind>.owner` and `ngdpbase.stores.<kind>.encrypt` key in the custom config gets one warning in the log. It says the key is no longer read and names what decides the vault now: `ngdpbase.system-category.<entry>.encrypt` (with its current value), or the entry's `owner`, where `<entry>` is the system-category that declares the kind's vault (`general` for the `default` vault). A kind no system-category declares is said so. ConfigurationManager also marks itself needs-attention (`markNeedsAttention`, shown on the admin dashboard) with one reason naming every key. Nothing is changed, carried over or removed. The detection is `legacyStoreKeys` in `src/utils/legacyStoreKeys.ts`; the keys and why are in [system-category.md](../system-category.md#related-settings-that-are-not-per-system-category).
 
 ## Configured add-ons must exist (#672)
 

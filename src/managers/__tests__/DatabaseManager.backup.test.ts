@@ -209,7 +209,9 @@ describe('DatabaseManager backup and staged restore (#1723)', () => {
       db.prepare('INSERT INTO a (pad) VALUES (?)').run(pad);
       db.prepare('INSERT INTO b (pad) VALUES (?)').run(pad);
     });
-    for (let i = 0; i < 20000; i++) pair();
+    // The 20000 rows to copy go in as one transaction (each pair a savepoint
+    // inside it): one sync to disk, not 20000 (#2216).
+    db.transaction(() => { for (let i = 0; i < 20000; i++) pair(); })();
 
     let writesDuring = 0;
     let done = false;
@@ -275,7 +277,9 @@ describe('DatabaseManager backup and staged restore (#1723)', () => {
     const restarted = await start();
     expect(fs.existsSync(path.join(dataDir, 'ngdpbase.db.staged.incomplete'))).toBe(true);
     expect(fs.existsSync(path.join(dataDir, 'ngdpbase.db.pre-restore'))).toBe(false);
-    expect(restarted.getManagerStatus()).toMatchObject({ state: 'degraded', kind: 'attention', reason: expect.stringMatching(/NOT applied: only 1 of 2/) });
+    expect(restarted.getManagerStatus()).toMatchObject({ state: 'degraded', kind: 'attention', reason: expect.stringMatching(/^A saved copy of the databases was not put back when the site started/), fixUrl: '/admin/backup' });
+    // #2354: the cause is for the notice below, not the dashboard.
+    expect(restarted.getManagerStatus().reason).not.toMatch(/only 1 of 2/);
     await restarted.reportAtBoot();
     expect(notifications.at(-1)).toMatchObject({ level: 'error', title: 'A database restore was not applied' });
     await restarted.shutdown();
@@ -304,7 +308,9 @@ describe('DatabaseManager backup and staged restore (#1723)', () => {
     fs.writeFileSync(file, JSON.stringify(manifest));
     const restarted = await start();
     expect(fs.readFileSync(victim, 'utf8')).toBe('keep me');
-    expect(restarted.getManagerStatus().reason).toMatch(/not a database of this site/);
+    expect(restarted.getManagerStatus().reason).toMatch(/^A saved copy of the databases was not put back/);
+    await restarted.reportAtBoot();
+    expect(notifications.at(-1)).toMatchObject({ message: expect.stringMatching(/not a database of this site/) });
     await restarted.shutdown();
   });
 
@@ -348,7 +354,7 @@ describe('DatabaseManager backup and staged restore (#1723)', () => {
   test('no backup key: the backup refuses loudly and writes nothing, and the start says so too', async () => {
     delete process.env[BACKUP_KEY_ENV];
     const manager = await populated();
-    expect(manager.getManagerStatus()).toMatchObject({ state: 'degraded', kind: 'outage', reason: expect.stringMatching(/NGDPBASE_BACKUP_KEY is not set/) });
+    expect(manager.getManagerStatus()).toMatchObject({ state: 'degraded', kind: 'outage', reason: expect.stringMatching(/^Databases are not being backed up, because the backup key is not set\./) });
     await expect(backupInto(manager)).rejects.toThrow(/NGDPBASE_BACKUP_KEY is not set, so no database was backed up/);
     expect(fs.readdirSync(backupDir)).toEqual([]);
     process.env[BACKUP_KEY_ENV] = 'backup-key-not-a-secret';
@@ -399,7 +405,7 @@ describe('DatabaseManager backup and staged restore (#1723)', () => {
   test('a backup key equal to the database key still backs up, as loudly as a missing key (D3)', async () => {
     process.env[BACKUP_KEY_ENV] = process.env[DATABASE_KEY_ENV]!;
     const manager = await populated();
-    expect(manager.getManagerStatus()).toMatchObject({ state: 'degraded', kind: 'attention', reason: expect.stringMatching(/NGDPBASE_BACKUP_KEY is the same as NGDPBASE_DATABASE_KEY/) });
+    expect(manager.getManagerStatus()).toMatchObject({ state: 'degraded', kind: 'attention', reason: expect.stringMatching(/^The backup key is the same as the database key/) });
     await manager.reportAtBoot();
     expect(notifications.at(-1)).toMatchObject({ level: 'error', message: expect.stringMatching(/same as NGDPBASE_DATABASE_KEY/) });
     const data = (await backupInto(manager)).data as DatabaseBackupData;

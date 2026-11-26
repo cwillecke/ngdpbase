@@ -17,8 +17,9 @@ import fs from 'fs-extra';
 import os from 'os';
 import path from 'path';
 import matter from 'gray-matter';
-import PageManager from '../PageManager';
+import PageManager, { PageRuleRefusedError } from '../PageManager';
 import VersioningFileProvider from '../../providers/VersioningFileProvider';
+import { withWriteDoorAllowing } from '../../__tests__/__fixtures__/pageWriteDoor';
 
 /** The acting subject: the door takes one, positionally (#1179). */
 const JIM = { username: 'jim', isAuthenticated: true } as never;
@@ -88,7 +89,8 @@ function makeRawDoor(existing: Record<string, { content: string; metadata: Recor
     AuditManager: audit,
     ConfigurationManager: { getProperty: (_k: string, d: unknown) => d, getResolvedDataPath: (_k: string, d: string) => d }
   };
-  const pm = new PageManager({ getManager: vi.fn((name: string) => managers[name] ?? null) });
+  // #1815: these tests are about the door's index and audit work, not who may write.
+  const pm = new PageManager({ getManager: vi.fn(withWriteDoorAllowing((name: string) => managers[name] ?? null)) });
   (pm as unknown as { provider: unknown }).provider = provider;
   return { pm, provider, validation, events, ...spies };
 }
@@ -214,9 +216,10 @@ function makeLive(testDir: string) {
     AttachmentManager: spies.attachments,
     AssetManager: spies.assets,
     CacheManager: spies.cache,
-    AuditManager: { logAuditEvent: vi.fn(async (e: Record<string, unknown>) => { events.push(e); return 'id'; }) }
+    // #1815: a delete is recorded at the door, and `page-delete` needs a durable sink.
+    AuditManager: { logAuditEvent: vi.fn(async (e: Record<string, unknown>) => { events.push(e); return 'id'; }), flushAuditQueue: vi.fn(async () => {}) }
   };
-  const engine = { getManager: vi.fn((name: string) => managers[name] ?? null) };
+  const engine = { getManager: vi.fn(withWriteDoorAllowing((name: string) => managers[name] ?? null)) };
   return { engine, events, ...spies };
 }
 
@@ -409,6 +412,9 @@ describe('the title rule at the door (#1455)', () => {
     await expect(pm.savePage('vaults/jim/default/Docs/Setup', 'body', {}, JIM, {
       normaliseTitle: true, skipValidation: true, skipConflictCheck: true
     })).rejects.toThrow(/is not a private page name/);
+    await expect(pm.savePage('vaults/jim/default/Docs/Setup', 'body', {}, JIM, {
+      normaliseTitle: true, skipValidation: true, skipConflictCheck: true
+    })).rejects.toBeInstanceOf(PageRuleRefusedError);
     expect(provider.savePage).not.toHaveBeenCalled();
   });
 

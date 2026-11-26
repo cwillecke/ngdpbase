@@ -2,11 +2,13 @@ import BaseManager, { BackupData, type BackupArchiveTarget, type ManagerBackupOp
 import type { AttachmentFilesBackupData, AttachmentFilesBackupOutcome } from '../providers/attachmentFilesBackup.js';
 import { ANONYMOUS_SUBJECT } from './UserManager.js';
 import type PolicyDecisionPoint from '../security/PolicyDecisionPoint.js';
-import { actorOf, type ActorContext } from '../context/ActorContext.js';
+import { actorOf, isJobContext, type ActorContext } from '../context/ActorContext.js';
 import { systemContext } from '../context/bootActions.js';
 import type IdentityManager from './IdentityManager.js';
 import { IdentityStoreUnavailableError, errorClassOf } from '../utils/identityStoreUnavailable.js';
 import { ANONYMOUS_USERNAME } from '../context/JobContext.js';
+import { carriesCeiling } from '../utils/proxyClaim.js';
+import { NO_POLICY_REASON } from '../types/Policy.js';
 import fs from 'fs-extra';
 import path from 'path';
 import logger from '../utils/logger.js';
@@ -35,7 +37,7 @@ import type {
 import type BasicAttachmentProvider from '../providers/BasicAttachmentProvider.js';
 // #1926: the provider's uploader shape, not a copy of it — a copy keyed `name` is how uploads lost their username.
 import type { User } from '../providers/BaseAttachmentProvider.js';
-import { formatPrivatePageName, isSharedFolderOwner, parsePrivatePageName, privateStoreAttachmentsDir, privateStoreLayoutFromConfig, privateStoreRoot, SHARED_FOLDER_OWNER } from '../utils/privateStorePath.js';
+import { formatPrivatePageName, isRestorableFileId, isSharedFolderOwner, isValidStoreId, parsePrivatePageName, privateStoreAttachmentsDir, privateStoreLayoutFromConfig, privateStoreRoot, SHARED_FOLDER_OWNER, type PrivateStoreLayout } from '../utils/privateStorePath.js';
 import { readVaultSealState } from '../utils/privateStoreMeta.js';
 import { parsePageFrontmatter } from '../utils/pageFrontmatter.js';
 import { listPrivateOwners } from '../utils/privateStoreTakeout.js';
@@ -57,6 +59,7 @@ import type FileManager from './FileManager.js';
 import type { FilePlace } from '../types/File.js';
 import { storeKindFromConfig } from '../utils/privateStoreDoor.js';
 import type NotificationManager from './NotificationManager.js';
+import { STAGED_RESTORE_FIX, stagedRestoreNotApplied } from '../utils/plainAttention.js';
 
 /**
  * Minimal interface for MediaManager — avoids a circular import.
@@ -102,6 +105,8 @@ interface BaseAttachmentProvider {
   filesInStoreForPage(location: StoreFileLocation, pageName: string): Promise<StoreFileEntry[]>;
   setFileMentionInStore(location: StoreFileLocation, id: string, pageName: string, mentioned: boolean): Promise<boolean>;
   deleteFileInStore(location: StoreFileLocation, id: string): Promise<StoreFileEntry | null>;
+  readStoreRenumbered(location: StoreFileLocation): Promise<Map<string, string>>;
+  noteStoreRenumbered(location: StoreFileLocation, pairs: ReadonlyMap<string, string>): Promise<void>;
   searchFilesInStore(location: StoreFileLocation, query: AssetQuery): Promise<AssetRecord[]>;
   // #1460: the start-up move out of the shared index.
   privateRecordsInSharedIndex(): Array<{ id: string; owner: string | null; store: string | null; pages: string[] }>;
@@ -175,6 +180,23 @@ export interface PutOptions {
    * record names the file by id only, so it is not recorded there.
    */
   importedFrom?: string;
+  /**
+   * A takeout import's file (#2188): the ids it had, the one to try first
+   * first, so a page still linking `/attachments/{id}` finds it again. The
+   * file is stored under the first that is free ({@link restoreIdIsFree});
+   * when none is, it gets a new id, as any upload does. Honoured only in a
+   * vault, never a shared folder or the shared pool; the import passes it
+   * only for one of its user's own stores. The stored id is in the returned
+   * metadata either way.
+   */
+  restoreIds?: readonly string[];
+  /**
+   * The ids files on the site held when the caller's run began, from
+   * {@link heldFileIds}, read once per run (#2188). With it, a restore checks
+   * the set instead of every store's folder on disk, and adds the id it
+   * stores to it.
+   */
+  heldIds?: Set<string>;
 }
 
 /**
@@ -321,6 +343,10 @@ class AttachmentManager extends BaseManager implements CatalogSource {
   /** What the last check for vault pages using shared-pool files found, and the degraded reason it set (#1842). */
   private poolFileFindings: VaultPagePoolFiles[] = [];
   private poolFileReason: string | null = null;
+  /** #2188: ids a restore has claimed and not yet written; one id is claimed by one put at a time. */
+  private readonly claimedRestoreIds = new Set<string>();
+  /** #2188: ids a restore has stored since start, which a run's held ids read earlier may not list. */
+  private readonly restoredIds = new Set<string>();
   private maxSize!: number;
   private allowedTypes!: string;
 
@@ -388,7 +414,10 @@ class AttachmentManager extends BaseManager implements CatalogSource {
       await this.attachmentProvider.initialize(config.readOnly === true ? { readOnly: true } : {});
       // #1876: a staged restore of the files that was set aside is shown, not just logged.
       const restored = this.attachmentProvider.takeRestoreAtStart?.();
-      if (restored?.refused) this.markNeedsAttention(`A staged restore of the attachment files was not applied: ${restored.refused}`);
+      if (restored?.refused) {
+        logger.warn(`[AttachmentManager] A staged restore of the attachment files was not applied: ${restored.refused}`);
+        this.markNeedsAttention(stagedRestoreNotApplied('the attached files'), undefined, STAGED_RESTORE_FIX);
+      }
 
       logger.info(`📎 AttachmentManager initialized with ${this.providerClass}`);
       logger.info(`📎 Max attachment size: ${this.formatSize(this.maxSize)}`);
@@ -757,18 +786,45 @@ class AttachmentManager extends BaseManager implements CatalogSource {
         owner,
         vaultAddon: storeKindFromConfig((key, fallback) => configManager.getProperty(key, fallback), store)?.owner ?? null
       }) ? options.keep : null;
-      const entry = await this.writeAttachments(this.attachmentProvider.storeFileInStore(
-        { owner, store, io },
-        fileBuffer,
-        {
-          originalName: fileInfo.originalName,
-          mimeType: fileInfo.mimeType,
-          description: options.description || '',
-          author: authorRef,
-          ...(pageName ? { pageName } : {}),
-          ...(keep ? { keptOriginal: { types: keep.types } } : {})
+      // #2188: a restored file keeps an id it had when nothing else holds it.
+      // The id is claimed, in one synchronous step, before it is checked, and
+      // held until the file is written, so two imports at once never both take it.
+      let restoreId: string | null = null;
+      if (place.kind === 'vault') {
+        for (const id of new Set(options.restoreIds ?? [])) {
+          if (this.claimedRestoreIds.has(id)) continue;
+          this.claimedRestoreIds.add(id);
+          if (await this.restoreIdIsFree(id, { owner, store, io }, pagesDirectory, layout, options.heldIds).catch(() => false)) {
+            restoreId = id;
+            break;
+          }
+          this.claimedRestoreIds.delete(id);
         }
-      ));
+      }
+      let entry: StoreFileEntry;
+      try {
+        entry = await this.writeAttachments(this.attachmentProvider.storeFileInStore(
+          { owner, store, io },
+          fileBuffer,
+          {
+            originalName: fileInfo.originalName,
+            mimeType: fileInfo.mimeType,
+            description: options.description || '',
+            author: authorRef,
+            ...(pageName ? { pageName } : {}),
+            ...(keep ? { keptOriginal: { types: keep.types } } : {}),
+            ...(restoreId ? { id: restoreId } : {})
+          }
+        ));
+      } finally {
+        // On disk from here, or not stored. A run whose held ids were read before
+        // this write learns of it through restoredIds, which sends it to the disk.
+        if (restoreId) {
+          this.restoredIds.add(restoreId);
+          this.claimedRestoreIds.delete(restoreId);
+        }
+      }
+      options.heldIds?.add(entry.id);
       // #1461: a private file is logged by id — never by its filename.
       logger.info(`📎 Uploaded a file into ${owner}'s private store '${store}' (${entry.id})`);
       // #2048: an encrypted store's file is recorded by id and store only.
@@ -821,6 +877,96 @@ class AttachmentManager extends BaseManager implements CatalogSource {
   }
 
   /**
+   * Whether a file brought back by a takeout re-import may be stored under
+   * the id it had, `id` (#2188). Only an id of the shape a store gives
+   * (`isRestorableFileId`), and only when no file holds it: not the target
+   * store's index, not the shared pool, and no file on disk in any store of
+   * any owner or shared folder. A store names each file's bytes by its id
+   * (`{id}.ext`) in the clear, sealed or not, so another owner's sealed store
+   * is checked without its key. An id another file holds is never reused, so
+   * a takeout cannot claim another file's id, its own or anyone's.
+   *
+   * With `held` ({@link heldFileIds}, read once by the caller's run), the
+   * stores on disk are not read again: the id is free when the set lacks it,
+   * unless a restore stored that id since, which only the disk can settle.
+   */
+  private async restoreIdIsFree(
+    id: string, target: StoreFileLocation, pagesDirectory: string, layout: PrivateStoreLayout, held?: ReadonlySet<string>
+  ): Promise<boolean> {
+    if (!this.attachmentProvider || !isRestorableFileId(id)) return false;
+    if ((await this.attachmentProvider.listFilesInStore(target)).some((f) => f.id === id)) return false;
+    if (await this.attachmentProvider.attachmentExists(id)) return false;
+    if (held && !this.restoredIds.has(id)) return !held.has(id);
+    return !(await this.storeIdsOnDisk(pagesDirectory, layout, id)).has(id);
+  }
+
+  /**
+   * The ids of every file on disk in any store of any owner or shared folder,
+   * by the names of their bytes (#2188). With `only`, stops at that id.
+   */
+  private async storeIdsOnDisk(pagesDirectory: string, layout: PrivateStoreLayout, only?: string): Promise<Set<string>> {
+    const ids = new Set<string>();
+    for (const owner of await listPrivateOwners(pagesDirectory, layout)) {
+      let stores: string[];
+      try {
+        stores = await privateStoreIdsOf(pagesDirectory, owner, layout);
+      } catch {
+        // A folder no account could be named: nothing of a store's in it.
+        continue;
+      }
+      for (const store of stores) {
+        for (const name of await fs.readdir(privateStoreAttachmentsDir(pagesDirectory, owner, store, layout)).catch(() => [] as string[])) {
+          const id = name.split('.')[0] ?? name;
+          ids.add(id);
+          if (id === only) return ids;
+        }
+      }
+    }
+    return ids;
+  }
+
+  /**
+   * The ids files in the site's stores hold now, read once, for a takeout
+   * import to pass as `PutOptions.heldIds` to each file it puts (#2188).
+   * Ids only, from the names of the bytes on disk; no store is opened.
+   */
+  async heldFileIds(): Promise<Set<string>> {
+    const configManager = this.engine.getManager<ConfigurationManager>('ConfigurationManager');
+    const pagesDirectory = configManager?.getResolvedDataPath?.('ngdpbase.page.provider.filesystem.storagedir', './data/pages');
+    if (!configManager || !pagesDirectory) return new Set();
+    return this.storeIdsOnDisk(pagesDirectory, privateStoreLayoutFromConfig((key, fallback) => configManager.getProperty(key, fallback)));
+  }
+
+  /**
+   * The ids a takeout import gave the files of `ctx`'s own store `store` that
+   * could not keep their own, as takeout id → id here (#2188), or null when
+   * this context cannot open the store. Ids only.
+   */
+  async ownStoreRenumbered(ctx: ActorContext, store: string): Promise<Map<string, string> | null> {
+    const location = await this.ownStoreLocation(ctx, store);
+    return location && this.attachmentProvider ? this.attachmentProvider.readStoreRenumbered(location) : null;
+  }
+
+  /** Adds `pairs` to {@link ownStoreRenumbered}'s, for a run that stored files under new ids (#2188). */
+  async noteOwnStoreRenumbered(ctx: ActorContext, store: string, pairs: ReadonlyMap<string, string>): Promise<void> {
+    const location = await this.ownStoreLocation(ctx, store);
+    if (!location || !this.attachmentProvider) throw new Error('That store cannot be written in this session');
+    await this.attachmentProvider.noteStoreRenumbered(location, pairs);
+  }
+
+  /** `ctx`'s own store `store`, as {@link ownStoreFingerprints} reaches it, or null. */
+  private async ownStoreLocation(ctx: ActorContext, store: string): Promise<StoreFileLocation | null> {
+    if (!this.attachmentProvider || !isValidStoreId(store) || !ctx?.username || !mayActInPrivateContainer(ctx, ctx.username)) return null;
+    if (!this.mayReach(ctx, ctx.username, `store-files:${store}`, 'view')) return null;
+    try {
+      return await this.vaultLocation(ctx, ctx.username, store);
+    } catch {
+      // Locked, or a sealed store this context holds no DEK for: never read in the clear.
+      return null;
+    }
+  }
+
+  /**
    * The username an upload is recorded under (#1926): the person the context
    * names. Asked after policy has allowed the upload and before anything is
    * written; it decides nothing about authority, only whether there is
@@ -859,7 +1005,7 @@ class AttachmentManager extends BaseManager implements CatalogSource {
       // The pool's own failure (a metadata file it cannot write, a full disk): named by class, tried at the next start.
       const reason = `File uploaders were not converted to identity @ids (${errorClassOf(err)}); the next start tries again (#2097)`;
       logger.warn(`[AttachmentManager] ${reason}`);
-      this.markNeedsAttention(reason);
+      this.markNeedsAttention('Some files still name who uploaded them the old way, because the update did not finish. Restart the site to try again.');
       return;
     }
     this.reportUploaderConversion(changed, counts, 'shared file');
@@ -901,9 +1047,9 @@ class AttachmentManager extends BaseManager implements CatalogSource {
 
   /** The identity store could not answer: nothing is converted this start, and the next start tries again (#2097). */
   private postponeUploaderConversion(why: string): void {
-    const reason = 'File uploaders were not converted to identity @ids: identity store unavailable, conversion postponed to the next start (#2097)';
-    logger.warn(`[AttachmentManager] ${reason}: ${why}`);
-    this.markNeedsAttention(reason);
+    logger.warn(`[AttachmentManager] File uploaders were not converted to identity @ids: identity store unavailable, conversion postponed to the next start (#2097): ${why}`);
+    // #2354: the dashboard says it in plain words; the developer detail is in the line above.
+    this.markNeedsAttention('Some files still name who uploaded them the old way, because the contacts were not available when the site started. Restart the site to try again.');
   }
 
   /**
@@ -1059,6 +1205,27 @@ class AttachmentManager extends BaseManager implements CatalogSource {
     }
 
     return await this.attachmentProvider.getAttachment(attachmentId);
+  }
+
+  /**
+   * May `ctx` read this file, by the rules `GET /attachments/:id` serves it
+   * under: a file in the requester's own store, else `asset-read`, and a
+   * private file only to its owner or their delegate (PIP). No bytes are read.
+   */
+  async mayReadAttachment(attachmentId: string, ctx: ActorContext): Promise<boolean> {
+    if (await this.isOwnPrivateStoreFile(attachmentId, ctx)) return true;
+    if (!(await this.checkPermission('asset-read', ctx))) return false;
+    const meta = await this.getAttachmentMetadata(attachmentId);
+    if (!meta) return false;
+    if (!meta.isPrivate) return true;
+    return this.mayReach(ctx, typeof meta.creator === 'string' ? meta.creator : '', `attachment:${attachmentId}`, 'view');
+  }
+
+  /** A file's original bytes and metadata, when {@link mayReadAttachment} lets `ctx` read it; else null. */
+  async readAttachmentFor(attachmentId: string, ctx: ActorContext): Promise<{ buffer: Buffer; metadata: AttachmentMetadata } | null> {
+    const own = await this.getPrivateStoreAttachment(attachmentId, ctx);
+    if (own) return own;
+    return (await this.mayReadAttachment(attachmentId, ctx)) ? this.getAttachment(attachmentId) : null;
   }
 
   // ── Files in a private store (#1400, every store since #1460) ─────────────
@@ -1355,6 +1522,27 @@ class AttachmentManager extends BaseManager implements CatalogSource {
    */
   async isOwnPrivateStoreFile(attachmentId: string, ctx: ActorContext): Promise<boolean> {
     return (await this.findOwnStoreFile(ctx, attachmentId, 'view')) !== null;
+  }
+
+  /**
+   * The files the requester's own store `store` holds, as fingerprint → id,
+   * or null when this context cannot open it (#2171). The store's own
+   * duplicate check (its index's fingerprints), read without storing or
+   * recording anything: a takeout import reads it once per run and asks it
+   * before putting a file again, so a file deleted since comes back and one
+   * still held writes no second upload record. Only that store is opened.
+   */
+  async ownStoreFingerprints(ctx: ActorContext, store: string): Promise<Map<string, string> | null> {
+    if (!this.attachmentProvider || !isValidStoreId(store) || !ctx?.username || !mayActInPrivateContainer(ctx, ctx.username)) return null;
+    if (!this.mayReach(ctx, ctx.username, `store-files:${store}`, 'view')) return null;
+    let location: StoreFileLocation;
+    try {
+      location = await this.vaultLocation(ctx, ctx.username, store);
+    } catch {
+      // Locked, or a sealed store this context holds no DEK for: never read in the clear.
+      return null;
+    }
+    return new Map((await this.attachmentProvider.listFilesInStore(location)).map((f) => [f.fingerprint, f.id]));
   }
 
   /** The requester's own private-store files uploaded onto `pageName`. */
@@ -2109,8 +2297,10 @@ class AttachmentManager extends BaseManager implements CatalogSource {
     const reason = `Vault pages use files in the shared attachment pool, which is served like any public attachment: ${detail}. ` +
       'They were left as they are; "Move into vault" on the admin dashboard, or on the owner\'s profile for a sealed vault, moves them in (#1842)';
     logger.error(`📎 ${reason}`);
-    this.poolFileReason = reason;
-    if (this.markNeedsAttention(reason) && opts.notify) {
+    // #2354: the dashboard says it in plain words; the owners and counts are in the log line above.
+    const plain = `${this.poolFileFindings.length === 1 ? 'A private vault page uses' : `${this.poolFileFindings.length} private vault pages use`} files from the shared attachment pool, which anyone can open like any public attachment. Use "Move into vault" on this page, or on the owner's profile for a sealed vault.`;
+    this.poolFileReason = plain;
+    if (this.markNeedsAttention(plain) && opts.notify) {
       try {
         await this.engine.getManager<NotificationManager>('NotificationManager')
           ?.notifyAdmins({ level: 'error', title: 'Vault pages use files outside their vault', message: `${reason}.` });
@@ -2230,6 +2420,66 @@ class AttachmentManager extends BaseManager implements CatalogSource {
   }
 
   /**
+   * May `context` delete the shared file `attachmentId` (#2534)? The
+   * `asset-delete` permission, or being the person who uploaded it.
+   *
+   * The uploader's right is an exception to a MISSING permission and nothing
+   * more, so it is decided here, in the door, and the button asks the same
+   * question through {@link mayDeleteAttachment}:
+   *   - an explicit deny, a ceiling (token, share link, proxy claim) or an
+   *     engine that cannot answer is a refusal, never an exception;
+   *   - it needs a signed-in person: not anonymous, not a job, not an
+   *     asserted username;
+   *   - the file's own record names them (an identity id, or the plain
+   *     username on a record not yet converted); an unreadable record, an
+   *     orphan and "Unknown" never match.
+   * A file in a vault or shared folder is decided by the vault rule instead.
+   */
+  private async mayDeleteSharedFile(context: ActorContext, attachmentId: string): Promise<boolean> {
+    if (await this.checkPermission('asset-delete', context)) return true;
+    if (!context || isJobContext(context) || carriesCeiling(context)) return false;
+    const username = typeof context.username === 'string' ? context.username.trim() : '';
+    if (!username || username === ANONYMOUS_USERNAME || context.isAuthenticated !== true) return false;
+
+    // Silence only: policy said nothing about asset-delete for this person.
+    const pdp = this.engine.getManager<PolicyDecisionPoint>('PolicyDecisionPoint');
+    if (typeof pdp?.decide !== 'function') return false;
+    const decision = await pdp.decide(context, { action: 'asset-delete' });
+    if (decision.permit || decision.applicable || decision.reason !== NO_POLICY_REASON) return false;
+
+    // The record of THIS file, read now: ids are content hashes, so owning another file proves nothing here.
+    let uploadedBy: unknown;
+    try {
+      uploadedBy = (await this.getAttachmentMetadata(attachmentId))?.uploadedBy;
+    } catch {
+      return false;
+    }
+    const identities = this.engine.getManager<IdentityManager>('IdentityManager');
+    if (typeof identities?.refersTo !== 'function') {
+      // No identity store at all: only a record that still holds the plain username can match.
+      return typeof uploadedBy === 'string' && uploadedBy === username && uploadedBy !== UNKNOWN_UPLOADER;
+    }
+    try {
+      return await identities.refersTo(context, uploadedBy, username);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Whether the Delete button is offered for the file `attachmentId` (#2534):
+   * the same answer {@link deleteAttachment} gives, so the button is never
+   * offered and then refused. Records nothing and changes nothing.
+   */
+  async mayDeleteAttachment(context: ActorContext, attachmentId: string): Promise<boolean> {
+    if (!this.attachmentProvider) return false;
+    const own = await this.locateOwnStoreFile(context, attachmentId, 'delete');
+    return own
+      ? this.mayInVault(context, 'asset-delete', own.location.owner, own.location.store, attachmentId)
+      : this.mayDeleteSharedFile(context, attachmentId);
+  }
+
+  /**
    * Delete an attachment
    *
    * @param {string} attachmentId - Attachment identifier
@@ -2250,7 +2500,7 @@ class AttachmentManager extends BaseManager implements CatalogSource {
     const own = await this.locateOwnStoreFile(context, attachmentId, 'delete');
     const allowed = own
       ? await this.mayInVault(context, 'asset-delete', own.location.owner, own.location.store, attachmentId)
-      : await this.checkPermission('asset-delete', context);
+      : await this.mayDeleteSharedFile(context, attachmentId);
     if (!allowed) {
       throw new Error('Permission denied: You do not have permission to delete attachments');
     }

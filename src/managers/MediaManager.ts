@@ -30,6 +30,7 @@ import BaseMediaProvider, { MediaItem, ScanResult } from '../providers/BaseMedia
 import FileSystemMediaProvider, { DEFAULT_MEDIA_EXTENSIONS } from '../providers/FileSystemMediaProvider.js';
 import { transformImage } from '../utils/imageTransform.js';
 import { enabledEntries } from '../utils/configFiles.js';
+import { describeMediaFolderOverlap, findMediaFolderOverlaps, privateStorageRoots } from '../utils/mediaFolderOverlap.js';
 import type ConfigurationManager from './ConfigurationManager.js';
 import type PolicyInformationPoint from '../security/PolicyInformationPoint.js';
 import type CatalogManager from './CatalogManager.js';
@@ -60,6 +61,8 @@ class MediaManager extends BaseManager implements CatalogSource {
   readonly currentSchemaVersion = MediaManager.CURRENT_SCHEMA_VERSION;
   /** Active media provider (null when not yet initialized) */
   private _provider: BaseMediaProvider | null = null;
+  /** Why configured folders were refused for overlapping private storage (#2195). */
+  private overlapReasons: string[] = [];
   /** The configured media folders, for the degraded-state reason (#1167). */
   private mediaFolders: string[] = [];
 
@@ -129,9 +132,15 @@ class MediaManager extends BaseManager implements CatalogSource {
     const extensionList = enabledEntries(configManager.getProperty('ngdpbase.media.extensions', DEFAULT_MEDIA_EXTENSIONS));
     const extensions = new Set(extensionList.map(e => e.toLowerCase().replace(/^\./, '')));
 
+    // #2195: a folder overlapping private storage is skipped, not fatal: the
+    // site still boots and its other folders are scanned.
+    const storageRoots = privateStorageRoots(configManager);
+    const overlaps = findMediaFolderOverlaps(folders, storageRoots);
+    const allowed = folders.filter((_f, i) => !overlaps.some(o => o.position === i + 1));
     this.mediaFolders = folders;
     const fileSystemProvider = new FileSystemMediaProvider({
-      folders,
+      folders: allowed,
+      excludedRoots: storageRoots.map(r => r.path),
       ignoreDirs,
       maxDepth,
       indexFile,
@@ -149,7 +158,9 @@ class MediaManager extends BaseManager implements CatalogSource {
     // #1167: an unreadable configured folder is a degraded manager, visible on
     // the dashboard and in the manager status — not one boot-time warn line.
     // Checked now rather than at the first scan, which may be an hour away.
+    this.overlapReasons = overlaps.map(describeMediaFolderOverlap);
     this.recordFolderState(await fileSystemProvider.unreachableFolders());
+    this.surfaceOverlaps();
 
     // #1721: the folder rescan is a maintenance job on the scheduler — listed
     // on Admin → Scheduled Jobs, never overlapping itself. 0 turns it off.
@@ -158,6 +169,8 @@ class MediaManager extends BaseManager implements CatalogSource {
       id: 'media.folder-scan',
       displayName: 'Media: rescan folders',
       everyMs: scanInterval,
+      // #2467: the last scan is still on the dashboard after a restart.
+      keepLastRun: true,
       run: async () => {
         const result = await this.scanFolders();
         return `Scanned ${result.scanned}, added ${result.added}, updated ${result.updated}`;
@@ -295,15 +308,47 @@ class MediaManager extends BaseManager implements CatalogSource {
    * what degraded means (#1155) — configured, wanted, not working.
    */
   private recordFolderState(unreachable: string[]): void {
-    if (unreachable.length === 0) {
+    if (unreachable.length === 0 && this.overlapReasons.length === 0) {
       this.markReady();
       return;
     }
     const total = Math.max(this.mediaFolders.length, unreachable.length);
-    this.markDegraded(
-      `${unreachable.length} of ${total} configured media folder(s) cannot be read: ${unreachable.join(', ')}`,
-      'ngdpbase.media.folders'
-    );
+    // #2354: the dashboard says it in plain words; the folders are in the log.
+    const reasons: string[] = [];
+    if (this.overlapReasons.length > 0) {
+      reasons.push(`${this.overlapReasons.length === 1 ? 'A media folder overlaps' : `${this.overlapReasons.length} media folders overlap`} private storage, so ${this.overlapReasons.length === 1 ? 'it is' : 'they are'} not scanned. Choose ${this.overlapReasons.length === 1 ? 'a folder' : 'folders'} outside private storage.`);
+    }
+    if (unreachable.length > 0) {
+      logger.warn(`[MediaManager] ${unreachable.length} of ${total} configured media folder(s) cannot be read: ${unreachable.join(', ')}`);
+      reasons.push(`${unreachable.length} of ${total} media ${total === 1 ? 'folder' : 'folders'} cannot be read, so ${unreachable.length === 1 ? 'its' : 'their'} files are not shown. Check that the drive is connected to the server; this is done outside this page.`);
+    }
+    this.markDegraded(reasons.join(' '), 'ngdpbase.media.folders');
+  }
+
+  /** Log and notify admins of each folder refused for overlapping private storage (#2195). */
+  private surfaceOverlaps(): void {
+    const nm = this.engine.getManager<NotificationManager>('NotificationManager');
+    for (const message of this.overlapReasons) {
+      logger.error(`[MediaManager] ${message}`);
+      nm?.notifyAdmins({ level: 'error', title: 'Media folder overlaps private storage', message }).catch(() => { /* ignore */ });
+    }
+  }
+
+  /**
+   * Why each of `folders` may not be a media folder, empty when all may (#2195).
+   * The configuration screen asks before saving `ngdpbase.media.folders`.
+   */
+  checkFolders(folders: string[]): string[] {
+    const configManager = this.engine.getManager<ConfigurationManager>('ConfigurationManager');
+    if (!configManager) return [];
+    return findMediaFolderOverlaps(folders, privateStorageRoots(configManager)).map(describeMediaFolderOverlap);
+  }
+
+  /** One path per line, then "and N more" when the provider capped the list (#2191). */
+  private formatFileList(files: string[] | undefined, total: number): string {
+    if (!files || files.length === 0) return ' ';
+    const more = total - files.length;
+    return `\n\n${files.join('\n')}${more > 0 ? `\nand ${more} more` : ''}\n\n`;
   }
 
   /**
@@ -344,7 +389,8 @@ class MediaManager extends BaseManager implements CatalogSource {
       notify({
         level: 'warning',
         title: 'Media files with a partial capture date',
-        message: `${result.partialCaptureDate} media file(s) have a partial EXIF/QuickTime date (year-only, with no month/day) and were defaulted to January 1, so they sort at the start of their year. ` +
+        message: `${result.partialCaptureDate} media file(s) have a partial EXIF/QuickTime date (year-only, with no month/day) and were defaulted to January 1, so they sort at the start of their year.` +
+          this.formatFileList(result.partialCaptureDateFiles, result.partialCaptureDate) +
           'Backfill a full capture date on the source files (e.g. with exiftool\'s DateTimeOriginal) and Reindex for accurate within-year sorting.'
       });
     }
@@ -356,7 +402,8 @@ class MediaManager extends BaseManager implements CatalogSource {
       notify({
         level: 'error',
         title: 'Media files without a capture date',
-        message: `${result.noCaptureDate} media file(s) have no usable capture date (EXIF/QuickTime, and none parseable from the filename) and will sort by file modification time, not capture date. ` +
+        message: `${result.noCaptureDate} media file(s) have no usable capture date (EXIF/QuickTime, and none parseable from the filename) and will sort by file modification time, not capture date.` +
+          this.formatFileList(result.noCaptureDateFiles, result.noCaptureDate) +
           'Backfill the capture date on the source files (e.g. with exiftool\'s DateTimeOriginal) and Reindex for accurate date sorting.'
       });
     }

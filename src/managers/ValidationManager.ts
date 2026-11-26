@@ -63,8 +63,10 @@ export const DEFAULT_SHARE_MAX_DAYS = 15;
  * - `public`: a `storageLocation` without a vault; its pages can never be
  *   private.
  * - `vault`: a `storageLocation.privatestore`; its pages may be private.
+ * - `shared-folder`: `storageLocation.sharedfolder: true` (#2255); its pages
+ *   live in shared folders (the `shared` category).
  */
-export type CategoryStored = 'none' | 'public' | 'vault';
+export type CategoryStored = 'none' | 'public' | 'vault' | 'shared-folder';
 
 /**
  * Where an entry's pages are stored. The one rule every reader of "is this
@@ -77,6 +79,7 @@ export function categoryStored(cfg: { storageLocation?: unknown } | null | undef
   // (a malformed value, or a word left from before #1504) still stores, so a
   // stale site config never starts refusing saves.
   if (location === undefined || location === null) return 'none';
+  if (typeof location === 'object' && (location as { sharedfolder?: unknown }).sharedfolder === true) return 'shared-folder';
   return typeof location === 'object' && parsePrivatestore((location as { privatestore?: unknown }).privatestore) ? 'vault' : 'public';
 }
 
@@ -298,13 +301,16 @@ class ValidationManager extends BaseManager {
    */
   private async reportMistypedSiteValues(categories: unknown): Promise<void> {
     if (!categories || typeof categories !== 'object') return;
-    const lines = Object.entries(categories as Record<string, unknown>)
-      .flatMap(([key, entry]) => systemCategoryValueProblems(key, entry))
-      .map((p) => `${p.message}; ${p.readAs}`);
+    const problems = Object.entries(categories as Record<string, unknown>)
+      .map(([key, entry]) => systemCategoryValueProblems(key, entry));
+    const lines = problems.flat().map((p) => `${p.message}; ${p.readAs}`);
     if (lines.length === 0) return;
     const reason = `${lines.join('. ')}. Fix ${SYSTEM_CATEGORY_KEY} in the configuration`;
     logger.error(`[ValidationManager] ${reason}`);
-    if (this.markNeedsAttention(reason, SYSTEM_CATEGORY_KEY)) {
+    // #2354: the dashboard says it in plain words; the entries and the values are in the log line above.
+    const many = problems.filter((p) => p.length > 0).length !== 1;
+    const plain = `${many ? 'Some page categories have' : 'A page category has'} a yes/no setting that holds something else, so the site guesses what was meant (for example, new pages may start public, or a vault may stay unencrypted). Correct ${many ? 'them' : 'it'} in the settings.`;
+    if (this.markNeedsAttention(plain, SYSTEM_CATEGORY_KEY)) {
       try {
         await this.engine.getManager<NotificationManager>('NotificationManager')?.notifyAdmins({
           level: 'error', title: 'A system-category value has the wrong type', message: `${reason}.`

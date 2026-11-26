@@ -10,6 +10,13 @@
       "icon": "calendar-check",
       "color": "#0d6efd"
     },
+    "calendar-read": {
+      "description": "See the events of calendars set to signed-in visibility, in the calendar view, the API and the .ics feed",
+      "label": "See events of calendars shown to signed-in people",
+      "icon": "calendar",
+      "color": "#6c757d",
+      "read-only": true
+    },
     "calendar-reserve": {
       "description": "Make and cancel your own reservations",
       "label": "Make and cancel your own reservations",
@@ -22,7 +29,6 @@
       "id": "calendar-manage-access",
       "name": "Calendar management",
       "description": "Manage calendar events and reservations",
-      "priority": 90,
       "effect": "allow",
       "subjects": [
         {
@@ -41,10 +47,29 @@
       ]
     },
     {
+      "id": "calendar-read-access",
+      "name": "Calendar viewing",
+      "description": "Every signed-in account sees the events of calendars whose visibility is authenticated",
+      "effect": "allow",
+      "subjects": [
+        {
+          "type": "authenticated"
+        }
+      ],
+      "resources": [
+        {
+          "type": "page",
+          "pattern": "*"
+        }
+      ],
+      "actions": [
+        "calendar-read"
+      ]
+    },
+    {
       "id": "calendar-reserve-access",
       "name": "Calendar reservations",
       "description": "Make and cancel one's own reservations",
-      "priority": 90,
       "effect": "allow",
       "subjects": [
         {
@@ -83,5 +108,6 @@
       ]
     }
   ],
+  "_comment_calendar_read": "#2391 — calendar-read: see the events of a calendar whose visibility is authenticated. Granted to every signed-in account; a calendar whose visibility is private asks calendar-manage, and a public one asks nothing.",
   "_comment_calendar_reserve": "#1430 — calendar-reserve: make and cancel one's own reservation. Delegated on day one to every role that can sign in; calendar-manage stays the management action."
 }

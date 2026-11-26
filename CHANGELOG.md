@@ -13,6 +13,258 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Future enhancements
 
+### Added
+
+- __#2534__: The search page has a Delete button on a file in the site's own files, for the person who uploaded it and for anyone who may delete files. Its confirm box names the pages that still use the file (only pages you may open, at most 10, the rest counted) and the delete still goes ahead if you confirm. The delete itself is the existing one, and the server now allows the uploader of a shared file as well as holders of the delete permission, with no new permission; an explicit deny, an agent token, share link or proxy, a signed-out request and a file in a vault keep their existing rules. Renaming or replacing a file is [#2536](https://github.com/jwilleke/ngdpbase/issues/2536); deleting from the Media Manager is [#2537](https://github.com/jwilleke/ngdpbase/issues/2537).
+
+### Changed
+
+- __#2523 (slice 4 of #2247)__: the Shared links page has an all-users view for managers, at `/my/shares?view=all`. Revoking another user's link, of either kind, now needs the permission "See and revoke everyone's shared links" and nothing else. For tag links it replaces the system-administration permission and the permission to revoke shared links. A site that uses the default administrator policy sees no change. A site where a custom policy gives system administration to someone without the new permission loses that person's ability to revoke other users' tag links until the policy grants it. The view lists each owner, the area name and the number of pages, with no page titles and no addresses, and opening it is not recorded; stopping a link is, naming the manager and the owner. The administrator dashboard's link to the view shows only to someone who holds that permission; anyone else sees a line naming it. The old all-shares page at `/shares` now redirects to the all-users view, and the permission "Revoke share links through a token or proxy" (formerly "Revoke your own share links") now applies only to a token or proxy acting for the person who made a link.
+
+### Fixed
+
+- __#2494__: more admin pages stop showing the system's own error text. The raw editor, proxy access, shared folders and their recovery words, creating a user, the backup key, vault repair, deleting an attachment, the streaming import, add-on update, linking a contact and starting a job now say in a sentence what failed and what to do, and the full error goes to the server log. A refusal written for the person (a shared folder that already exists, a role that could not be given, an end date in the past or a locked private store when giving proxy access, a raw save the page rules refuse) is still shown as it is. When a new user is created but the invitation fails, the administrator is told the user exists and no invitation was sent. An import from a web address whose site is down, gone or too busy now says so, instead of the general sentence. A page or version that is not found, and a deleted page that cannot be put back, no longer show file paths. A refusal the server makes on purpose (a rename or delete that is not allowed, a title that is taken, a passkey that cannot be added) now leaves one line in the server log.
+- __#2540__: the Shared links page now shows a link that an administrator stopped as "Page not available (404)", as the administrator's confirm and the sharing guide already said. It read "Page no longer available".
+- __#2532__: `./server.sh update` and `update all` do nothing when the site is already at the latest commit and its build matches it: no install, build or restart (a site that is stopped is still started, without a build), and `update all` lists the site as `unchanged` in its summary. A successful build now records its commit in `dist/.built-from`; a site without that file, with a failed build, or with a build of another commit still rebuilds. A site built before this release rebuilds once on its next update.
+
+## [5.48.0] - 2026-11-25
+
+### Upgrade notes
+
+- __#2519__ — a site that is already held by git needs this once, in its folder, before its first update: `git checkout -- package-lock.json`. After that, `update all` keeps the lockfile clean.
+
+### Added
+
+- __#2468__ — new admin page "Page building speed" at `/admin/parser-performance` (a button next to Logs on the dashboard, for holders of `admin-read` or `admin-system`). It sums the kept checks for the last hour, 24 hours, 7 days and 30 days: typical, slowest 1 in 20, slowest and average, with the number of checks in each column heading, for the time to build a page, the share served from stored copies and the share that failed. In the stored-copies table of those sums, the slowest 1 in 20 and slowest rows show the lowest values, so in all three sums tables they mean the worst builds. The stored-copies column of the earlier warnings does the same, and that card's note says so. At start-up the parser copies the numbers from the old "MarkupParser Performance Alert: ..." notifications to `legacy-alerts.json` in the history folder, shown on the page as earlier warnings, and then deletes those notifications; a restart in between loses nothing and imports nothing twice. The recovery line for the share served from stored copies now says "below the lowest allowed". A check with no usable date (or one that cannot exist, such as 9999-99-99) is dropped with a warning, and a check after a half-written last line starts on a new line. Only the three old alert titles, matched whole, are copied and deleted, with the new `NotificationManager.removeByTitles`, which no route can reach. The page reuses its sums for a minute, so many page views read the files once. A site with no folder for the checks, or whose folder could not be made, gets a notice with the step to take and no tables. This replaces the 5.47.0 line that said notifications an earlier version saved are left as they are: from this release they are copied and then deleted.
+
+- __#2521__ — a new permission, `share-manage-all` ("See and revoke everyone's shared links"), held by administrators through the policy `admin-share-manage-all`. It is a separate policy, not an edit to `admin-full-access`, so a site holding a stored copy of `admin-full-access` still receives it. A site with a custom policy for administrators grants it to whoever it chooses; the Roles and Permissions page shows it as held by administrators and no one else. It needs no fresh sign-in and does not depend on "admins can enter private areas". Nothing uses it for a screen yet. When an administrator revokes another user's tag link at `POST /shares/:id/revoke`, the `share-revoke` audit record now carries `byManager: true` and the stored link gets a `revokedByManager` flag naming nobody. The `share-revoke` permission is unchanged and stays grantable, because a token or proxy acting for a link's maker still needs it. Nothing for you to do.
+
+- __#2483__ — Admin → Backup now shows six collapsible status cards, with Auto Backup first, so you can see what the backup is doing and fold away the parts you do not need.
+
+### Changed
+
+- __#2522__: a new Shared links page at `/my/shares` lists every link you made, tag links and private-area links together, and the Profile card counts the same rows. A link an administrator stopped shows as "Page not available (404)". The help page "Share Links" is now "Shared links". `/shares?keyword=X` redirects to the new page; `/shares` still shows an administrator every user's tag links. Anyone who made a shared link can now always revoke it when signed in at their own browser: before, the maker of a tag link also needed the permission to revoke shared links, and the maker of a private-area link needed the permission to manage their profile. An agent token or a proxy acting for the maker still needs those permissions.
+
+- __#2520__ — "My Links" is now called "Pinned pages" wherever you see it: the sidebar heading, the page menu ("Add to pinned pages", "Remove from pinned pages"), the Profile and My Contributions cards, the list page's title and browser tab, and the messages after you pin or unpin a page. The address `/my/links`, your pinned pages and the `[{MyLinks}]` plugin keep working as before, so nothing needs migrating, and a link on a page, or a bookmark, that still says "My Links" opens the renamed help page instead of showing a red link to create a new one. The "My Links" help page is retitled "Pinned pages": a site that never edited it shows Update ready under Admin → Required Pages and takes it with Sync; a site that edited its copy is asked, and until its admin chooses, that help page says "My Links" while the screens say "Pinned pages".
+
+### Fixed
+
+- __#2514__ — the upgrade clean-up of old `access:` limits now reaches pages in a person's vault. The start-up scan and the sign-in pass listed pages with the page provider's list, which leaves the vaults folder out, so a vault page with an old limit such as `edit: [admin]` was never counted in Admin → needs attention, never given an Author Lock, and had no copy made in `upgrade-backups`. The start-up scan now counts every vault page it can read (never named), and the sign-in pass converts the signed-in person's own vault pages, with a copy first. Another person's vault is still never looked at, and a closed (encrypted) vault is not listed until it is open. A person with a vault that could not be opened at sign-in is not marked as done, so the pass runs again at their next sign-in and when they unlock the vault. The copy made first of an encrypted page is its stored bytes, so it stays encrypted and restores the page, and no page name or file path is written to the log. A damaged vault is skipped alone. Nothing for you to do.
+- __#2528__ — in Admin, the calendar read rule is no longer flagged as letting everyone use every page. The rule only covers calendars, so the warning was wrong and is gone.
+- __#2519 (#2527)__ — updating a site no longer leaves `package-lock.json` changed. `update all` keeps the file as committed, so a site held by git stays clean after an update (see the upgrade notes for the one-time step).
+
+## [5.47.0] - 2026-11-25
+
+### Upgrade notes
+
+- __#2466, #2478, #2511__ — on its first start after upgrading, a site that came from 5.42 or earlier converts its leftover priority and access limits. At start, the update removes the old `priority` from your own access rules (each logged, the file copied first to the `upgrade-backups` folder of the data folder) and converts a page's old `access:` limit to an Author Lock only where it limited editing to administrators alone and the page's author, if it has one, is an administrator. Since #2255 the old `access:` has not been read, so this narrows who can edit such a page today: a page that any editor could change now only its author and administrators can change, and nothing else about the page changes. Pages with no exact match are left as they were and stay in Admin → needs attention. A private page is not changed at start-up, because the system may not write one: when its owner signs in, the same conversion runs on their own private pages, as them, through their own permissions, with a copy first, once for each person, and without slowing the sign-in; the count of private pages left in Admin → needs attention drops as owners sign in. Whether a page's author is an administrator is now asked of the site's permission check (#2511), so a page by an administrator whose role comes from the permission check is converted too. Pages in a person's vault are converted when that person signs in, only when the page's author is the vault owner. __Pages in an administrator's vault are not converted yet:__ they stay in Admin → needs attention until a later release (#2514). A page that could not be judged at sign-in because a lookup failed (the identity store, the user store, or the access rules not loaded yet) is tried again at the next sign-in. The copies in `upgrade-backups` are never removed, and a copy of a private page keeps its text there: delete them by hand once you no longer need them. Nothing for you to do; running again changes nothing.
+- __#2391__ — the calendar API and the `.ics` feed now honour each calendar's `visibility` setting, as the calendar view's settings already described. A calendar set to `authenticated` shows its events to signed-in accounts; one set to `private` shows them to holders of `calendar-manage`; a configured calendar with no `visibility` is visible only to holders of `calendar-manage`, the same as a calendar the configuration does not name. __Upgrade note:__ after upgrading, set `visibility` on every calendar (`public`, `authenticated` or `private`); a calendar left unset is visible only to calendar managers, and the calendar admin page names it. A site's `clubhouse` calendar needs an entry under `calendars` with the `visibility` its members should have. A calendar set to `enabled: false` is left out of the API, the `.ics` feed and the marquee text. The marquee text applies the setting for the viewer. A changed `visibility` or `enabled` applies on the next request, with no restart. A calendar app that cannot sign in to the site can subscribe only to a public calendar's `.ics` address. The Clubhouse reservation form now checks the same settings: it reserves only on a calendar that is enabled, has `workflow: reservation` and that the person may see, and otherwise answers "This calendar does not accept reservations." For a submission held for review, the reviewer who approves it is the person checked. Cancelling a reservation you may not cancel now answers 404 "Reservation not found", the same as for an id that does not exist. The add-on adds one permission, `calendar-read`, granted to every signed-in account.
+- __#2495__ — the backup folder is its own setting on Admin → Backup, no longer a row in the Auto Backup form. It is checked and made when saved, and checked again before every backup. A folder the site cannot reach is refused on save, where before any path was saved, and a failed backup says what is wrong in plain words.
+- __#2454__ — footnote links: an address that is not `http` or `https` shows as plain text, including one stored before this release. A save with such an address is refused with a plain message.
+- New settings: `ngdpbase.markup.performance.history.dir` (`${FAST_STORAGE}/parser-performance`, listed as sensitive) and `ngdpbase.footnotes.sources.storagedir` (`${SLOW_STORAGE}/footnote-sources`). No setting and no route is removed; the Recent Activity panel is gone from the admin dashboard (#2469).
+
+### Added
+
+- __#2454 S1, S2 (#2475, #2480)__ — shared footnote sources. A source is a title and an `http` or `https` link, stored as one file in the new `footnote-sources/` folder (`ngdpbase.footnotes.sources.storagedir`). A footnote can carry an optional `sourceId`; while the source exists, the footnote shows the source's title and link. A vault page refuses a `sourceId`, and a page that moves into a vault gets its sources written into the footnotes as plain title and link. The folder is its own optional backup part, so a backup made before this release restores as before. Creating a source writes a `footnote-edit` audit record that holds only its id. There are no screens in these slices.
+- __#2391 S1 (#2479)__ — the `calendar-read` permission, and calendar visibility in the API and `.ics` feed (see the upgrade notes).
+- __#2477__ — design for shared links, `docs/design/shared-links.md`: no code.
+
+### Changed
+
+- __#2482__ — Admin → Media Management: the automatic scan line is renamed, its last run is kept across a restart, "Last reindex" is the later of the last Reindex and the last Rebuild, and an empty line says "Not run since the server started".
+- __#2508__ — 40 responses in the routes now send a plain sentence instead of the error's own text (`ENOENT: no such file…`); the full error goes to the server log once. Status codes and the shape of the answer are unchanged (part 1 of #2494).
+- __#2486, #2487, #2450__ — dependency updates (`ts-ics` 2.4.9 in the calendar add-on, 19 root minor and patch updates) and the kit sync to v1.15.0.
+- __#2468 (#2503)__ — the parser's once-a-minute page building check is now kept: each check appends one line (time to build a page, share served from stored copies, share that failed, pages built) to a file for the day under the new setting `ngdpbase.markup.performance.history.dir` (default `${FAST_STORAGE}/parser-performance`), and files older than 30 days are removed. The share served from stored copies and the share that failed are now the minute's own, not totals since start-up, so a low-traffic site may see its limit crossed more often than before. Crossing a limit now writes one warning log line and coming back under it one info line; the parser no longer saves a notification each minute it stays over. Notifications an earlier version saved are left as they are. The limits and their defaults are unchanged.
+- __#2469 (#2476)__ — the admin dashboard no longer shows the Recent Activity panel, which listed two made-up lines.
+
+### Fixed
+
+- __#2507__ — a plain form post refused for a stale sign-in (Reset configuration, add-on Enable or Disable) goes to the confirm-it-is-you step instead of a page of raw JSON; a script request still gets JSON. Reset configuration is not redone after the confirmation: the page asks to press Reset again.
+- __#2499__ — Revoke's sign-in prompt no longer says what you typed is kept, because the form holds nothing typed.
+- __#2432 (#2506)__ — a restart no longer fails with "Cannot create role 'vault-owner': a file already exists" when the organization id differs from the one the role file was written under; later role changes work too. One warning per role and run names both ids.
+- __#2454 S1 (#2475)__ — an edited footnote shows at once on a cached page, because every footnote write now tells the page cache.
+
+## [5.46.0] - 2026-11-21
+
+### Upgrade notes
+
+- __#2441__ — the old takeout import route is removed. Takeout imports now go through `/import` with the private-store receiver. `POST /my/takeout/import` is gone, and so is the setting `ngdpbase.stores.import.maxsize`: a site that set it can delete it. A takeout keeps the old limits through three new settings next to the engine's: `ngdpbase.import.engine.takeout-zip-max-entries` (65,534), `takeout-zip-max-bytes` (256 MB unpacked) and `takeout-max-file-bytes` (256 MB a file). Every other import keeps the engine's limits: 10,000 entries, 256 MB unpacked and 100 MB a file. Each import saves a report page in the store, named with the date and time and ending in -import-report. A site that had raised `maxsize` above 256 MB must raise all three of `takeout-zip-max-bytes`, `takeout-max-file-bytes` and `ngdpbase.import.engine.upload-max-bytes` to that value (#2187).
+- __#2448__ — an import now counts what its zips unpack to, and how many files they hold, across the whole upload (zips inside zips included) against `zip-max-bytes` and `zip-max-entries`, where each zip used to get the limits to itself; over either, the whole upload is refused and nothing is imported, and the names of the files count toward the size too.
+- __#2403, #2409__ — a CSV export of an add-on's list now writes every row, whatever `max-items` and `max-bytes` say. Nothing to change in configuration. One new setting: `ngdpbase.display.line-length` (`short` or `full`, default `full`). Sites on the Fairways theme keep short lines until their own config says otherwise.
+- __#2414__ — the add-on start-up reseed is removed. A site with `ngdpbase.addons.page-reseed` on no longer gets add-on pages refreshed at restart; those pages show __Update ready__ in Admin → Required Pages Sync until an admin presses __Sync All__. The start-up log carries a one-line warning while the key is still true.
+- __#2415__ — with `ngdpbase.vaults.admin-access` true (the shipped value), an administrator can now open and save pages in another person's unencrypted vault, and each visit is recorded. An encrypted vault stays closed to them. Set the key to false to keep administrators out.
+- __#2437__ — Push to Source is hidden on a site that is not a source checkout, and refused if requested. Admins on a source checkout see no change except a one-line question before it runs.
+- Nothing else to do. New settings: `ngdpbase.display.line-length` (`full`), `ngdpbase.export.engine.csv-max-cells` (20000000), `ngdpbase.import.engine.takeout-zip-max-entries` (65534), `takeout-zip-max-bytes` (268435456), `takeout-max-file-bytes` (268435456) and `ngdpbase.access.narrowed-role-writes` (empty list). Removed setting: `ngdpbase.stores.import.maxsize`.
+
+### Added
+
+- __#2399__ — each person can choose short lines or full width in Profile → User Preferences → Line Length, and each site sets the default with `ngdpbase.display.line-length`. Signed-out visitors see the site's setting. Pictures follow the text width. A theme sets how wide "short" is with `--ngdp-short-measure`, default `36em`; Fairways sets `32em`, as before.
+- __#2447__ — a web address typed into a page or a comment as plain text, such as `https://example.com`, now shows as a link that opens in a new tab, also when it is in quotation marks. An address in code, or written `\https://example.com`, stays text. Only `http` and `https` addresses become links, never bare domains, mail addresses or `ftp:`.
+- __#2440__ — a link written as `[text](https://example.com)` now looks and behaves like the pipe form: it opens in a new tab with the external-link style. Import no longer rewrites it into the pipe form, so this is the form to write.
+- __#2407__ — access policies can read attributes of vaults and shared folders. A page has two new attributes, `encrypted` and `vault-owner`, read from the vault it is in (`vault:encrypted`, `vault:owner`); they are missing for a page in no vault. A policy that names the `vault` or `shared-folder` type may read the attributes declared on it (#2261).
+- __#2414, #2431, #2435__ — Admin → Required Pages Sync shows one of six plain states for every required page, in the core list and the add-on list (#2389):
+  - Same as shipped, Update ready, Edited here not confirmed and Both changed. A page with no stamp is no longer replaced, and __Sync All__ updates only the pages that are __Update ready__.
+  - __Keep edited version__ in the Review dialog marks an edit as meant for this site (Kept for this site; Kept, needs your review when the shipped page changes later). The mark is three front-matter keys and changes neither the text nor the last-modified date.
+  - Each row says which release its copy came from ("Your copy: v5.43.0") and each section header says "This release: v5.46.0". The editor banner on a shipped page now says changes stay on this site.
+- __#2446__ — a settings form keeps what was typed across the fresh sign-in prompt. The New token form on the profile page and the Admin → Configuration forms are filled in again after sign-in, and a note says so. Passwords and secret settings are never kept.
+
+### Fixed
+
+- __#2270__ — a site that had removed page-delete, page-rename or page-edit from its copy of the editor, contributor or demo-administrator rules no longer gets them back on General pages and on pages people write themselves after updating. The category rules leave out what the site's own copy left out. The next save of the site's configuration file (any setting) records it in a new setting, `ngdpbase.access.narrowed-role-writes` (role and write pairs), and Admin → After updating says which role is affected until then. The pairs are left out of every category rule in force, so a rule a later release adds is narrowed too, and deleting or editing a category rule in Admin → Configuration does not give the write back. Take a pair out of the setting to give a role that write again; that works after any save of the rules in Admin → Configuration, because the rules are stored without what the narrowing did to them. A save never takes a write the site did not remove and never gives back one it removed or deleted: the second rule shown for a role is folded back into its rule only when saved as shown and only while the rule itself is unchanged apart from its name and description, so renaming the rule or rewording its description keeps editors' remaining writes; any other edit to the rule (actions, resources, a page category, its effect, its id) keeps the second rule separate and still limited, and deleting or editing the second rule is kept as saved. A rule of the site's own that grants a narrowed role the write is left out too, and Admin → After updating names it. A pair that cannot be read (a role in capitals, a misspelt write) is refused when saved in Admin → Configuration, and in a hand-edited file it is logged and shown in Admin → After updating instead of being read as empty. Reset to defaults clears the pairs; a restore brings them back. Sites that narrowed nothing decide as before, whichever setting is saved. A site that saved its configuration on 5.43.0 to 5.45.0 after narrowing a copy is not detected: its saved list shows nothing of the narrowing, so its editors, contributors and demo administrators keep the page writes the category rules give them, and the site should check its rules in Admin → Configuration.
+- __#2408__ — a CSV export of an add-on's list is no longer cut short: `ngdpbase.export.engine.max-items` and `ngdpbase.export.engine.max-bytes` apply to page, file and search exports, not to records exported as CSV. `ngdpbase.export.engine.csv-max-columns` still applies. A new `ngdpbase.export.engine.csv-max-cells` (default 20000000, records times columns; an admin can raise it, each extra 10 million cells costs about 0.35 GB of peak memory) is checked before the table is built, so a sparse list can no longer run the server out of memory ([#2410](https://github.com/jwilleke/ngdpbase/issues/2410)); a finished export over `max-held-bytes` is refused and not kept. An add-on's `recordExport` now gets `count` and at most the first 200 item names ([#2411](https://github.com/jwilleke/ngdpbase/issues/2411)), and the size of the items is worked out once per run ([#2412](https://github.com/jwilleke/ngdpbase/issues/2412)).
+- __#2269__ — after an update, a page that still carries an `access:` limit on who can read, change or otherwise use it is listed in Admin → needs attention, with how many and which pages and what each limited, so the administrator can move each limit to the page's Audience or Author Lock or to an access rule. The list is checked on every start after the shipped pages are in place, is kept current as pages are saved or deleted, and is not replaced by (or a replacement for) other needs-attention items such as a vault that could not be opened. The site stopped reading `access:` in 5.43.0, so those pages follow the site's access rules; nothing about who can read or change a page changes here. The old `{ edit: [admin] }` that install added to shipped pages is left out only on pages outside `general`; on a general page it is a limit someone set, and is listed. Private pages are counted and not named, with a line asking each page's owner to set the limit again.
+- __#2415__ — an administrator is no longer told "page does not exist" for a page in another person's unencrypted vault when `ngdpbase.vaults.admin-access` is true. The admin raw editor and the admin diff view ask the same vault check, and with the key false a non-owner is refused (#2413).
+- __#2438__ — a page no longer shows the internal `data-jspwiki-placeholder` text, or loses code, when code sits in an indented block, in a fence after a quote inside a list item, or in a span across link brackets (#1726). Text indented four spaces after a blank line now shows as code, as in CommonMark.
+- __#2453__ — links that lost their opening bracket in the JSPWiki import, such as `text|https://…|target='_blank']`, are repaired by the link-leftovers step instead of showing as one long broken link (#2451).
+- __#2461__ — a link written by hand in a comment, such as `[x](https://a.com/?a=1&b=2)`, keeps its `&` and opens the page that was typed (#2449). The same fix applies to page text.
+
+### Changed
+
+- Docs: the access-policy worked example starts a fresh site, without an `audit` entry that put a copied example into maintenance (#2429, #2426); the access-policy guides cover the 7-row decision table, the search budget and resource attributes, and the planning doc is deleted (#2416, #2261); the design for Required Pages Sync states (#2402); SETUP.md explains the two `.env` files, and the bootstrap guide and the comments in `server.sh` and `ecosystem.config.cjs` now match the code (#2455, #2452).
+- CI and tooling: 19 dependency updates in the root group (#2421), `actions/cache` 4 to 6 (#2420), and the agent kit synced to v1.15.0 (#2434).
+
+### Removed
+
+- `POST /my/takeout/import`, with `ImportManager.importOwnStoreTakeout` and `src/utils/privateStoreImport.ts`. The download page now links to `/import?receiver=core.private-store`, which does the same job through the import engine (#2187, #2118).
+
+## [5.45.0] - 2026-11-14
+
+### Upgrade notes
+
+- Nothing to do. One new setting: `ngdpbase.export.engine.csv-max-columns` (default 1000) limits the columns in a CSV export (#2395).
+
+### Added
+
+- __#2395__ — add-ons can offer __Export__ on their own lists as a CSV file, under each add-on's own read permission (#2174, slice 3). A manifest declares `exportSources`, and an add-on registers one with `host.registerExportSource`. The new types are published to npm with this release as `@jwilleke/ngdpbase-types`. New key `ngdpbase.export.engine.csv-max-columns`, default `1000`, limits the columns in a CSV export.
+- __#2398__ — the Trail button shows on every page that has the left menu. Admin and other screens now show the Trail under their heading.
+
+### Changed
+
+- The in-page breadcrumb is removed from Required Pages Sync and from the diff screen, since the Trail replaces it (#2398).
+- Dashboard items for a missing consent version and for unencrypted files in a vault now say where to fix them (#2394).
+- Docs: Fairways site design notes (#2392).
+
+## [5.44.0] - 2026-11-12
+
+### Upgrade notes
+
+- __#2374__ — the old Export screen is retired. `/export` now sends you to search. To export, search for what you want and choose __Export these results__ (shown only when signed in). The saved-exports list is gone: the `/exports` page, and the download and delete links it had. Files already in the exports folder stay where they are, and `ngdpbase.directories.exports` is unchanged, but no screen lists them any more, so copy or remove them on the server if you want them. The More menu's Export item, the dashboard's Export Data button and the two help pages Export and Export Data are gone too.
+- __#2380__ — `POST /export/html/:page` and `POST /export/markdown/:page` are removed and now answer 404. A script that posted to them must change. Use __Export this page…__ on the page, or search export.
+- __#2314__ — a write from someone who is not signed in is refused before any route runs. __Check:__ if your site let visitors edit, comment on or create pages without an account, they now have to sign in first. The default rules never allowed it, so only sites that added such rules are affected. A script that posts without signing in must send a token. Signing in, registering, resetting a password, the contact form and a form add-on's public form still work signed out. Signed-out uploads, ingest and capture are always refused (#2296). An add-on of your own with a public form must list its route with `host.allowSignedOutWrite` (#2298).
+- __#2330__ — access policies follow XACML 3.0 in lowercase (#2332). __Check:__ if you wrote your own policies in `app-custom-config.json`, or run an add-on of your own that ships policies, rewrite any that use a `condition` or a `priority` __before__ you update. An old-style condition is refused when you save in Admin → Configuration and reported at start-up by policy id. A deny written the old way always applies and an allow written the old way never applies, so leaving one can lock people out.
+  - A condition is one function named for its XACML function, with an array of arguments, and `datatype` is required on every attribute and value. Before: `{ "attribute": "subject:department-id", "equals": "sales" }`. After: `{ "string-equal": [ { "attributeid": "subject:department-id", "datatype": "string" }, { "value": "sales", "datatype": "string" } ] }`.
+  - Operators: `equals` is `string-equal`, `integer-equal` or `boolean-equal` by type; `not-equals` is `not` around that; `in` is `string-is-in` or `integer-is-in`; `greater-or-equal` is `integer-greater-than-or-equal`; `less-or-equal` is `integer-less-than-or-equal`; `any-of` is `or`; `all-of` is `and`; `not` takes an array of one condition. A right-hand string that named an attribute (`"equals": "subject:id"`) is now `{ "attributeid": "subject:id", "datatype": "string" }`. The full table is in [docs/access-policies.md](docs/access-policies.md).
+  - `priority` is removed from policies. A leftover one is ignored and named once at start-up. It changes nothing, since a deny has overridden any allow since #2255.
+  - A policy with the older plural `conditions` array (non-empty) limits no access, because nothing reads it. It is named at start-up and when you save, and not refused (#2334, #2342). Move the rule to `condition`.
+  - New key `ngdpbase.access.rule-combining-algorithm`, shipped `"deny-overrides"`, the only value accepted. Any other value is refused on save, and at start-up the site reports it and does not start. If you set it, set it to `"deny-overrides"`.
+- __#2313__ — after you update, the first start runs a set of run-once checks, and anything that needs a decision appears in __Admin → After updating__. __Check:__ open that page after the first start. The dashboard's "Access policies need review after the #2255 upgrade" notice is gone; pages nobody can edit are now the first item on the new page, with a button that lets administrators edit them. A second item names any allow rule that lets signed-out visitors, or every signed-in user, change pages (#2301, #2299).
+- __#2364__ — if passkeys are on but the site address is not https (and not localhost), Admin → After updating says passkeys can't work and offers __Turn passkeys off__. Nothing turns them off by itself (#2341). __Check:__ set the site address to https, or press the button.
+- __#2308__ — `./server.sh update` now refuses a checkout that has files marked assume-unchanged or skip-worktree, and a sparse checkout, and lists them, because a failed update's rollback could overwrite edits `git status` does not show. If it refuses, undo the mark with `git update-index --no-assume-unchanged <file>`, or update a sparse checkout by hand. __`./server.sh update all`__ is new in this range (#2297). It updates every ngdpbase checkout PM2 runs and reads no policy or pin file. Nothing runs it on its own, so run it with `--dry-run` first and read what it would skip. If another updater (cron or a script) also updates these checkouts, decide which one owns each.
+- __#2324__ — add-ons that keep records for one person can now ask core who owns a record and what a list may show (#1823). Nothing changes for add-ons already installed. An add-on author declares resource types named `<slug>-…`, and for a type with an `owner`, only that person (or someone acting for them under a proxy grant) is allowed.
+
+### Added
+
+- __#2366__ — __Export these results__ on the search page downloads one zip of every page and file you may read from that search, in the format you choose (#2174). Signed-out visitors see no button. A limit leaves matches out and says how many. New key `ngdpbase.export.engine.max-items` (default 200) caps pages and files together; `ngdpbase.export.engine.max-bytes` (25 MB) still caps the zip.
+- __#2313__ — "After updating" in Admin: run-once checks and a page that lists what needs a decision, in plain words (#2313, #2364). See [docs/managers/UpgradeCheckManager.md](docs/managers/UpgradeCheckManager.md).
+- __#2370__ — on the dashboard item "Access policies need review", each deny rule has a __Mark as checked__ button. It hides the item until that rule changes and does not change what the rule does. It needs permission to change configuration. The marks are kept in `ngdpbase.access.checked-denies`.
+- __#2300__ — environment attributes in policies: `ngdpbase.access.environment-attributes`, with `environment:is-business-hours` shipped from `schedule:business-hours`, and a `config:<key>` source that reads a yes/no setting (#2261). A `config:` source may name any setting, secrets included, so only give policy-editing permission to people you trust. The value is never written to a log, audit record or message.
+- __#2324__ — core decides the owner of an add-on record and the filter for a list of them (#1823).
+- __#2297__ — `./server.sh update all` updates the online ngdpbase checkouts PM2 runs, one at a time, by calling each one's own `./server.sh update`. It needs no configuration. It skips a checkout, with a one-line reason, when it is not online, is owned by another user, is detached, is on a branch other than `master`, has uncommitted files or files hidden from git status, is ahead of `origin/master`, or a git check cannot run (#2308, #2303). `--dry-run` prints the plan. See [docs/SERVER-MANAGEMENT.md](docs/SERVER-MANAGEMENT.md#updating-every-checkout-on-this-host).
+- __#2298__ — signed-out writes are refused by a named list; `npm run lint:signed-out-writes` and `npm run inventory:routes` show every write route (#2314).
+- __#2330__ — `ngdpbase.access.rule-combining-algorithm` is shown in the start-up log and above the policies in Admin → Configuration (#2332).
+
+### Fixed
+
+- The History and Source menu items no longer add `#` to the address (#2312).
+- Compare Versions shows changes again, highlights them correctly, keeps From and To in order, keeps side-by-side panes level after uneven changes, says when nothing changed, and shows history comments (#2323, #2327, #2351, #2353).
+- A signed-out save or delete gets the same answer whether or not the page exists (#2296).
+- Recent Changes is no longer in the page Info menu (#2325).
+- Page information no longer shows Last Accessed and reports each value from its source (#2306).
+- Sign-in banners and "Confirm it is you" offer only what this account can add or use, and never a passkey where passkeys can't work (#2349, #2357).
+- Every needs-attention and not-working item on the dashboard says what is wrong and one thing to do, in plain words (#2347, #2350, #2358), and links to a real settings row or says the fix is on the server (#2368).
+- Row buttons on Add-ons, InterWiki, Organizations, Required Pages and Page History work for names that contain a quote, such as `O'Brien` (#2362).
+- Admin → Audit Log shows details as text (#2361).
+- Page Conflict links to the page that already has the title, and a new page with a taken title or slug links the other page (#2372, #2377).
+- `URN:` is read like `urn:` when matching an owner id, and compiled policy conditions are kept until the configuration changes (#2369).
+- `npm run docs` builds again (#2381).
+
+### Changed
+
+- Theme: the Fairways look is refreshed. The page fills the window, a repeated wordmark stays at most 18rem wide, header controls get a focus ring, and light, dark and system follow the usual switch. Other themes are unchanged (#2310, #2382).
+- CI and tooling: the ffmpeg-static download is cached so a GitHub release outage does not fail a build (#2338). The agent kit is synced to v1.15.0-6-g5def115 (#2379). Dependency updates (#2335, #2336, #2337, #2386, #2387).
+- Docs: the access-policy schema guide no longer advises the unenforced `conditions` array (#2346).
+
+### Removed
+
+- The Export screen and the saved-exports list: `GET /export`, `GET /exports`, `GET /download/:filename`, `DELETE /deleteExport/:filename`, with `ExportManager.getExports` and `deleteExport` (#2374).
+- `POST /export/html/:page` and `POST /export/markdown/:page`, with `ExportManager.saveExport`, `exportPageToHtml` and `exportToMarkdown` (#2378, #2380).
+- `priority` on access policies (#2330, #2332).
+
+## [5.43.0] - 2026-11-07
+
+### Upgrade notes
+
+- __#2255__ — the `access:` frontmatter key is removed. Page writes are now decided by system-category policies, with conditions and deny-overrides (#2265). A site that relied on `access:` stamps must express them as policies in `ngdpbase.access.policies`. At boot, the startup log and Admin → needs attention list the categories that no policy lets anyone edit (the "Access policies need review" notice). See [docs/access-policies.md](docs/access-policies.md).
+- __#2281__ — saving `ngdpbase.access.policies` in Admin → Configuration is now checked. A policy with a problem, or an action that is not a defined permission, is refused and nothing is written (#2281).
+- __#2289__ — on save and delete, a signed-out JSON request now gets 401 instead of 403; a signed-out form goes to sign-in (#2292).
+
+### Added
+
+- __#2255__ — page writes are decided by the page's system-category and the policies, with conditions and deny-overrides, and `access:` frontmatter is removed (#2265). `PageManager` decides every page write (#1815, #2257).
+- __#2261__ — attribute-based access in policies: condition operators and the condition tree (#2277), `authenticated` and `anyone` policy subjects (#2280), and subject attributes with `subject:aal` (#2286).
+- __#2278__ — Admin → Configuration checks access policies when `ngdpbase.access.policies` is saved and when it loads (#2281).
+- __#2245__ — `/my/vaults` lists pages by vault and shows whether each is encrypted (#2253).
+- __#2246__ — boot warns about the legacy `ngdpbase.stores.<kind>.owner` and `encrypt` keys (#2254).
+
+### Fixed
+
+- __#2264__ — New Token on `/profile` follows the step-up reauth answer (#2264).
+- __#2275__ — the audit record names a refused page save or create, with the `policyIds` that refused it (#2275).
+- __#2288__, __#2289__ — a refusal names the allow whose condition was not met (`metadata.conditionNotMet`, ids only), and a signed-out page save or delete goes to sign-in, or gets 401 for JSON (#2292).
+- __#2290__ — an ingest update keeps the page's creation time and has one `lastModified` source (#2291).
+- __#2241__ — `./server.sh update` checks readiness over https on a TLS site (#2242).
+
+### Changed
+
+- Every `/admin` dashboard section card is full width (#2273), and `/profile` cards are full width with only Account Information open by default (#2274).
+- Theme: card outlines are 2px at 3:1 contrast in every theme (#2266).
+- Docs: planning for attribute-based access in config (#2261, #2262).
+
+## [5.42.0] - 2026-11-02
+
+### Added
+
+- __#421__ — TOTP second factor. A user enrols an authenticator app on `/profile` (#2234), and is asked for its code at sign-in and at step-up (#2236).
+- __#1523__ — remembered browsers. A remembered browser skips the second-factor prompt only where the user's role allows it (#2235), and the sign-in's audit record names the remembered browser it came from (#2239).
+- __#1523__ — boot refuses to start when an enabled second factor has no provider registered for it (#2222).
+- __#1541__ — every `/profile` card collapses under a header, as the `/admin` cards do (#2230).
+
+### Fixed
+
+- __#2223__ — an add-on can no longer register an auth provider under a core id or the `oidc:` prefix (#2229).
+- __#2188__, __#2171__ — ICE: a file restored by re-import keeps its id, so links to it work again (#2213), and is reported as imported (#2225).
+- `create-addon`: the generated publish workflow reads `npm pack --json` output from npm 11 and 12 (#2224).
+
+### Changed
+
+- CI: Dependabot patch and minor updates auto-merge once the required checks pass (#2231).
+- CI: the required checks report on docs-only pull requests (#2218, #2219).
+- The pre-push hook passes on any machine: a test whose tool is missing is skipped, with the reason (#2216, #2220).
+- Dependencies: the root minor-and-patch group (#2232) and `DavidAnson/markdownlint-cli2-action` (#2233).
+- Docs: request-response planning answers, round 3 (#2228).
+
+## [5.41.1] - 2026-11-01
+
+### Planned
+
+- Future enhancements
+
+## [5.41.0] - 2026-11-01
+
+### Planned
+
+- Future enhancements
+
 ## [5.40.0] - 2026-10-30
 
 ### Planned

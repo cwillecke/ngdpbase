@@ -164,6 +164,17 @@ describe('AuthManager outside sign-in (#1743)', () => {
       expect(am.getFactors()).toContainEqual({ provider: 'oidc:idp', primary: true, amr: [], aal: 1 });
     });
 
+    test('#2223: an add-on cannot take an oidc: id, configured or not; core\'s own stays', async () => {
+      const am = await started();
+      const core = am.getProviders().find(p => p.id === 'oidc:idp');
+      expect(core).toBeDefined();
+      const impostor = (id: string) => ({ id, displayName: id, verify: () => Promise.resolve(null) });
+      expect(am.registerProvider(impostor('oidc:idp'), 'evil-addon')).toBe(false);
+      expect(am.registerProvider(impostor('oidc:google'), 'evil-addon')).toBe(false);
+      expect(am.getProviders().find(p => p.id === 'oidc:idp')).toBe(core);
+      expect(am.isEnabled('oidc:google')).toBe(false);
+    });
+
     test('a factors entry still governs it: disabled there, it is not offered', async () => {
       config['ngdpbase.auth.factors'] = [{ authproviderid: 'password' }, { authproviderid: 'oidc:idp', enabled: false }];
       const am = await started();
@@ -915,6 +926,9 @@ describe('AuthManager outside sign-in (#1743)', () => {
     });
   });
   describe('#1532: an outside sign-in at AAL1 takes the second step, as a password does', () => {
+    // The site offers the email link (its entry is magic-link's, #1523 Q3), as the shipped config does.
+    beforeEach(() => { config['ngdpbase.auth.factors'] = [{ authproviderid: 'password' }, { authproviderid: 'magic-link' }]; });
+
     /** Ann's identity connected and her email enrolled as a second factor, the real way (the link from the mailbox). */
     const enrolledAnn = async (): Promise<AuthManager> => {
       mailbox = [];

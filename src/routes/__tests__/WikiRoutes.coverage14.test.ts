@@ -1,6 +1,6 @@
 /**
  * WikiRoutes coverage batch 14 — login/auth, register/profile, page versions,
- *   page history/diff, preview, export.
+ *   page history/diff, preview.
  */
 import express from 'express';
 import { policyShaped } from './__fixtures__/policyShaped';
@@ -144,10 +144,7 @@ const mockCacheManager = {
 
 const mockExportManager = {
   getExports: vi.fn().mockResolvedValue([{ filename: 'export-1.zip', path: '/tmp/export-1.zip' }]),
-  deleteExport: vi.fn().mockResolvedValue(undefined),
-  exportPageToHtml: vi.fn().mockRejectedValue(new Error('Export failed')),
-  exportToMarkdown: vi.fn().mockRejectedValue(new Error('Export failed')),
-  saveExport: vi.fn().mockResolvedValue('/tmp/export.html')
+  deleteExport: vi.fn().mockResolvedValue(undefined)
 };
 
 // #1049: the four provider-specific methods collapsed into three dispatchers
@@ -322,9 +319,6 @@ function resetMocks() {
 
   mockExportManager.getExports.mockResolvedValue([{ filename: 'export-1.zip', path: '/tmp/export-1.zip' }]);
   mockExportManager.deleteExport.mockResolvedValue(undefined);
-  mockExportManager.exportPageToHtml.mockRejectedValue(new Error('Export failed'));
-  mockExportManager.exportToMarkdown.mockRejectedValue(new Error('Export failed'));
-  mockExportManager.saveExport.mockResolvedValue('/tmp/export.html');
 
   mockAuthManager.isEnabled.mockReturnValue(false);
   mockAuthManager.authenticate.mockResolvedValue({ success: true, username: 'testuser' });
@@ -951,6 +945,23 @@ describe('WikiRoutes — coverage batch 14', () => {
       expect(res.status).toBe(302);
       expect(res.headers.location).toContain('/profile');
     });
+
+    // #2399: the line-length choice is saved as short, full, or "site".
+    async function savedLineLength(body: Record<string, string>): Promise<unknown> {
+      mockUserManager.updateUser.mockClear();
+      await request(app).post('/preferences').set('x-csrf-token', 'test-csrf-token').send(body);
+      const update = mockUserManager.updateUser.mock.calls[0][1] as (u: unknown) => { preferences: Record<string, unknown> };
+      return update({ preferences: {} }).preferences['display.line-length'];
+    }
+
+    test.each(['short', 'full', 'site'])('saves display.line-length = %s', async (choice) => {
+      expect(await savedLineLength({ 'display.line-length': choice })).toBe(choice);
+    });
+
+    test('a missing or unknown line-length value is saved as "site"', async () => {
+      expect(await savedLineLength({})).toBe('site');
+      expect(await savedLineLength({ 'display.line-length': 'enormous' })).toBe('site');
+    });
   });
 
   // ── Preview ───────────────────────────────────────────────────────────────────
@@ -966,32 +977,6 @@ describe('WikiRoutes — coverage batch 14', () => {
     });
   });
 
-  // ── Export ────────────────────────────────────────────────────────────────────
-
-  describe('GET /export (exportPage)', () => {
-    test('renders export page with list of pages', async () => {
-      const res = await request(app).get('/export');
-      expect(res.status).toBe(200);
-    });
-  });
-
-  describe('POST /export/html/:page (exportPageHtml)', () => {
-    test('returns 500 when export fails', async () => {
-      const res = await request(app)
-        .post('/export/html/TestPage')
-        .set('x-csrf-token', 'test-csrf-token');
-      expect(res.status).toBe(500);
-    });
-  });
-
-  describe('POST /export/markdown/:page (exportPageMarkdown)', () => {
-    test('returns 500 when export fails', async () => {
-      const res = await request(app)
-        .post('/export/markdown/TestPage')
-        .set('x-csrf-token', 'test-csrf-token');
-      expect(res.status).toBe(500);
-    });
-  });
 
   // ── Page versions API ─────────────────────────────────────────────────────────
 

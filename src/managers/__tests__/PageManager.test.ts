@@ -10,6 +10,8 @@ import PageManager from '../PageManager';
 import { TEST_ACTOR, actor } from '../../test-support/actors';
 import { ANONYMOUS_SUBJECT } from '../UserManager';
 import type { WikiEngine } from '../../types/WikiEngine';
+import { withWriteDoorAllowing } from '../../__tests__/__fixtures__/pageWriteDoor';
+import { PageTitleConflictError, pageTitleConflictLink, pageTitleConflictText } from '../../utils/pageTitleConflict';
 
 // Mock ConfigurationManager
 const mockConfigurationManager = {
@@ -25,12 +27,12 @@ const mockConfigurationManager = {
   })
 };
 
-// Mock engine
+// Mock engine; #1815: the write door's deciders allow, these tests are not about who may write
 const mockEngine = {
-  getManager: vi.fn((name) => {
+  getManager: vi.fn(withWriteDoorAllowing((name) => {
     if (name === 'ConfigurationManager') return mockConfigurationManager;
     return null;
-  }),
+  })),
   getConfig: vi.fn(() => ({ get: vi.fn() }))
 };
 
@@ -153,6 +155,8 @@ describe('PageManager', () => {
 
     test('deletePage() should delegate to provider', async () => {
       pageManager.provider.deletePage = vi.fn().mockResolvedValue(undefined);
+      // #1815: delete decides on the page it finds, so the page is there.
+      pageManager.provider.getPage = vi.fn().mockResolvedValue({ uuid: 'uuid-1', content: 'x', metadata: { title: 'Test' } });
 
       await pageManager.deletePage('Test', TEST_ACTOR);
 
@@ -277,7 +281,8 @@ describe('PageManager', () => {
         return dv;
       });
 
-      await pageManager.savePage('Secret', 'body', { private: true }, { username: 'alice' });
+      // #1815: a save into alice's vault is alice's own, signed in.
+      await pageManager.savePage('Secret', 'body', { private: true }, { username: 'alice', isAuthenticated: true });
 
       const saved = pageManager.provider.savePage.mock.calls[0][2];
       expect(saved.private).toBe(true);
@@ -314,7 +319,8 @@ describe('PageManager', () => {
       await pageManager.savePage('P', 'body', {
         private: true,
         'user-keywords': ['private', 'notes']
-      }, { username: 'alice' });
+        // #1815: a save into alice's vault is alice's own, signed in.
+      }, { username: 'alice', isAuthenticated: true });
 
       const saved = pageManager.provider.savePage.mock.calls[0][2];
       expect(saved.private).toBe(true);
@@ -470,6 +476,8 @@ describe('PageManager', () => {
 
     test('deletePage() deletes as the subject it was given', async () => {
       pageManager.provider.deletePage = vi.fn().mockResolvedValue(undefined);
+      // #1815: delete decides on the page it finds, so the page is there.
+      pageManager.provider.getPage = vi.fn().mockResolvedValue({ uuid: 'uuid-1', content: 'x', metadata: { title: 'Test Page' } });
 
       await pageManager.deletePage('Test Page', { username: 'testuser' });
 
@@ -599,11 +607,11 @@ describe('PageManager', () => {
         conflictType: 'title-duplicate',
         message: 'A page with title \'Speed\' already exists under UUID other-uuid'
       });
-      mockEngine.getManager.mockImplementation((name) => {
+      mockEngine.getManager.mockImplementation(withWriteDoorAllowing((name) => {
         if (name === 'ConfigurationManager') return mockConfigurationManager;
         if (name === 'ValidationManager') return { checkConflicts: mockCheckConflicts, sanitizeMetadata: (m: unknown) => m };
         return null;
-      });
+      }));
 
       await expect(
         pageManager.savePage('Speed', '# Speed', { uuid: 'new-uuid' }, TEST_ACTOR)
@@ -612,14 +620,91 @@ describe('PageManager', () => {
       expect(mockCheckConflicts).toHaveBeenCalledWith('new-uuid', 'Speed', '', TEST_ACTOR);
     });
 
+    describe('a title clash is a PageTitleConflictError, naming the page not its id (#2371)', () => {
+      const clash = async (holder: { title: string } | null) => {
+        const mockCheckConflicts = vi.fn().mockResolvedValue({
+          hasConflict: true,
+          conflictType: 'title-duplicate',
+          conflictingUuid: 'other-uuid-1234',
+          message: "A page with title 'speed' already exists under UUID other-uuid-1234"
+        });
+        mockEngine.getManager.mockImplementation(withWriteDoorAllowing((name) => {
+          if (name === 'ConfigurationManager') return mockConfigurationManager;
+          if (name === 'ValidationManager') return { checkConflicts: mockCheckConflicts, sanitizeMetadata: (m: unknown) => m };
+          return null;
+        }));
+        pageManager.provider.getPageByUUID = vi.fn(async () => (holder ? { name: holder.title, uuid: 'other-uuid-1234', metadata: { title: holder.title } } : null));
+        return pageManager.savePage('speed', '# Speed', { uuid: 'new-uuid' }, TEST_ACTOR).catch((e: unknown) => e);
+      };
+
+      test('names the other page by its own title; the id is only in the message for the log', async () => {
+        const err = await clash({ title: 'Speed' });
+        expect(err).toBeInstanceOf(PageTitleConflictError);
+        const conflict = err as PageTitleConflictError;
+        expect(pageTitleConflictText(conflict)).toBe('A page called "Speed" already exists.');
+        expect(pageTitleConflictLink(conflict)).toEqual({ title: 'Speed', url: '/view/Speed' });
+        expect(pageTitleConflictText(conflict)).not.toContain('other-uuid');
+      });
+
+      test('falls back to the requested title when the holder cannot be read', async () => {
+        const err = await clash(null);
+        expect(err).toBeInstanceOf(PageTitleConflictError);
+        expect(pageTitleConflictLink(err as PageTitleConflictError).title).toBe('speed');
+      });
+    });
+
+    describe('a slug clash is a PageTitleConflictError too (#2376)', () => {
+      const slugClash = async (holder: { title: string } | null, typed = 'R&D Plans v2') => {
+        mockEngine.getManager.mockImplementation(withWriteDoorAllowing((name) => {
+          if (name === 'ConfigurationManager') return mockConfigurationManager;
+          if (name === 'ValidationManager') return {
+            // The slug is checked before the title, so a title clash arrives as this too.
+            checkConflicts: vi.fn().mockResolvedValue({ hasConflict: true, conflictType: 'uuid-mismatch', conflictingUuid: 'other-uuid-1234', message: "A page with slug 'r-d-plans-v2' already exists under UUID other-uuid-1234" }),
+            sanitizeMetadata: (m: unknown) => m
+          };
+          return null;
+        }));
+        pageManager.provider.getPageByUUID = vi.fn(async () => (holder ? { name: holder.title, uuid: 'other-uuid-1234', metadata: { title: holder.title } } : null));
+        return pageManager.savePage(typed, '# Plans', { uuid: 'new-uuid' }, TEST_ACTOR).catch((e: unknown) => e);
+      };
+
+      test('the same title, ignoring case: the title text, the other page by its own title', async () => {
+        const err = await slugClash({ title: 'Speed' }, 'speed');
+        expect(err).toBeInstanceOf(PageTitleConflictError);
+        expect(pageTitleConflictText(err as PageTitleConflictError)).toBe('A page called "Speed" already exists.');
+        expect(pageTitleConflictLink(err as PageTitleConflictError)).toEqual({ title: 'Speed', url: '/view/Speed' });
+      });
+
+      test('another title with the same slug: too close, still linking the other page', async () => {
+        const err = await slugClash({ title: 'R-D Plans v2' });
+        expect(err).toBeInstanceOf(PageTitleConflictError);
+        expect(pageTitleConflictText(err as PageTitleConflictError)).toBe('That name is too close to the name of an existing page, "R-D Plans v2".');
+        expect(pageTitleConflictLink(err as PageTitleConflictError)).toEqual({ title: 'R-D Plans v2', url: '/view/R-D%20Plans%20v2', tooClose: true });
+      });
+
+      test('the id is only in the message, for the log', async () => {
+        const err = await slugClash({ title: 'R-D Plans v2' }) as PageTitleConflictError;
+        expect(err).toBeInstanceOf(PageTitleConflictError);
+        expect(err.message).toContain('other-uuid-1234');
+        expect(pageTitleConflictText(err)).not.toContain('other-uuid');
+        expect(JSON.stringify(pageTitleConflictLink(err))).not.toContain('other-uuid');
+      });
+
+      test('falls back to the typed title when the holder cannot be read', async () => {
+        const err = await slugClash(null, 'Speed');
+        expect(err).toBeInstanceOf(PageTitleConflictError);
+        expect(pageTitleConflictText(err as PageTitleConflictError)).toBe('A page called "Speed" already exists.');
+      });
+    });
+
     test('should proceed normally when no conflict', async () => {
       const mockCheckConflicts = vi.fn().mockResolvedValue({ hasConflict: false, conflictType: null });
       pageManager.provider.savePage = vi.fn(async (name: string) => ({ name, uuid: 'uuid-1' }));
-      mockEngine.getManager.mockImplementation((name) => {
+      mockEngine.getManager.mockImplementation(withWriteDoorAllowing((name) => {
         if (name === 'ConfigurationManager') return mockConfigurationManager;
         if (name === 'ValidationManager') return { checkConflicts: mockCheckConflicts, sanitizeMetadata: (m: unknown) => m };
         return null;
-      });
+      }));
 
       await pageManager.savePage('New Page', '# Hello', { uuid: 'new-uuid' }, TEST_ACTOR);
 
@@ -682,11 +767,15 @@ describe('PageManager', () => {
   describe('deletePage() acting user', () => {
     test('a subject with no username still deletes', async () => {
       pageManager.provider.deletePage = vi.fn().mockResolvedValue(true);
+      // #1815: delete decides on the page it finds, so the page is there.
+      pageManager.provider.getPage = vi.fn().mockResolvedValue({ uuid: 'uuid-1', content: 'x', metadata: { title: 'TestPage' } });
       await expect(pageManager.deletePage('TestPage', { roles: [] })).resolves.toBe(true);
     });
 
     test('the subject given is the one handed to the provider', async () => {
       pageManager.provider.deletePage = vi.fn().mockResolvedValue(true);
+      // #1815: delete decides on the page it finds, so the page is there.
+      pageManager.provider.getPage = vi.fn().mockResolvedValue({ uuid: 'uuid-1', content: 'x', metadata: { title: 'TestPage' } });
       await expect(pageManager.deletePage('TestPage', { username: 'alice' })).resolves.toBe(true);
       expect(pageManager.provider.deletePage).toHaveBeenCalledWith(
         'TestPage',

@@ -15,11 +15,12 @@
  * how a field gets added to one and missed in the others.
  */
 
-/** Who a policy grants to. The evaluator matches `role` and `job` (#1999), its `SUBJECT_MATCHERS`. */
+/** Who a policy grants to. The evaluator matches `role`, `job` (#1999), `authenticated` and `anyone` (#2261), its `SUBJECT_MATCHERS`. */
 export interface PolicySubject {
-  /** `role`, or `job` for a scheduled job acting as itself (#1999). */
+  /** `role`, `job` for a scheduled job acting as itself (#1999), or `authenticated` / `anyone` (#2261). */
   type: string;
-  value: string;
+  /** The role or the job id. `authenticated` and `anyone` take none. */
+  value?: string;
 }
 
 /**
@@ -33,13 +34,50 @@ export interface PolicyResource {
   pattern: string;
 }
 
+/**
+ * An argument of a comparison (#2255, #2261, #2330), as XACML 3.0 writes one in
+ * lowercase. An attribute is `{ "attributeid": "subject:department-id",
+ * "datatype": "string" }`: `attributeid` starts `subject:`, `resource:` or
+ * `environment:`. A literal is `{ "value": "sales", "datatype": "string" }`,
+ * and for `X-is-in` its `value` may be an array. `datatype` is required and is
+ * one of the XACML JSON profile's short names.
+ */
+export type ConditionOperand =
+  | { attributeid: string; datatype: string }
+  | { value: unknown; datatype: string };
+
+/**
+ * A policy's condition (#2330): one function, named for its XACML 3.0 function
+ * in lowercase, whose value is the array of its arguments.
+ *
+ * - `string-equal`, `integer-equal`, `boolean-equal`, `string-is-in`,
+ *   `integer-is-in`, `integer-greater-than`, `integer-greater-than-or-equal`,
+ *   `integer-less-than`, `integer-less-than-or-equal` take two
+ *   {@link ConditionOperand}s;
+ * - `and` and `or` take a list of conditions, `not` takes one;
+ *
+ * nested at most 4 deep.
+ *
+ * Each node is true, false or unknown. A comparison reading an attribute that
+ * is missing is unknown; in `or` a true branch decides, in `and` a false one
+ * does, and `not` of unknown is unknown. An allow applies only when the
+ * condition is true; a deny applies when it is true or unknown.
+ */
+export type PolicyCondition = Record<string, Array<ConditionOperand | PolicyCondition>>;
+
+/** The prefixes that mark a condition value as an attribute rather than a literal (#2255). */
+export const ATTRIBUTE_CATEGORIES = ['subject', 'resource', 'environment'] as const;
+
+/** True when `value` names an attribute (`subject:id`, `resource:owner`), not a literal. */
+export function isAttributeName(value: unknown): value is string {
+  return typeof value === 'string' && ATTRIBUTE_CATEGORIES.some((c) => value.startsWith(`${c}:`));
+}
+
 /** One entry of `ngdpbase.access.policies`. */
 export interface Policy {
   id: string;
   name?: string;
   description?: string;
-  /** Lower runs first, so a higher-priority deny lands last and wins. */
-  priority?: number;
   /**
    * `allow` or `deny`. Typed as a string because the value comes from
    * configuration, where an operator can write anything; the evaluator treats
@@ -49,6 +87,8 @@ export interface Policy {
   subjects?: PolicySubject[];
   resources?: PolicyResource[];
   actions?: string[];
+  /** Applies only when this holds (#2255); see {@link PolicyCondition}. */
+  condition?: PolicyCondition;
   [key: string]: unknown;
 }
 
@@ -95,11 +135,18 @@ export interface DecisionRequest {
   action: string;
   resource?: DecisionResource;
   /**
-   * What the PIP knows about the resource beyond its reference, for the
-   * policy resource types that match on it (#1504): a page's
-   * `system-category`. The PDP passes it through; it never loads it.
+   * Where a page or file sits, for the resource types that match on it: the
+   * `vault` (#1539) or the `shared-folder` (#2125). A page's own attributes —
+   * its `system-category`, its `owner` — are never passed: the PDP asks the
+   * PIP for them from the page id (#2255).
    */
   attributes?: Record<string, unknown>;
+  /**
+   * The page's frontmatter when the PIP itself already holds it (the page
+   * door, the list filter), so the PDP's lookup reads no page twice. Only the
+   * PIP sets it; a route never does (#2255).
+   */
+  pageMetadata?: Record<string, unknown> | null;
   /**
    * Whether a share's `resources` cover the thing being asked about.
    *
@@ -136,6 +183,18 @@ export interface Decision {
    */
   applicable: boolean;
   reason: string;
+  /**
+   * The ids of the policies that decided (#2255): the denies that matched,
+   * or, when none did, the allows that matched. Empty when no policy matched
+   * or something other than policy decided (a ceiling, step-up).
+   */
+  policyIds: string[];
+  /**
+   * The ids of allow policies that matched subject, resource and action but
+   * whose condition was false or unknown (#2288), so a refusal can say which
+   * allow was not met. Ids only, never attribute values. Absent when none.
+   */
+  conditionNotMet?: string[];
 }
 
 /**
@@ -144,6 +203,14 @@ export interface Decision {
  * and `ApiContext.enforceDeny` reads it to ask for a fresh sign-in.
  */
 export const STEP_UP_REASON = 'step-up';
+
+/**
+ * The reason a decision carries when no policy spoke to the question (#2534).
+ * Declared once: the evaluator writes it, and a door with a narrow exception
+ * to a missing permission reads it to tell "no policy said anything" from an
+ * explicit deny or an engine that could not answer.
+ */
+export const NO_POLICY_REASON = 'No matching policy';
 
 /** True when `pattern` covers `id` for a resource of that type. `*` is everything. */
 export function resourceMatches(pattern: string, id: string): boolean {

@@ -1,0 +1,124 @@
+/**
+ * #2193 — views/reauth.ejs carries a script's prompt id to the password
+ * confirmation, the passkey button and Cancel. Cancel for such a prompt is a
+ * POST with the session's CSRF token, so the page waiting on it, in whichever
+ * window, learns it was cancelled; any other prompt's Cancel stays a link to
+ * where it returns. Header and footer are left out: they are not this view's.
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import ejs from 'ejs';
+
+const VIEW = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../views/reauth.ejs');
+
+/** The view without its header and footer includes, which need the whole page's data. */
+const TEMPLATE = fs.readFileSync(VIEW, 'utf8').replace(/<%- include\('(header|footer)'[^%]*%>/g, '');
+
+const PROMPT = '0123456789abcdef0123456789abcdef';
+
+function render(prompt: string): string {
+  return ejs.render(TEMPLATE, { next: '/view/Ledger', prompt, needsPasskey: false, hasPasskey: true, hasPassword: true, csrfToken: 'tok' });
+}
+
+describe('reauth view (#2193)', () => {
+  test('a script\'s prompt: its id goes with the password, the passkey and a Cancel that posts', () => {
+    const html = render(PROMPT);
+    expect(html).toContain(`<input type="hidden" name="prompt" value="${PROMPT}">`);
+    expect(html).toContain(`data-prompt="${PROMPT}"`);
+    expect(html).toMatch(/<form method="POST" action="\/auth\/reauth\/cancel"[^>]*>\s*<input type="hidden" name="_csrf" value="tok">/);
+    expect(html).not.toContain('<a href="/view/Ledger">Cancel</a>');
+  });
+
+  test('any other prompt: no id, and Cancel is the link back', () => {
+    const html = render('');
+    expect(html).not.toContain('name="prompt"');
+    expect(html).not.toContain('/auth/reauth/cancel');
+    expect(html).toContain('<a href="/view/Ledger">Cancel</a>');
+  });
+
+  test('#421 slice 2c: an enrolled app is offered; at AAL2 with the password, below it alone', () => {
+    const at = (needsPasskey: boolean) => ejs.render(TEMPLATE, { next: '/profile', prompt: '', needsPasskey, hasPasskey: false, hasPassword: true, hasTotp: true, csrfToken: 'tok' });
+    const aal2 = at(true);
+    expect(aal2).toMatch(/<form method="POST" action="\/auth\/reauth\/totp"[\s\S]*name="password"[\s\S]*name="code"/);
+    expect(aal2).not.toContain('has no way to confirm');
+    const aal1 = at(false);
+    expect(aal1).toContain('action="/auth/reauth/totp"');
+    expect(aal1).not.toContain('id="reauthTotpPassword"');
+    expect(render('')).not.toContain('/auth/reauth/totp');
+  });
+
+  test('#2345: where passkeys cannot work, the note names the app and password, not a passkey', () => {
+    const at = (passkeysAvailable: boolean) => ejs.render(TEMPLATE, { next: '/profile', prompt: '', needsPasskey: true, ways: { addPasskey: passkeysAvailable }, hasPasskey: false, hasPassword: true, hasTotp: true, csrfToken: 'tok' });
+    const off = at(false);
+    expect(off).toContain('Your role needs your password with your authenticator app');
+    expect(off).not.toMatch(/passkey/i);
+    expect(at(true)).toContain('Your role needs a passkey, or your password with your authenticator app');
+  });
+
+  test('#2345: the no-way-to-confirm fallback names a passkey only where one can be added', () => {
+    const at = (passkeysAvailable: boolean, needsPasskey: boolean) => ejs.render(TEMPLATE, { next: '/profile', prompt: '', needsPasskey, ways: { addPasskey: passkeysAvailable, addTotp: true }, hasPasskey: false, hasPassword: needsPasskey, hasTotp: false, csrfToken: 'tok' });
+    for (const needsPasskey of [false, true]) {
+      const off = at(false, needsPasskey);
+      expect(off).toContain('Add an authenticator app on your <a href="/profile">profile</a>, or ask an administrator.');
+      expect(off).not.toMatch(/passkey/i);
+      expect(at(true, needsPasskey)).toContain('Add a passkey on your');
+    }
+  });
+
+  test('#2356: the fallback names only what this account can add, else an administrator', () => {
+    const at = (ways: Record<string, unknown>, needsPasskey = true, hasPassword = true) =>
+      ejs.render(TEMPLATE, { next: '/profile', prompt: '', needsPasskey, ways, hasPasskey: false, hasPassword, hasTotp: false, csrfToken: 'tok' });
+    // Allowed methods exclude passkeys and the app: nothing to add, no passkey, no app.
+    const none = at({ addPasskey: false, addTotp: false, outside: [] });
+    expect(none).toContain('This account has no way to confirm here that reaches the level your role needs.');
+    expect(none).toMatch(/Ask an administrator\.<\/p>/);
+    expect(none).not.toMatch(/passkey|authenticator/i);
+    expect(none).not.toContain('on your <a href="/profile">profile</a>');
+    // The app at AAL2 needs a password: an account with none is not told to add one.
+    expect(at({ addTotp: true }, true, false)).not.toMatch(/authenticator/i);
+    // An outside provider that gives the level: named, never the app.
+    const outside = at({ addTotp: false, outside: ['Example ID'] });
+    expect(outside).toContain('Sign out, then sign in with Example ID, or ask an administrator.');
+    expect(outside).not.toMatch(/authenticator|passkey/i);
+  });
+});
+
+describe('reauth view banner (#2445)', () => {
+  const html = (next: string, prompt = '') => ejs.render(TEMPLATE, { next, prompt, needsPasskey: false, hasPasskey: true, hasPassword: true, csrfToken: 'tok', cspNonce: 'n' });
+
+  test('says in plain words that it has been a while since the last sign-in, at the top', () => {
+    const out = html('/profile');
+    const banner = out.match(/<div class="alert alert-warning[^"]*"[^>]*data-reauth-expired[^>]*>([\s\S]*?)<\/div>/);
+    expect(banner).not.toBeNull();
+    expect(banner![1]).toMatch(/been a while since you signed in/i);
+    expect(banner![1]).not.toMatch(/this action/i);
+    expect(out.indexOf('data-reauth-expired')).toBeLessThan(out.indexOf('Confirm it is you'));
+  });
+
+  test('says typed entries will be kept only where the page redoes the request', () => {
+    const kept = /data-reauth-kept(?![^>]*hidden)[^>]*>[^<]*what you typed will be kept/i;
+    expect(html('/auth/reauth/continue?replay=abc')).toMatch(kept);
+    // A script's prompt (Revoke, Extend, New token) has typed nothing by itself: the sentence waits for a draft.
+    expect(html('/profile', PROMPT)).toMatch(/data-reauth-kept[^>]*hidden/);
+    expect(html('/profile')).toMatch(/data-reauth-kept[^>]*hidden/);
+  });
+
+  test('#2485: a redone request that holds nothing typed (Revoke) does not promise to keep it; one that holds entries still does', () => {
+    const keptHidden = /data-reauth-kept[^>]*hidden/;
+    const out = (typed: boolean) => ejs.render(TEMPLATE, { next: '/auth/reauth/continue?replay=abc', prompt: '', typed, needsPasskey: false, hasPasskey: true, hasPassword: true, csrfToken: 'tok', cspNonce: 'n' });
+    expect(out(false)).toMatch(keptHidden);
+    expect(out(false)).not.toMatch(/<div[^>]*data-reauth-expired[^>]*hidden/);
+    expect(out(true)).not.toMatch(keptHidden);
+  });
+
+  test('is hidden, until a waiting draft shows it, where nothing says an action was tried (the lower-sign-in notice link)', () => {
+    expect(html('/admin/configuration')).toMatch(/<div class="alert alert-warning[^"]*"[^>]*data-reauth-expired[^>]*hidden/);
+    expect(html('/profile', PROMPT)).not.toMatch(/<div[^>]*data-reauth-expired[^>]*hidden/);
+    expect(html('/auth/reauth/continue?replay=abc')).not.toMatch(/<div[^>]*data-reauth-expired[^>]*hidden/);
+  });
+
+  test('is on this prompt only, not on the ordinary sign-in page', () => {
+    expect(fs.readFileSync(path.resolve(path.dirname(VIEW), 'login.ejs'), 'utf8')).not.toContain('data-reauth-expired');
+  });
+});

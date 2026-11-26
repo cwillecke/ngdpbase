@@ -75,7 +75,18 @@ SLOW_STORAGE=/srv/ngdpbase/data   # may be the same folder as FAST_STORAGE
 PORT=3000
 ```
 
-Both storage folders must be writable by `PUID`:`PGID`. The session secret, credentials key and backup key are generated into `<FAST_STORAGE>/.env` on the first start; save the backup key somewhere off the server.
+Both storage folders must be writable by `PUID`:`PGID`. Keys such as the session secret, credentials key and backup key are generated into `<FAST_STORAGE>/.env` on the first start; save the backup key somewhere off the server.
+
+A direct install ends up with two `.env` files:
+
+- `<checkout>/.env` is the one you just wrote: `FAST_STORAGE`, `SLOW_STORAGE`, `PORT` and the other settings in `.env.example`. The server reads it first to find `FAST_STORAGE`.
+- `<FAST_STORAGE>/.env` belongs to the site. The server writes its generated keys there, such as `NGDPBASE_SESSION_SECRET`, `NGDPBASE_CREDENTIALS_KEY` and `NGDPBASE_BACKUP_KEY`, and you add the site's own secrets there, such as `NGDPBASE_DATABASE_KEY` and any mail or add-on secrets.
+
+If both files set a variable, `<FAST_STORAGE>/.env` wins.
+
+A variable set outside the files wins over both (a shell export before `node dist/src/app.js`, or a container's settings). The exception is `./server.sh`, which reads the files after your shell, so the files win there. [Where `.env` files are read from](docs/guides/bootstrap-developer-guide.md#where-env-files-are-read-from) has the full order.
+
+Only `<FAST_STORAGE>/.env` is in your backups and in Admin → Backup → Download .env. Keep your own copy of `<checkout>/.env`; [What to keep safe](docs/guides/backup-restore-guide.md#what-to-keep-safe) in the backup guide says more.
 
 ### 4. Headless only: the admin password
 
@@ -213,6 +224,17 @@ See [docker/DOCKER.md](./docker/DOCKER.md) for complete Docker headless deployme
 - `config/app-custom-config.json` - Custom overrides (created by installation)
 
 See [docs/architecture/](./docs/architecture/) for configuration system details.
+
+### Removed configuration keys
+
+An upgraded site's `app-custom-config.json` can still carry keys that nothing reads any more. The server starts, ignores them, and logs a warning (and shows ConfigurationManager as needing attention on the admin dashboard) for those listed here with one. Remove them from the file.
+
+| Key | Replaced by | Notes |
+|---|---|---|
+| `ngdpbase.stores.<kind>.encrypt` | `ngdpbase.system-category.<entry>.encrypt` | `<entry>` is the system-category that declares the vault; `general` for the `default` vault. Setting it to `true` closes existing plaintext vaults of that kind, so change it on purpose. |
+| `ngdpbase.stores.<kind>.owner` | `owner` of `ngdpbase.system-category.<entry>` | `admin` when the entry has none. |
+
+Details: [docs/system-category.md](./docs/system-category.md#related-settings-that-are-not-per-system-category).
 
 ### Common operator topics
 

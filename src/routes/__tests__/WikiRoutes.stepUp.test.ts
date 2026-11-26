@@ -10,7 +10,7 @@ import AuthManager from '../../managers/AuthManager';
 
 const res = () => ({
   status: vi.fn().mockReturnThis(), json: vi.fn().mockReturnThis(), redirect: vi.fn().mockReturnThis(),
-  send: vi.fn().mockReturnThis(), render: vi.fn().mockReturnThis(), set: vi.fn().mockReturnThis()
+  send: vi.fn().mockReturnThis(), render: vi.fn().mockReturnThis(), set: vi.fn().mockReturnThis(), setHeader: vi.fn().mockReturnThis()
 });
 const session = (): Record<string, unknown> => ({ username: 'molly', isAuthenticated: true, save: vi.fn((cb: (e?: unknown) => void) => cb()) });
 
@@ -18,6 +18,7 @@ function routes(needed: boolean, authenticate: (id: string, c: unknown) => Promi
   const audit: Array<Record<string, unknown>> = [];
   const authManager = {
     stepUpNeeded: vi.fn(() => needed),
+    signInFresh: vi.fn(() => false),
     renameCredential: vi.fn().mockResolvedValue(true),
     revokeDelegation: vi.fn().mockResolvedValue(true),
     passkeyAuthenticationOptions: vi.fn().mockResolvedValue({ challenge: 'c1' }),
@@ -25,19 +26,34 @@ function routes(needed: boolean, authenticate: (id: string, c: unknown) => Promi
     authenticate: vi.fn(authenticate),
     reauthenticated: vi.fn(() => ({ provider: 'password', factors: [], amr: ['pwd'], aal: 1, acr: 'aal1', mfa: false, at: 'now' })),
     requiredAalFor: vi.fn(() => 1),
-    passkeyRelyingParty: vi.fn(() => null),
+    passkeyRelyingParty: vi.fn((): unknown => null),
     hasCredential: vi.fn(() => false),
+    // #2356: what this account can add or use; nothing by default.
+    strongerSignInWays: vi.fn(() => Promise.resolve({ addPasskey: false, addTotp: false, usePasskey: false, useTotp: false, password: true, outside: [] as string[] })),
     // #1758: step-up is AuthManager's — the real answer, record and completion, on this double.
     engine: null as unknown,
     askForFreshSignIn(...a: Parameters<AuthManager['askForFreshSignIn']>) { return AuthManager.prototype.askForFreshSignIn.apply(this as never, a); },
+    // #2154: a page's form POST is kept to be redone after the prompt.
+    stepUpReplays: new Map(),
+    keepStepUpReplay(...a: unknown[]) { return (AuthManager.prototype as unknown as { keepStepUpReplay: (...x: unknown[]) => unknown }).keepStepUpReplay.apply(this, a); },
     recordReauth(...a: Parameters<AuthManager['recordReauth']>) { return AuthManager.prototype.recordReauth.apply(this as never, a); },
-    completeReauth(...a: Parameters<AuthManager['completeReauth']>) { return AuthManager.prototype.completeReauth.apply(this as never, a); }
+    completeReauth(...a: Parameters<AuthManager['completeReauth']>) { return AuthManager.prototype.completeReauth.apply(this as never, a); },
+    // #2193: a script's request names its own prompt.
+    cancelStepUpPrompt(...a: Parameters<AuthManager['cancelStepUpPrompt']>) { return AuthManager.prototype.cancelStepUpPrompt.apply(this as never, a); },
+    stepUpPromptState(...a: Parameters<AuthManager['stepUpPromptState']>) { return AuthManager.prototype.stepUpPromptState.apply(this as never, a); },
+    stepUpReplayHasFields(...a: Parameters<AuthManager['stepUpReplayHasFields']>) { return AuthManager.prototype.stepUpReplayHasFields.apply(this as never, a); },
+    takeStepUpReplay(...a: Parameters<AuthManager['takeStepUpReplay']>) { return AuthManager.prototype.takeStepUpReplay.apply(this as never, a); }
   };
   const oidc = { revokeGrant: vi.fn().mockResolvedValue(true) };
+  const folders = { prepareNewRecoveryWords: vi.fn().mockResolvedValue({ token: 'tok', words: ['abandon', 'ability'] }) };
   const backup = { revealInstanceEnv: vi.fn().mockResolvedValue(Buffer.from('X=1\n')), revealBackupKeyFile: vi.fn().mockResolvedValue({ fingerprint: '0123456789abcdef', text: 'X=1\n' }) };
+  // #2360: what the two admin forms would change, so a stale sign-in can be shown to change nothing.
+  const config = { getProperty: (_k: string, d: unknown) => d, resetToDefaults: vi.fn().mockResolvedValue(undefined), setProperty: vi.fn().mockResolvedValue(undefined) };
+  const addons = { canDisable: vi.fn(() => ({ ok: true, blockedBy: [] as string[] })), storeDisableWarnings: vi.fn().mockResolvedValue([]) };
   const managers: Record<string, unknown> = {
     OidcManager: oidc,
     BackupManager: backup,
+    SharedFolderManager: folders,
     AuthManager: authManager,
     // #1635: the PDP decides step-up. This double grants by policy and asks
     // AuthManager about freshness exactly as the real PDP does; `holds` is the
@@ -49,13 +65,14 @@ function routes(needed: boolean, authenticate: (id: string, c: unknown) => Promi
     },
     AuditManager: { logAuditEvent: (e: Record<string, unknown>) => { audit.push(e); return Promise.resolve('a'); }, logAuthentication: vi.fn().mockResolvedValue('a') },
     UserManager: { hasPassword: vi.fn().mockResolvedValue(true), getUser: vi.fn().mockResolvedValue({ username: 'molly' }) },
-    ConfigurationManager: { getProperty: (_k: string, d: unknown) => d }
+    ConfigurationManager: config,
+    AddonsManager: addons
   };
   const engine = { getManager: vi.fn((n: string) => managers[n] ?? null) };
   authManager.engine = engine;
   const r = new WikiRoutes(engine) as unknown as Record<string, (q: unknown, s: unknown) => Promise<void>> & { getCommonTemplateData: unknown };
   (r as unknown as { getCommonTemplateData: () => Promise<Record<string, unknown>> }).getCommonTemplateData = () => Promise.resolve({ csrfToken: 't' });
-  return { r, authManager, audit, oidc, backup };
+  return { r, authManager, audit, oidc, backup, folders, config, addons };
 }
 
 const req = (s: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
@@ -80,8 +97,8 @@ describe('step-up at the route door (#1525)', () => {
     const out = res();
     await r.passkeyRegisterOptions(req(session(), { method: 'GET', originalUrl: '/auth/passkey/register/options' }), out);
     expect(out.status).toHaveBeenCalledWith(403);
-    // Not the data URL: returning there showed the person raw JSON.
-    expect(out.json).toHaveBeenCalledWith(expect.objectContaining({ reauth: '/auth/reauth?next=%2Fprofile' }));
+    // Not the data URL: returning there showed the person raw JSON. #2193: it names its own prompt.
+    expect(out.json).toHaveBeenCalledWith(expect.objectContaining({ reauth: expect.stringMatching(/^\/auth\/reauth\?next=%2Fprofile&prompt=[0-9a-f]{32}$/) }));
   });
 
   test('a delegated credential is refused outright, never sent to a prompt', async () => {
@@ -145,11 +162,12 @@ describe('coming back from a fresh sign-in (#2145)', () => {
       metadata: expect.objectContaining({ detail: expect.stringContaining('passkey for config-manage') }) }));
   });
 
-  test('a form POST lands on the page with the form, which says it can be done now', async () => {
+  test('a form POST that cannot be redone (no form body) lands on the page with the form, which says it can be done now', async () => {
     const { s, out } = await stepUpThenPasskey(
       (r, sess) => r.renameOwnCredential(req(sess, { body: { label: 'Phone' } }), res()), '/profile');
     expect(out.json).toHaveBeenCalledWith({ ok: true, redirect: '/profile' });
     expect(s.stepUpConfirmed).toBe('/profile');
+    expect(s.stepUpNote).toBeUndefined(); // every other action keeps the generic note
   });
 
   test('a page GET opens the page again, which does the action: no note', async () => {
@@ -195,6 +213,146 @@ describe('coming back from a fresh sign-in (#2145)', () => {
   });
 });
 
+describe('a form POST carries on after a fresh sign-in (#2154)', () => {
+  const passkeyOk = () => Promise.resolve({ success: true, username: 'molly', provider: 'passkey', factors: [] });
+  /** A browser's form POST on session `sid`. */
+  const formPost = (s: Record<string, unknown>, sid: string, body: Record<string, unknown>) =>
+    req(s, { sessionID: sid, body, is: (t: string) => (t === 'application/x-www-form-urlencoded' ? t : false) });
+  const continueTo = (s: Record<string, unknown>, sid: string, next: string) =>
+    req(s, { method: 'GET', sessionID: sid, originalUrl: next, query: { replay: new URL(next, 'http://x').searchParams.get('replay') } });
+
+  /** Rename the passkey on a stale session, then confirm with a passkey; the prompt's return. */
+  async function staleRenameThenPasskey() {
+    const env = routes(true, passkeyOk);
+    const s = session();
+    const asked = res();
+    await env.r.renameOwnCredential(formPost(s, 'sid-1', { _csrf: 't-old', label: 'Phone' }), asked);
+    const reauth = String(asked.redirect.mock.calls[0]?.[0]);
+    const next = new URL(reauth, 'http://x').searchParams.get('next') ?? '';
+    env.authManager.stepUpNeeded.mockReturnValue(false);
+    s.passkeyChallenge = { value: 'c1', purpose: 'reauth', expires: Date.now() + 60_000 };
+    const out = res();
+    await env.r.passkeyReauthVerify(req(s, { sessionID: 'sid-1', body: { response: {}, next } }), out);
+    return { ...env, s, next, out };
+  }
+
+  test('the confirmation returns to the continue page, which posts the same fields to the same address once', async () => {
+    const { r, authManager, s, next, out } = await staleRenameThenPasskey();
+    expect(next).toMatch(/^\/auth\/reauth\/continue\?replay=[0-9a-f]{32}$/);
+    expect(out.json).toHaveBeenCalledWith({ ok: true, redirect: next });
+    expect(s.stepUpConfirmed).toBeUndefined();
+    expect(authManager.renameCredential).not.toHaveBeenCalled();
+
+    const page = res();
+    await r.reauthContinue(continueTo(s, 'sid-1', next), page);
+    // The session's own CSRF token, not the one kept: the CSRF check runs again on the POST.
+    expect(page.render).toHaveBeenCalledWith('reauth-continue', expect.objectContaining({
+      action: '/profile/credentials/cred-1/rename', fields: [['label', 'Phone']], back: '/profile', csrfToken: 't'
+    }));
+    expect(page.set).toHaveBeenCalledWith('Cache-Control', 'no-store');
+
+    // The browser's POST from that page does the action, on its own door.
+    const done = res();
+    await r.renameOwnCredential(formPost(s, 'sid-1', { _csrf: 't', label: 'Phone' }), done);
+    expect(authManager.renameCredential).toHaveBeenCalledTimes(1);
+    expect(done.redirect).toHaveBeenCalledWith('/profile?success=Renamed');
+  });
+
+  test('#2485: the prompt for a kept POST says whether it holds anything typed (Revoke holds nothing)', async () => {
+    const env = routes(true);
+    const promptFor = async (body: Record<string, unknown>) => {
+      const s = session();
+      const asked = res();
+      await env.r.renameOwnCredential(formPost(s, 'sid-1', body), asked);
+      const next = new URL(String(asked.redirect.mock.calls[0]?.[0]), 'http://x').searchParams.get('next') ?? '';
+      env.authManager.stepUpNeeded.mockReturnValue(false); // the prompt itself is profile-manage, which never steps up
+      const out = res();
+      await env.r.reauthPage(req(s, { method: 'GET', sessionID: 'sid-1', originalUrl: '/auth/reauth', query: { next } }), out);
+      env.authManager.stepUpNeeded.mockReturnValue(true);
+      return out.render.mock.calls[0][1] as { typed?: boolean };
+    };
+    expect((await promptFor({ _csrf: 't-old' })).typed).toBe(false);
+    expect((await promptFor({ _csrf: 't-old', label: 'Phone' })).typed).toBe(true);
+  });
+
+  test('a second replay is refused', async () => {
+    const { r, s, next } = await staleRenameThenPasskey();
+    await r.reauthContinue(continueTo(s, 'sid-1', next), res());
+    const again = res();
+    await r.reauthContinue(continueTo(s, 'sid-1', next), again);
+    expect(again.status).toHaveBeenCalledWith(410);
+    expect(again.render).not.toHaveBeenCalledWith('reauth-continue', expect.anything());
+  });
+
+  test('a replay from another session is refused, and spent', async () => {
+    const { r, s, next } = await staleRenameThenPasskey();
+    const other = res();
+    await r.reauthContinue(continueTo(session(), 'sid-2', next), other);
+    expect(other.status).toHaveBeenCalledWith(410);
+    expect(other.render).not.toHaveBeenCalledWith('reauth-continue', expect.anything());
+    const mine = res();
+    await r.reauthContinue(continueTo(s, 'sid-1', next), mine);
+    expect(mine.status).toHaveBeenCalledWith(410);
+  });
+
+  test('the prompt\'s Cancel goes back to the page with nothing redone', async () => {
+    const env = routes(true, passkeyOk);
+    const s = session();
+    const asked = res();
+    await env.r.renameOwnCredential(formPost(s, 'sid-1', { _csrf: 't-old', label: 'Phone' }), asked);
+    const next = new URL(String(asked.redirect.mock.calls[0]?.[0]), 'http://x').searchParams.get('next') ?? '';
+    // Still stale; profile-manage never steps up.
+    env.authManager.stepUpNeeded.mockImplementation((action: string) => action !== 'profile-manage');
+    const out = res();
+    await env.r.reauthContinue(continueTo(s, 'sid-1', next), out);
+    expect(out.redirect).toHaveBeenCalledWith('/profile');
+    expect(out.render).not.toHaveBeenCalled();
+  });
+
+  test('Admin → Backup → Make a new set of recovery words is made after the passkey, with no second press (the issue\'s case)', async () => {
+    const env = routes(true, passkeyOk);
+    // Only the backup key pages' permission steps up, as configured.
+    env.authManager.stepUpNeeded.mockImplementation((action: string) => action === 'config-manage');
+    const s = session();
+    const fromBackup = (h: string) => (h === 'referer' ? 'https://wiki.example.com/admin/backup' : 'ua');
+    const press = (csrf: string) => req(s, {
+      sessionID: 'sid-1', originalUrl: '/admin/backup/shared-folders/words/new', body: { _csrf: csrf }, get: fromBackup,
+      is: (t: string) => (t === 'application/x-www-form-urlencoded' ? t : false),
+      userContext: { username: 'molly', roles: ['admin'], isAuthenticated: true }
+    });
+    const asked = res();
+    await env.r.adminSharedFoldersNewWords(press('t-old'), asked);
+    const next = new URL(String(asked.redirect.mock.calls[0]?.[0]), 'http://x').searchParams.get('next') ?? '';
+    expect(next).toMatch(/^\/auth\/reauth\/continue\?replay=[0-9a-f]{32}$/);
+    expect(env.folders.prepareNewRecoveryWords).not.toHaveBeenCalled();
+
+    env.authManager.stepUpNeeded.mockReturnValue(false);
+    s.passkeyChallenge = { value: 'c1', purpose: 'reauth', expires: Date.now() + 60_000 };
+    const confirmed = res();
+    await env.r.passkeyReauthVerify(req(s, { sessionID: 'sid-1', body: { response: {}, next } }), confirmed);
+    expect(confirmed.json).toHaveBeenCalledWith({ ok: true, redirect: next });
+
+    const page = res();
+    await env.r.reauthContinue(continueTo(s, 'sid-1', next), page);
+    expect(page.render).toHaveBeenCalledWith('reauth-continue', expect.objectContaining({
+      action: '/admin/backup/shared-folders/words/new', fields: [], back: '/admin/backup', csrfToken: 't'
+    }));
+
+    // The continue page's own POST makes the new set.
+    const made = res();
+    await env.r.adminSharedFoldersNewWords(press('t'), made);
+    expect(env.folders.prepareNewRecoveryWords).toHaveBeenCalledTimes(1);
+    expect(made.render).toHaveBeenCalledWith('admin-shared-folders-words', expect.objectContaining({ step: 'words', replacing: true }));
+  });
+
+  test('a page GET is unchanged: it returns to itself', async () => {
+    const env = routes(true, passkeyOk);
+    const out = res();
+    await env.r.adminBackupKey(req(session(), { method: 'GET', sessionID: 'sid-1', originalUrl: '/admin/backup/key' }), out);
+    expect(out.redirect).toHaveBeenCalledWith('/auth/reauth?next=%2Fadmin%2Fbackup%2Fkey');
+  });
+});
+
 describe('downloading the backup key file (#2134)', () => {
   test('a stale session is sent to re-authenticate and the key is never read', async () => {
     // Sabotage (2026-10-30): asking holdsPermission instead of permitted() turns this red.
@@ -214,6 +372,129 @@ describe('downloading the backup key file (#2134)', () => {
     await r.adminBackupKeyFile(req(session(), { method: 'GET', originalUrl: '/admin/backup/key/file' }), out);
     expect(backup.revealBackupKeyFile).toHaveBeenCalledWith(expect.objectContaining({ username: 'molly' }));
     expect(out.send).toHaveBeenCalledWith('X=1\n');
+  });
+});
+
+describe('a page waiting on its prompt asks whether that prompt is confirmed (#2193)', () => {
+  const status = (s: Record<string, unknown>, userContext: Record<string, unknown>, prompt?: unknown) =>
+    req(s, { method: 'GET', originalUrl: '/auth/reauth/status', query: prompt === undefined ? {} : { prompt }, userContext });
+  const molly = { username: 'molly', roles: ['reader'], isAuthenticated: true, aalCap: 1, signIn: { factors: [] } };
+  const passwordOk = () => Promise.resolve({ success: true, username: 'molly', provider: 'password', factors: [] });
+
+  /** A script's request refused on session `s`: the prompt id its `reauth` names. */
+  async function refusedPrompt(env: ReturnType<typeof routes>, s: Record<string, unknown>): Promise<string> {
+    const out = res();
+    await env.r.passkeyRegisterOptions(req(s, { method: 'GET', originalUrl: '/auth/passkey/register/options' }), out);
+    const { reauth } = (out.json.mock.calls[0] as [{ reauth: string }])[0];
+    return new URL(reauth, 'http://x').searchParams.get('prompt') ?? '';
+  }
+
+  test('answers whether the sign-in is fresh and where this prompt is, never cached, and leaves the session object as it was', async () => {
+    const env = routes(true);
+    const s = session();
+    const prompt = await refusedPrompt(env, s);
+    env.authManager.stepUpNeeded.mockReturnValue(false); // the double asks it of every permission
+    env.authManager.signInFresh.mockReturnValue(true);
+    const before = JSON.stringify(s);
+    const out = res();
+    await env.r.reauthStatus(status(s, molly, prompt), out);
+    expect(env.authManager.signInFresh).toHaveBeenCalledWith(molly.signIn, ['reader'], false, undefined, 1);
+    expect(out.set).toHaveBeenCalledWith('Cache-Control', 'no-store');
+    expect(out.json).toHaveBeenCalledWith({ fresh: true, prompt: 'waiting' });
+    expect(JSON.stringify(s)).toBe(before);
+  });
+
+  test('the password confirmation confirms the prompt it was opened for, and no other', async () => {
+    // Sabotage (2026-10-31): dropping body.prompt in reauthWithPassword turns this red.
+    const env = routes(true, passwordOk);
+    const s = session();
+    const mine = await refusedPrompt(env, s);
+    const other = await refusedPrompt(env, s);
+    env.authManager.stepUpNeeded.mockReturnValue(false);
+    await env.r.reauthWithPassword(req(s, { body: { password: 'right', next: '/profile', prompt: mine } }), res());
+    const answers: unknown[] = [];
+    for (const prompt of [mine, other, 'f'.repeat(32)]) {
+      const out = res();
+      await env.r.reauthStatus(status(s, molly, prompt), out);
+      answers.push((out.json.mock.calls[0] as [{ prompt: string }])[0].prompt);
+    }
+    expect(answers).toEqual(['confirmed', 'waiting', 'unknown']);
+  });
+
+  test('the passkey confirmation confirms its prompt too', async () => {
+    const env = routes(true, () => Promise.resolve({ success: true, username: 'molly', provider: 'passkey', factors: [] }));
+    const s = session();
+    const prompt = await refusedPrompt(env, s);
+    env.authManager.stepUpNeeded.mockReturnValue(false); // the double asks it of every permission
+    s.passkeyChallenge = { value: 'c1', purpose: 'reauth', expires: Date.now() + 60_000 };
+    await env.r.passkeyReauthVerify(req(s, { body: { response: {}, next: '/profile', prompt } }), res());
+    const out = res();
+    await env.r.reauthStatus(status(s, molly, prompt), out);
+    expect(out.json).toHaveBeenCalledWith(expect.objectContaining({ prompt: 'confirmed' }));
+  });
+
+  test('the prompt page carries its id, only a well-formed one, to the confirmation and to Cancel', async () => {
+    const env = routes(false);
+    const id = '0123456789abcdef0123456789abcdef';
+    const out = res();
+    await env.r.reauthPage(req(session(), { method: 'GET', originalUrl: '/auth/reauth', query: { next: '/profile', prompt: id } }), out);
+    expect(out.render).toHaveBeenCalledWith('reauth', expect.objectContaining({ prompt: id }));
+    const bad = res();
+    await env.r.reauthPage(req(session(), { method: 'GET', originalUrl: '/auth/reauth', query: { next: '/profile', prompt: '"><script>' } }), bad);
+    expect(bad.render).toHaveBeenCalledWith('reauth', expect.objectContaining({ prompt: '' }));
+  });
+
+  test('#2356: the page gets this account\'s ways; the passkey and the app only when this account can use them', async () => {
+    const env = routes(false);
+    const view = async () => {
+      const out = res();
+      await env.r.reauthPage(req(session(), { method: 'GET', originalUrl: '/auth/reauth', query: { next: '/profile' } }), out);
+      return out.render.mock.calls[0][1] as { ways: { addPasskey: boolean }; hasPasskey: boolean; hasTotp: boolean };
+    };
+    const none = await view();
+    expect(env.authManager.strongerSignInWays).toHaveBeenCalledWith('molly');
+    expect(none).toMatchObject({ hasPasskey: false, hasTotp: false, ways: { addPasskey: false } });
+    // A passkey on the account that it is not allowed, or the site can't use, is not offered (usePasskey false).
+    env.authManager.hasCredential.mockReturnValue(true);
+    env.authManager.passkeyRelyingParty.mockReturnValue({ rpID: 'wiki.example.com' });
+    expect((await view()).hasPasskey).toBe(false);
+    env.authManager.strongerSignInWays.mockResolvedValue({ addPasskey: false, addTotp: false, usePasskey: true, useTotp: true, password: true, outside: [] });
+    expect(await view()).toMatchObject({ hasPasskey: true, hasTotp: true });
+  });
+
+  test('Cancel marks the prompt cancelled, saves the session, and goes back on this site', async () => {
+    const env = routes(true);
+    const s = session();
+    const prompt = await refusedPrompt(env, s);
+    env.authManager.stepUpNeeded.mockReturnValue(false); // the double asks it of every permission
+    const out = res();
+    await env.r.reauthCancel(req(s, { body: { prompt, next: '/view/Ledger' } }), out);
+    expect(s.save).toHaveBeenCalled();
+    expect(out.redirect).toHaveBeenCalledWith('/view/Ledger');
+    const asked = res();
+    await env.r.reauthStatus(status(s, molly, prompt), asked);
+    expect(asked.json).toHaveBeenCalledWith(expect.objectContaining({ prompt: 'cancelled' }));
+    const away = res();
+    await env.r.reauthCancel(req(s, { body: { prompt, next: 'https://evil.example/' } }), away);
+    expect(away.redirect).toHaveBeenCalledWith('/');
+  });
+
+  test('a delegated credential is never fresh', async () => {
+    const { r, authManager } = routes(false);
+    await r.reauthStatus(status(session(), { ...molly, viaToken: { id: 't', name: 'bot', scopes: ['profile-manage'] } }), res());
+    expect(authManager.signInFresh).toHaveBeenLastCalledWith(molly.signIn, ['reader'], true, undefined, 1);
+  });
+
+  test('asked like the prompt itself, profile-manage: a caller refused it learns nothing', async () => {
+    const env = routes(false);
+    (env.r as unknown as { permitted: () => Promise<boolean> }).permitted = vi.fn((_c, _p, _q, s: ReturnType<typeof res>) => { s.status(401).json({ error: 'Sign in' }); return Promise.resolve(false); }) as never;
+    const out = res();
+    await env.r.reauthStatus(status(session(), { username: 'anonymous', roles: ['anonymous'] }), out);
+    expect(env.authManager.signInFresh).not.toHaveBeenCalled();
+    expect(out.json).not.toHaveBeenCalledWith(expect.objectContaining({ fresh: expect.anything() }));
+    const cancel = res();
+    await env.r.reauthCancel(req(session(), { body: { prompt: 'a'.repeat(32), next: '/' } }), cancel);
+    expect(cancel.redirect).not.toHaveBeenCalled();
   });
 });
 
@@ -308,3 +589,102 @@ describe('revoking from My tokens and devices (#1764)', () => {
   });
 });
 
+
+// #2360: a plain form post to a step-up route is sent to the "confirm it is you"
+// step, as a page is; a script's request is still told in JSON.
+describe('a plain form post with a stale sign-in goes to the "confirm it is you" step (#2360)', () => {
+  const browserHeaders = { accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' };
+  const scriptHeaders = { accept: 'application/json', 'x-requested-with': 'XMLHttpRequest' };
+  const from = (page: string) => (h: string) => (h === 'referer' ? `https://wiki.example.com${page}` : 'ua');
+  const resetForm = (headers: Record<string, string>, extra: Record<string, unknown> = {}) =>
+    req(session(), { headers, body: { _csrf: 't' }, originalUrl: '/admin/configuration/reset', get: from('/admin/configuration'), ...extra });
+  const toggleForm = (headers: Record<string, string>, extra: Record<string, unknown> = {}) =>
+    req(session(), { headers, params: { name: 'accounting' }, body: { _csrf: 't', enabled: 'false' }, originalUrl: '/admin/addons/accounting/toggle', get: from('/admin/addons'), ...extra });
+
+  test('Reset configuration: redirected to /auth/reauth, back to the configuration page, and nothing is reset', async () => {
+    const { r, config, audit } = routes(true);
+    const out = res();
+    await r.adminResetConfiguration(resetForm(browserHeaders), out);
+    expect(out.redirect).toHaveBeenCalledWith('/auth/reauth?next=%2Fadmin%2Fconfiguration');
+    expect(out.json).not.toHaveBeenCalled();
+    expect(config.resetToDefaults).not.toHaveBeenCalled();
+    expect(audit).toContainEqual(expect.objectContaining({ eventType: 'reauth-prompt', resource: 'config-manage' }));
+  });
+
+  test('Enable or disable an add-on: redirected to /auth/reauth, back to the add-ons page, and nothing is changed', async () => {
+    const { r, config } = routes(true);
+    const out = res();
+    await r.adminAddonToggle(toggleForm(browserHeaders), out);
+    expect(out.redirect).toHaveBeenCalledWith('/auth/reauth?next=%2Fadmin%2Faddons');
+    expect(out.json).not.toHaveBeenCalled();
+    expect(config.setProperty).not.toHaveBeenCalled();
+  });
+
+  test('a script\'s request (Accept: application/json, X-Requested-With) is still told in JSON, with its own prompt', async () => {
+    for (const [name, call] of [
+      ['reset', (r: ReturnType<typeof routes>['r'], o: ReturnType<typeof res>) => r.adminResetConfiguration(resetForm(scriptHeaders), o)],
+      ['toggle', (r: ReturnType<typeof routes>['r'], o: ReturnType<typeof res>) => r.adminAddonToggle(toggleForm(scriptHeaders), o)]
+    ] as const) {
+      const { r } = routes(true);
+      const out = res();
+      await call(r, out);
+      expect(out.redirect, name).not.toHaveBeenCalled();
+      expect(out.status, name).toHaveBeenCalledWith(403);
+      expect(out.json, name).toHaveBeenCalledWith(expect.objectContaining({ reauth: expect.stringMatching(/^\/auth\/reauth\?next=%2Fadmin%2F(configuration|addons)&prompt=[0-9a-f]{32}$/) }));
+    }
+  });
+
+  test('a script\'s form-encoded request that asks for no particular type is not mistaken for a browser form', async () => {
+    const { r } = routes(true);
+    const out = res();
+    await r.adminResetConfiguration(resetForm({ accept: '*/*' }), out);
+    expect(out.redirect).not.toHaveBeenCalled();
+    expect(out.json).toHaveBeenCalledWith(expect.objectContaining({ reauth: expect.stringContaining('&prompt=') }));
+  });
+
+  // Jim, #2360 (2026-11-24): Reset configuration discards every custom setting with no backup, so
+  // confirming a sign-in never runs it. The person presses Reset again, and the browser's own
+  // "Are you sure?" asks again.
+  test('Reset configuration is not kept for a redo: confirming goes back to Configuration with the note, and nothing is reset until Reset is pressed again', async () => {
+    const passkeyOk = () => Promise.resolve({ success: true, username: 'molly', provider: 'passkey', factors: [] });
+    const env = routes(true, passkeyOk);
+    const s = session();
+    const post = (body: Record<string, unknown>) => resetForm(browserHeaders, { session: s, sessionID: 'sid-1', body, is: (t: string) => (t === 'application/x-www-form-urlencoded' ? t : false) });
+    const asked = res();
+    await env.r.adminResetConfiguration(post({ _csrf: 't-old' }), asked);
+    expect(asked.redirect).toHaveBeenCalledWith('/auth/reauth?next=%2Fadmin%2Fconfiguration');
+    expect(env.authManager.stepUpReplays.size).toBe(0);
+    expect(env.config.resetToDefaults).not.toHaveBeenCalled();
+    env.authManager.stepUpNeeded.mockReturnValue(false);
+    s.passkeyChallenge = { value: 'c1', purpose: 'reauth', expires: Date.now() + 60_000 };
+    const confirmed = res();
+    await env.r.passkeyReauthVerify(req(s, { sessionID: 'sid-1', body: { response: {}, next: '/admin/configuration' } }), confirmed);
+    expect(confirmed.json).toHaveBeenCalledWith({ ok: true, redirect: '/admin/configuration' });
+    expect(s.stepUpConfirmed).toBe('/admin/configuration');
+    // Jim, #2360: the note on that page says to press Reset again (a fixed key the header looks up).
+    expect(s.stepUpNote).toBe('press-again');
+    expect(env.config.resetToDefaults).not.toHaveBeenCalled();
+    // Pressed again, with the sign-in now fresh, it runs, once.
+    const done = res();
+    await env.r.adminResetConfiguration(post({ _csrf: 't' }), done);
+    expect(env.config.resetToDefaults).toHaveBeenCalledTimes(1);
+    expect(done.redirect).toHaveBeenCalledWith('/admin/configuration?success=Configuration reset to defaults');
+  });
+
+  test('the add-on switch is still kept and redone once after signing in again: it can be undone', async () => {
+    const passkeyOk = () => Promise.resolve({ success: true, username: 'molly', provider: 'passkey', factors: [] });
+    const env = routes(true, passkeyOk);
+    const s = session();
+    const post = (body: Record<string, unknown>) => toggleForm(browserHeaders, { session: s, sessionID: 'sid-1', body, is: (t: string) => (t === 'application/x-www-form-urlencoded' ? t : false) });
+    const asked = res();
+    await env.r.adminAddonToggle(post({ _csrf: 't-old', enabled: 'false' }), asked);
+    const next = new URL(String(asked.redirect.mock.calls[0]?.[0]), 'http://x').searchParams.get('next') ?? '';
+    expect(next).toMatch(/^\/auth\/reauth\/continue\?replay=[0-9a-f]{32}$/);
+    env.authManager.stepUpNeeded.mockReturnValue(false);
+    s.passkeyChallenge = { value: 'c1', purpose: 'reauth', expires: Date.now() + 60_000 };
+    await env.r.passkeyReauthVerify(req(s, { sessionID: 'sid-1', body: { response: {}, next } }), res());
+    const page = res();
+    await env.r.reauthContinue(req(s, { method: 'GET', sessionID: 'sid-1', originalUrl: next, query: { replay: new URL(next, 'http://x').searchParams.get('replay') } }), page);
+    expect(page.render).toHaveBeenCalledWith('reauth-continue', expect.objectContaining({ action: '/admin/addons/accounting/toggle', back: '/admin/addons' }));
+  });
+});

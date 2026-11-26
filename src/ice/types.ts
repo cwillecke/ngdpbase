@@ -14,9 +14,10 @@
  *   noise filter, fingerprints, skipping unchanged files, per-file status,
  *   keeping the original, and running the work as a background job.
  *
- * Only importing is built in the first slice. `out` / `both` shims and the
- * `write` half are declared so export (#1974) and feeds (D10) fit later
- * without changing these shapes.
+ * - An __export source__ is the owner's door for reading the thing being
+ *   exported (#2120): a page, later a search result or an add-on's list. It
+ *   checks the owner's existing read permission (D5) and yields items that
+ *   `out` shims chain into one file to download.
  */
 import type { ActorContext } from '../context/ActorContext.js';
 import type { GuardedFetchOptions, GuardedResponse } from '../http/guardedFetch.js';
@@ -66,6 +67,29 @@ export interface IceItem {
    * (a feed entry): an item whose key the engine has seen before is skipped.
    */
   itemKey?: string;
+  /**
+   * The archive the file was unpacked from (#2118), when it was: what lies
+   * beside it, for a shim whose format spans the files of an archive (a
+   * takeout's pages link to its files by the ids its file index names).
+   * The engine still hands each file to the shims on its own.
+   */
+  archive?: IceArchiveView;
+}
+
+/**
+ * The archive a file was unpacked from (#2118): this file's own path in it,
+ * and every member, read only. Paths are the archive's own, `/`-separated.
+ * Never part of an item's key: what an item is, is its content.
+ */
+export interface IceArchiveView {
+  /** The archive's name, as the file's `name` begins: `takeout.zip`. */
+  name: string;
+  /** This file's path within the archive. */
+  path: string;
+  /** Every member's path, in the archive's order. */
+  paths: readonly string[];
+  /** A member's bytes, or undefined when there is no such member. */
+  read(memberPath: string): Buffer | undefined;
 }
 
 /**
@@ -108,6 +132,15 @@ export interface ShimTools {
   options: Record<string, unknown>;
 }
 
+/** What an `out` shim is handed (#2120): a shim's tools, and who the export is for. */
+export interface ExportShimTools extends ShimTools {
+  /**
+   * The job context of the user who asked for the export, for a core shim
+   * that calls a core door with it (the PDF render, P1).
+   */
+  ctx: ActorContext;
+}
+
 /** What a shim's read returns. */
 export interface ShimReadResult {
   items: IceItem[];
@@ -116,6 +149,13 @@ export interface ShimReadResult {
    * records plus a partial note): the file's status is then `partial`, with this.
    */
   partial?: string;
+  /**
+   * Set, with no items, when the file is part of its format's layout and
+   * holds nothing to import on its own (#2118): a takeout's file index, read
+   * through the archive by the files it names. The file's status is then
+   * `noise`, with this, and the ledger records nothing for it.
+   */
+  skip?: string;
 }
 
 /**
@@ -142,8 +182,18 @@ export interface IceShim {
   duplicates?: 'file' | 'item';
   /** Inbound: read one input. Required for `in` and `both`. */
   read?(input: IceItem, tools: ShimTools): Promise<ShimReadResult>;
-  /** Outbound (export, #1974): not run in the first slice. Required for `out` and `both`. */
-  write?(items: IceItem[], tools: ShimTools): Promise<IceItem[]>;
+  /**
+   * Outbound (export, #2120): turn the items into this shim's `produces`.
+   * Required for `out` and `both`. An outbound shim matches its input by
+   * `accepts.kinds` alone; a shim that produces `file` makes the download,
+   * and is what the Export action offers.
+   */
+  write?(items: IceItem[], tools: ExportShimTools): Promise<IceItem[]>;
+  /**
+   * An outbound shim whose engine is missing says so (#2120): PDF with no
+   * provider chosen. The Export action does not offer it. Default: available.
+   */
+  isAvailable?(): boolean;
   /**
    * Vetting (#2149): clean this format's own kind of risky content out of a
    * file that is about to be kept as a file (scripts and handlers in an SVG,
@@ -259,6 +309,18 @@ export interface ReceiveInfo {
    * taken there: never a silent replace.
    */
   givenName?: string;
+  /**
+   * The place within the receiver the run goes to (#2118), for a receiver
+   * with `targets`: one its `targets` gave the user the run is for, checked
+   * by the engine before the run. The receiver's door still checks it.
+   */
+  target?: string;
+  /**
+   * Set when the file was taken before and is read again only because the
+   * receiver `rechecks` this item (#2171): the receiver's own check decides
+   * whether it still holds it, and one it holds is `duplicate`.
+   */
+  rechecked?: boolean;
 }
 
 /** What a receiver's `fileDone` is told (#2109). */
@@ -282,6 +344,12 @@ export interface ReceiveOutcome {
    * so the same bytes uploaded again are told the same.
    */
   heldAs?: string;
+}
+
+/** A place within a receiver (#2118): a user's private store. */
+export interface IceTarget {
+  id: string;
+  label?: string;
 }
 
 /**
@@ -342,6 +410,57 @@ export interface IceReceiver {
    * before the run is queued; the run reuses what was kept and needs no key.
    */
   keepsEncrypted?: boolean;
+  /**
+   * `receive` itself may write into an encrypted store (a takeout into a
+   * sealed private store, #2118), which only a request holding the user's
+   * unlocked key can write. The engine then runs an upload into it during
+   * the upload request, with the request's own context, instead of as a
+   * background job: no key is ever carried into a job (#2034's decision).
+   * An import into it is confidential (#2110). Core's only: an add-on
+   * receiver that declares it is refused at registration, so an add-on is
+   * confidential only through `keepsEncrypted`.
+   */
+  writesEncrypted?: boolean;
+  /**
+   * A zip inside an uploaded zip is handed on as a file, not unpacked
+   * (#2118): for a receiver whose format holds zips as content (a takeout's
+   * files). Without it, the engine unpacks nested zips too.
+   */
+  innerZipsAsFiles?: boolean;
+  /**
+   * Size limits for this receiver's runs, in place of the engine's
+   * (`ngdpbase.import.engine.*`): zip entries, the bytes a zip unpacks to,
+   * and the size of one file. Called at each run, so a setting changed in
+   * the meantime applies. A limit left out is the engine's. Core's only: an
+   * add-on receiver that declares it is refused at registration (#2187).
+   */
+  limits?(): { maxZipEntries?: number; maxZipBytes?: number; maxFileBytes?: number };
+  /**
+   * The items this receiver checks for itself whether it still holds
+   * (#2118, operator 2026-10-30): a takeout's page, by its uuid, and a
+   * takeout's file, by its bytes (#2171), so one deleted since an earlier
+   * import comes back when the same takeout is imported again. A file whose
+   * fingerprint the scope already took is then read again, and only these
+   * of its items go to `receive`, with `info.rechecked`; the rest are
+   * duplicates. When nothing new is stored it stays `unchanged`, unrecorded,
+   * as the fingerprint skip leaves it. Without this, the fingerprint decides.
+   */
+  rechecks?(item: IceItem): boolean;
+  /**
+   * The places within this receiver this context may import into (#2118):
+   * a user's own private stores. The receiver's own rule (D5). A receiver
+   * with targets takes a run only with one of them (`IceRunRequest.target`),
+   * which the engine checks against this before the run, binds into the
+   * ledger scope, and hands on in every item's `ReceiveInfo.target`.
+   */
+  targets?(ctx: ActorContext): Promise<IceTarget[]>;
+  /**
+   * Called once when a run into this receiver has read every file (#2118),
+   * with its report: a receiver that records the run as one act (a
+   * takeout's `store-import` audit event). Not called for a refused run. A
+   * throw is the run's failure.
+   */
+  runDone?(ctx: ActorContext, report: IceRunReport): Promise<void>;
   /** The original-file choices this receiver offers (D11). Without it: all three. */
   originals?: IceOriginalChoices;
   /**
@@ -371,6 +490,8 @@ export interface IceUpload {
    * drops it on a zip). Checked by the engine against the receiver's `names`.
    */
   givenName?: string;
+  /** The archive the engine unpacked this file from (#2118); set by the engine, never by a caller. */
+  archive?: IceArchiveView;
 }
 
 /**
@@ -428,6 +549,12 @@ export interface IceRunRequest {
    * client sent.
    */
   options?: Record<string, unknown>;
+  /**
+   * The place within the receiver (#2118), for a receiver with `targets`:
+   * one of those it gives the user the run is for. Required for such a
+   * receiver and refused for any other.
+   */
+  target?: string;
 }
 
 /** Per-file status (first slice). */
@@ -471,6 +598,8 @@ export interface IceFileReport {
 export interface IceRunReport {
   runId: string;
   receiver: string;
+  /** The place within the receiver (#2118), when it has places. */
+  target?: string;
   scope: string;
   /** Who it ran as. */
   username: string;
@@ -525,6 +654,9 @@ export interface RecentImport {
   /** The receiver it went into. */
   receiver: string;
   receiverLabel?: string;
+  /** The place within it (#2118), when the receiver has places. */
+  target?: string;
+  targetLabel?: string;
   /** How many references the receiver gave (pages, records). */
   refs: number;
   /** Where the user can open the first of them (`linkFor`), when they may. */
@@ -546,4 +678,119 @@ export interface IceLedger {
   /** Record several item keys in one write (#2109). */
   recordItems(scope: string, itemKeys: string[]): Promise<void>;
   files(scope: string): Promise<LedgerFileEntry[]>;
+}
+
+// ── Export (#2120) ──────────────────────────────────────────────────────────
+
+/**
+ * The kind of the one item an export ends with: a file to download, with
+ * `bytes`, `mediaType` and the `name` it is saved under.
+ */
+export const EXPORT_FILE_KIND = 'file';
+
+/** What an export source is told about the read it is asked for. */
+export interface ExportReadInfo {
+  /** The shim that will make the file (`core.pdf`). */
+  format: string;
+  /** Tell the user something about what was read (what was left out and why); shown with the finished export. */
+  note(text: string): void;
+}
+
+/**
+ * The owner's door for reading the thing being exported (#2120, D5): a page
+ * through PageManager, later a search result or an add-on's list. Export
+ * starts from the thing (operator, 2026-10-28): the source says what kind of
+ * items it yields, and only the `out` shims that can make a file from that
+ * kind are offered.
+ */
+export interface IceExportSource {
+  name: string;
+  label?: string;
+  /** The kind of the items it yields, e.g. `ncm` for a page. */
+  yields: IceKind;
+  /** Make the export a zip with this name (`search-results`) even when it holds one file. */
+  zipAs?: string;
+  /**
+   * Would this context be allowed to export `ref`? Asked only to decide
+   * whether to offer the Export action: an affordance, which records nothing.
+   * The owner's existing read rule (D5).
+   */
+  mayExport(ref: string, ctx: ActorContext): Promise<boolean>;
+  /**
+   * Read `ref` for export as `ctx`: the door. It checks the owner's existing
+   * permission, records what its owner records, and answers null when the
+   * thing is not there or `ctx` may not export it, without telling the two apart.
+   */
+  read(ref: string, ctx: ActorContext, info: ExportReadInfo): Promise<IceItem[] | null>;
+  /**
+   * Record how an export of `ref` ended, as its owner records exports: once
+   * the run has ended, with the file made or not. Also called, as a failure,
+   * when what was read is not exported (too large, the site too busy).
+   * Optional; a record that fails is logged, never thrown.
+   */
+  recordExport?(ref: string, ctx: ActorContext, outcome: ExportOutcome): Promise<void>;
+}
+
+/** How an export ended, for its source's record (#2120). */
+export interface ExportOutcome {
+  /** The shim that made, or was to make, the file. */
+  format: string;
+  runId: string;
+  /** How many items the source read. */
+  count: number;
+  /** The names of the first items the source read, at most 200: `count` says how many there were. */
+  items: string[];
+  result: 'success' | 'failure';
+  /** Why it failed, as the user is told. */
+  reason?: string;
+}
+
+export interface RegisteredExportSource extends IceExportSource {
+  id: string;
+  owner: string;
+}
+
+/** A format the Export action offers: the shim that makes the file, and the shims before it. */
+export interface IceExportFormat {
+  /** The shim that makes the file, `core.pdf`. */
+  id: string;
+  label: string;
+  /** Every shim the export runs through, in order, ending with `id`. */
+  chain: string[];
+}
+
+/** One export, as a caller asks for it. */
+export interface IceExportRequest {
+  /** The export source's id, `core.pages`. */
+  source: string;
+  /** What to export, in the source's own terms: a page's name. */
+  ref: string;
+  /** The format: an id `exportFormatsFor` offered. */
+  format: string;
+}
+
+/** The file an export made, as its status shows it. */
+export interface IceExportFile {
+  name: string;
+  mediaType: string;
+  size: number;
+}
+
+export interface IceExportReport {
+  runId: string;
+  source: string;
+  ref: string;
+  format: string;
+  chain: string[];
+  /** Who it ran as: the only user who sees it or downloads its file. */
+  username: string;
+  state: 'queued' | 'running' | 'done' | 'failed';
+  startedAt?: string;
+  finishedAt?: string;
+  error?: string;
+  /** What the source says about what it read, such as how many items were left out. */
+  notes?: string[];
+  file?: IceExportFile;
+  /** When the file is let go (`ngdpbase.export.engine.keep-minutes`). */
+  expiresAt?: string;
 }

@@ -1,0 +1,463 @@
+/**
+ * `./server.sh update` (#2208).
+ *
+ * Runs the real server.sh against a throwaway git checkout whose `origin` is a
+ * bare repo in os.tmpdir(). npm, npx (pm2), curl, lsof, pgrep and pkill are
+ * stubs on PATH, so nothing here starts a server, touches a running pm2
+ * daemon, or reads ./data. The stub build fails when the checked-out commit
+ * has a BREAK_BUILD file, and the stub readiness check answers 503 when it has
+ * BREAK_READY; that is how a test makes an update fail. The stub curl plays
+ * an http site by default, or a TLS site when STUB_SCHEME is https: that one
+ * answers plain http with a 301, as #1163's redirect server does (#2241).
+ */
+
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { spawnSync } from 'child_process';
+
+const REPO_ROOT = path.resolve(__dirname, '..', '..');
+
+let tmp: string;
+let origin: string;
+let seed: string;
+let instance: string;
+let stubBin: string;
+let npmLog: string;
+let curlLog: string;
+
+// Under a git hook (husky's pre-push runs this suite) git exports GIT_DIR,
+// GIT_INDEX_FILE and friends, which would aim these commands at the real repo.
+const envWithoutGit = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_')));
+
+function runGit(cwd: string, args: string[]): ReturnType<typeof spawnSync> {
+  return spawnSync('git', ['-c', 'commit.gpgsign=false', '-c', 'tag.gpgsign=false', '-c', 'core.hooksPath=/dev/null', ...args], {
+    cwd,
+    encoding: 'utf8',
+    env: {
+      ...envWithoutGit,
+      GIT_AUTHOR_NAME: 'test',
+      GIT_AUTHOR_EMAIL: 'test@example.invalid',
+      GIT_COMMITTER_NAME: 'test',
+      GIT_COMMITTER_EMAIL: 'test@example.invalid'
+    }
+  });
+}
+
+function git(cwd: string, ...args: string[]): string {
+  // A commit or push from here must never reach this repository. Every
+  // command runs only once git confirms its repository is inside tmp.
+  if (args[0] !== 'init' && args[0] !== 'clone') {
+    const dir = String(runGit(cwd, ['rev-parse', '--absolute-git-dir']).stdout).trim();
+    if (!tmp || !dir.startsWith(fs.realpathSync(tmp))) throw new Error(`refusing git ${args[0]} outside the test dir: ${dir}`);
+  }
+  const r = runGit(cwd, args);
+  if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${String(r.stderr)}`);
+  return String(r.stdout).trim();
+}
+
+function stub(name: string, body: string): void {
+  const file = path.join(stubBin, name);
+  fs.writeFileSync(file, `#!/bin/bash\n${body}\n`);
+  fs.chmodSync(file, 0o755);
+}
+
+/** Commit a new version to origin, optionally with a marker file that breaks it. */
+function publish(version: string, marker?: 'BREAK_BUILD' | 'BREAK_READY'): string {
+  fs.writeFileSync(path.join(seed, 'package.json'), JSON.stringify({ name: 'fixture', version }));
+  for (const m of ['BREAK_BUILD', 'BREAK_READY']) fs.rmSync(path.join(seed, m), { force: true });
+  if (marker) fs.writeFileSync(path.join(seed, marker), '');
+  git(seed, 'add', '-A');
+  git(seed, 'commit', '-q', '-m', `v${version}`);
+  git(seed, 'tag', `v${version}`);
+  git(seed, 'push', '-q', '--tags', 'origin', 'master');
+  return git(seed, 'rev-parse', 'HEAD');
+}
+
+function update(...args: string[]): { status: number | null; out: string } {
+  return updateServing('http', ...args);
+}
+
+function updateServing(scheme: 'http' | 'https', ...args: string[]): { status: number | null; out: string } {
+  const r = spawnSync('bash', [path.join(instance, 'server.sh'), 'update', ...args], {
+    cwd: instance,
+    encoding: 'utf8',
+    env: {
+      PATH: `${stubBin}:${process.env.PATH}`,
+      HOME: process.env.HOME,
+      PORT: '39999',
+      UPDATE_READY_TIMEOUT: '2',
+      STUB_INSTANCE: instance,
+      STUB_PID: String(process.pid),
+      NPM_LOG: npmLog,
+      CURL_LOG: curlLog,
+      STUB_SCHEME: scheme
+    }
+  });
+  return { status: r.status, out: `${r.stdout}${r.stderr}` };
+}
+
+function npmCalls(): string[] {
+  return fs.existsSync(npmLog) ? fs.readFileSync(npmLog, 'utf8').trim().split('\n').filter(Boolean) : [];
+}
+
+beforeEach(() => {
+  tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ngdp-update-'));
+  origin = path.join(tmp, 'origin.git');
+  seed = path.join(tmp, 'seed');
+  instance = path.join(tmp, 'instance');
+  stubBin = path.join(tmp, 'bin');
+  npmLog = path.join(tmp, 'npm.log');
+  curlLog = path.join(tmp, 'curl.log');
+  fs.mkdirSync(stubBin);
+
+  git(tmp, 'init', '-q', '--bare', '-b', 'master', origin);
+  git(tmp, 'clone', '-q', origin, seed);
+  git(seed, 'symbolic-ref', 'HEAD', 'refs/heads/master');
+  fs.copyFileSync(path.join(REPO_ROOT, 'server.sh'), path.join(seed, 'server.sh'));
+  fs.chmodSync(path.join(seed, 'server.sh'), 0o755);
+  fs.writeFileSync(path.join(seed, '.gitignore'), 'dist/\nnode_modules/\n.ngdpbase*.pid\n');
+  publish('1.0.0');
+  git(tmp, 'clone', '-q', origin, instance);
+
+  // The build writes dist/ and records whether this commit should be ready.
+  stub('npm', [
+    'echo "$*" >> "$NPM_LOG"',
+    'if [ "$1 $2" = "run build" ]; then',
+    '  [ -f BREAK_BUILD ] && { echo "stub build failed"; exit 1; }',
+    '  mkdir -p dist/src && echo "" > dist/src/app.js',
+    '  if [ -f BREAK_READY ]; then touch dist/not-ready; else rm -f dist/not-ready; fi',
+    'fi',
+    'exit 0'
+  ].join('\n'));
+  // pm2 reports the app online, at a PID that exists (this test process). A
+  // test can leave the app stopped by writing "stopped" to the state file;
+  // pm2 start brings it back, pm2 delete (stop) takes it down.
+  const state = path.join(tmp, 'pm2-state');
+  stub('npx', [
+    `state="${state}"`,
+    'case "$3" in',
+    '  show) echo "status $(cat "$state" 2>/dev/null || echo online)" ;;',
+    '  start) echo online > "$state" ;;',
+    '  delete) echo stopped > "$state" ;;',
+    '  pid) echo "$STUB_PID" ;;',
+    'esac',
+    'exit 0'
+  ].join('\n'));
+  // The URL is the last argument. A TLS site answers plain http with a 301;
+  // an http site fails the TLS handshake, which curl reports as 000.
+  stub('curl', [
+    'echo "$*" >> "$CURL_LOG"',
+    'url="${@: -1}"',
+    'case "$STUB_SCHEME:$url" in',
+    '  https:http://*) echo -n 301; exit 0 ;;',
+    '  http:https://*) echo -n 000; exit 35 ;;',
+    'esac',
+    '[ -f "$STUB_INSTANCE/dist/not-ready" ] && echo -n 503 || echo -n 200'
+  ].join('\n'));
+  stub('lsof', 'exit 1');
+  stub('pgrep', 'exit 1');
+  stub('pkill', 'exit 0');
+});
+
+afterEach(() => {
+  // Only ever the per-test temp dir — never a repo path.
+  if (tmp && tmp.startsWith(os.tmpdir())) fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+describe('./server.sh update (#2208)', () => {
+  it('fast-forwards to the tip of master, installs, builds and reports old → new', () => {
+    const oldSha = git(instance, 'rev-parse', 'HEAD');
+    const newSha = publish('1.1.0');
+
+    const r = update();
+
+    expect(r.status, r.out).toBe(0);
+    expect(git(instance, 'rev-parse', 'HEAD')).toBe(newSha);
+    expect(git(instance, 'symbolic-ref', '--short', 'HEAD')).toBe('master');
+    expect(npmCalls()).toEqual(['install', 'run build']);
+    expect(r.out).toContain(`1.0.0 (${oldSha.slice(0, 7)}) → 1.1.0 (${newSha.slice(0, 7)})`);
+  }, 60000);
+
+  it('leaves package-lock.json as committed when npm install rewrites it (#2519)', () => {
+    // npm install can rewrite the lockfile (it drops an entry the manifest
+    // does not list). The stub does the same, so the tree must be clean after.
+    fs.writeFileSync(path.join(seed, 'package-lock.json'), '{"lockfileVersion":3}\n');
+    publish('1.1.0');
+    stub('npm', [
+      'echo "$*" >> "$NPM_LOG"',
+      'if [ "$1" = "install" ]; then echo "{\\"lockfileVersion\\":3,\\"rewritten\\":true}" > package-lock.json; fi',
+      'if [ "$1 $2" = "run build" ]; then mkdir -p dist/src && echo "" > dist/src/app.js; fi',
+      'exit 0'
+    ].join('\n'));
+
+    const r = update();
+
+    expect(r.status, r.out).toBe(0);
+    expect(git(instance, 'status', '--porcelain')).toBe('');
+    expect(npmCalls()).toEqual(['install', 'run build']);
+  }, 60000);
+
+  it('checks out a named tag', () => {
+    const v11 = publish('1.1.0');
+    publish('1.2.0');
+
+    const r = update('v1.1.0');
+
+    expect(r.status, r.out).toBe(0);
+    expect(git(instance, 'rev-parse', 'HEAD')).toBe(v11);
+  }, 60000);
+
+  it('refuses a dirty tree and names the changes, before touching anything', () => {
+    const oldSha = git(instance, 'rev-parse', 'HEAD');
+    publish('1.1.0');
+    fs.writeFileSync(path.join(instance, 'local-notes.txt'), 'work in progress');
+
+    const r = update();
+
+    expect(r.status).not.toBe(0);
+    expect(r.out).toContain('uncommitted changes');
+    expect(r.out).toContain('local-notes.txt');
+    expect(git(instance, 'rev-parse', 'HEAD')).toBe(oldSha);
+    expect(npmCalls()).toEqual([]);
+  }, 60000);
+
+  it('refuses a non-fast-forward pull and never forces', () => {
+    publish('1.1.0');
+    fs.writeFileSync(path.join(instance, 'local.txt'), 'local commit');
+    git(instance, 'add', 'local.txt');
+    git(instance, 'commit', '-q', '-m', 'local');
+    const localSha = git(instance, 'rev-parse', 'HEAD');
+
+    const r = update();
+
+    expect(r.status).not.toBe(0);
+    expect(r.out).toContain('cannot be fast-forwarded');
+    expect(git(instance, 'rev-parse', 'HEAD')).toBe(localSha);
+    expect(npmCalls()).toEqual([]);
+  }, 60000);
+
+  it('rolls back to the old commit when the build fails, and starts it again', () => {
+    const oldSha = git(instance, 'rev-parse', 'HEAD');
+    publish('1.1.0', 'BREAK_BUILD');
+
+    const r = update();
+
+    expect(r.status).not.toBe(0);
+    expect(r.out).toContain('failed at: npm run build');
+    expect(r.out).toContain('Rolled back');
+    expect(git(instance, 'rev-parse', 'HEAD')).toBe(oldSha);
+    expect(git(instance, 'symbolic-ref', '--short', 'HEAD')).toBe('master');
+    expect(git(instance, 'status', '--porcelain')).toBe('');
+    expect(npmCalls()).toEqual(['install', 'run build', 'install', 'run build']);
+    expect(r.out).toContain('Server started');
+  }, 60000);
+
+  it('rolls back when the readiness check never answers 200', () => {
+    const oldSha = git(instance, 'rev-parse', 'HEAD');
+    publish('1.1.0', 'BREAK_READY');
+
+    const r = update();
+
+    expect(r.status).not.toBe(0);
+    expect(r.out).toContain('failed at: readiness check');
+    expect(r.out).toContain('Rolled back');
+    expect(git(instance, 'rev-parse', 'HEAD')).toBe(oldSha);
+    expect(fs.existsSync(path.join(instance, 'dist', 'not-ready'))).toBe(false);
+  }, 60000);
+
+  it('sees an https-only (TLS) site as ready and does not roll back (#2241)', () => {
+    const newSha = publish('1.1.0');
+
+    const r = updateServing('https');
+
+    expect(r.status, r.out).toBe(0);
+    expect(git(instance, 'rev-parse', 'HEAD')).toBe(newSha);
+    expect(r.out).toContain('Ready: https://localhost:39999/health/readiness');
+    expect(r.out).not.toContain('Rolled back');
+    const calls = fs.readFileSync(curlLog, 'utf8').trim().split('\n');
+    expect(calls[0]).toContain('-sk');
+    // Never follows the 301 to the public hostname.
+    expect(calls.every((c) => !/(^| )-[a-zA-Z]*L/.test(c))).toBe(true);
+  }, 60000);
+
+  it('falls back to http on a site without TLS', () => {
+    publish('1.1.0');
+
+    const r = updateServing('http');
+
+    expect(r.status, r.out).toBe(0);
+    expect(r.out).toContain('Ready: http://localhost:39999/health/readiness');
+    const calls = fs.readFileSync(curlLog, 'utf8').trim().split('\n');
+    expect(calls).toEqual([
+      expect.stringContaining('https://localhost:39999/health/readiness'),
+      expect.stringContaining('http://localhost:39999/health/readiness')
+    ]);
+  }, 60000);
+
+  it('rolls back a TLS site whose readiness answers 503, and reports both answers', () => {
+    const oldSha = git(instance, 'rev-parse', 'HEAD');
+    publish('1.1.0', 'BREAK_READY');
+
+    const r = updateServing('https');
+
+    expect(r.status).not.toBe(0);
+    expect(r.out).toContain('Last readiness answer: https 503, http 301');
+    expect(r.out).toContain('Rolled back');
+    expect(git(instance, 'rev-parse', 'HEAD')).toBe(oldSha);
+  }, 60000);
+
+  describe('when the commit and the build are unchanged (#2532)', () => {
+    const stampFile = (): string => path.join(instance, 'dist', '.built-from');
+    const curlCalls = (): string => (fs.existsSync(curlLog) ? fs.readFileSync(curlLog, 'utf8') : '');
+
+    it('does nothing on the second run at the same commit', () => {
+      const sha = publish('1.1.0');
+      const first = update();
+      expect(first.status, first.out).toBe(0);
+      expect(first.out).toContain('Updated:');
+      fs.rmSync(npmLog, { force: true });
+      fs.rmSync(curlLog, { force: true });
+
+      const second = update();
+
+      expect(second.status, second.out).toBe(0);
+      expect(second.out).toContain(`already at 1.1.0 (${sha.slice(0, 7)}), nothing to do`);
+      expect(npmCalls()).toEqual([]);
+      expect(curlCalls()).toBe('');
+      expect(second.out).not.toContain('Restarting');
+      expect(second.out).not.toContain('Server started');
+      expect(git(instance, 'status', '--porcelain')).toBe('');
+    }, 60000);
+
+    it('does nothing for a site that is online, with a matching build record', () => {
+      publish('1.1.0');
+      expect(update().status).toBe(0);
+      fs.writeFileSync(path.join(tmp, 'pm2-state'), 'online\n');
+      fs.rmSync(npmLog, { force: true });
+
+      const r = update();
+
+      expect(r.status, r.out).toBe(0);
+      expect(r.out).toContain('nothing to do');
+      expect(npmCalls()).toEqual([]);
+      expect(r.out).not.toContain('Server started');
+    }, 60000);
+
+    it('starts a stopped site without installing or building, when the build record matches', () => {
+      const sha = publish('1.1.0');
+      expect(update().status).toBe(0);
+      fs.writeFileSync(path.join(tmp, 'pm2-state'), 'stopped\n');
+      fs.rmSync(npmLog, { force: true });
+
+      const r = update();
+
+      expect(r.status, r.out).toBe(0);
+      expect(r.out).not.toContain('nothing to do');
+      expect(r.out).toContain('not running');
+      expect(r.out).toContain('Server started');
+      expect(r.out).toContain(`1.1.0 (${sha.slice(0, 7)})`);
+      expect(npmCalls()).toEqual([]);
+      expect(fs.readFileSync(path.join(tmp, 'pm2-state'), 'utf8').trim()).toBe('online');
+    }, 60000);
+
+    it('builds again when the build record is missing', () => {
+      publish('1.1.0');
+      expect(update().status).toBe(0);
+      fs.rmSync(stampFile(), { force: true });
+      fs.rmSync(npmLog, { force: true });
+
+      const r = update();
+
+      expect(r.status, r.out).toBe(0);
+      expect(r.out).not.toContain('nothing to do');
+      expect(npmCalls()).toEqual(['install', 'run build']);
+    }, 60000);
+
+    it('builds again when the build record is for another commit', () => {
+      publish('1.1.0');
+      expect(update().status).toBe(0);
+      fs.writeFileSync(stampFile(), `${'0'.repeat(40)}\n`);
+      fs.rmSync(npmLog, { force: true });
+
+      const r = update();
+
+      expect(r.status, r.out).toBe(0);
+      expect(r.out).not.toContain('nothing to do');
+      expect(npmCalls()).toEqual(['install', 'run build']);
+    }, 60000);
+
+    it('builds again when the built files are gone', () => {
+      publish('1.1.0');
+      expect(update().status).toBe(0);
+      fs.rmSync(path.join(instance, 'dist'), { recursive: true, force: true });
+      fs.rmSync(npmLog, { force: true });
+
+      const r = update();
+
+      expect(r.status, r.out).toBe(0);
+      expect(r.out).not.toContain('nothing to do');
+      expect(npmCalls()).toEqual(['install', 'run build']);
+    }, 60000);
+
+    it('still does the full job for a different ref, then skips that ref the next time', () => {
+      const v11 = publish('1.1.0');
+      publish('1.2.0');
+      expect(update().status).toBe(0);
+      fs.rmSync(npmLog, { force: true });
+
+      const back = update('v1.1.0');
+
+      expect(back.status, back.out).toBe(0);
+      expect(git(instance, 'rev-parse', 'HEAD')).toBe(v11);
+      expect(back.out).toContain('Updated:');
+      expect(npmCalls()).toEqual(['install', 'run build']);
+      fs.rmSync(npmLog, { force: true });
+
+      const again = update('v1.1.0');
+
+      expect(again.status, again.out).toBe(0);
+      expect(again.out).toContain('nothing to do');
+      expect(npmCalls()).toEqual([]);
+    }, 60000);
+
+    it('does not build the new commit as unchanged after a failed build', () => {
+      publish('1.1.0');
+      expect(update().status).toBe(0);
+      publish('1.2.0', 'BREAK_BUILD');
+      expect(update().status).not.toBe(0);
+      fs.rmSync(npmLog, { force: true });
+
+      const r = update();
+
+      // The broken commit is tried again, never skipped as "already built".
+      expect(r.status).not.toBe(0);
+      expect(r.out).not.toContain('nothing to do');
+      expect(npmCalls()).toContain('run build');
+    }, 60000);
+
+    it('records the rolled-back commit as built, so the next run on it does nothing', () => {
+      const oldSha = git(instance, 'rev-parse', 'HEAD');
+      publish('1.1.0', 'BREAK_BUILD');
+      expect(update().status).not.toBe(0);
+
+      expect(fs.readFileSync(stampFile(), 'utf8').trim()).toBe(oldSha);
+      const r = update(oldSha);
+      expect(r.status, r.out).toBe(0);
+      expect(r.out).toContain('nothing to do');
+    }, 60000);
+
+    it('still refuses a dirty tree when the commit is unchanged', () => {
+      publish('1.1.0');
+      expect(update().status).toBe(0);
+      fs.writeFileSync(path.join(instance, 'local-notes.txt'), 'work in progress');
+      fs.rmSync(npmLog, { force: true });
+
+      const r = update();
+
+      expect(r.status).not.toBe(0);
+      expect(r.out).toContain('uncommitted changes');
+      expect(r.out).not.toContain('nothing to do');
+    }, 60000);
+  });
+});

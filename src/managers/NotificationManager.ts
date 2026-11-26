@@ -11,6 +11,7 @@ import type { ActorContext } from '../context/ActorContext.js';
 import type EmailManager from './EmailManager.js';
 import type UserManager from './UserManager.js';
 import type PolicyDecisionPoint from '../security/PolicyDecisionPoint.js';
+import type { PluginFormatters } from './PluginManager.js';
 import { emailDomain, errorForLog } from '../utils/emailForLog.js';
 
 /**
@@ -149,7 +150,7 @@ class NotificationManager extends BaseManager {
     // Ensure data directory exists
     const dataDirPath = path.dirname(this.storagePath);
     const preflight = this.preflightConfiguredPath(
-      'ngdpbase.notifications.directory',
+      'ngdpbase.notifications.dir',
       dataDirPath
     );
     if (preflight.ok) {
@@ -270,9 +271,9 @@ class NotificationManager extends BaseManager {
 
   /** The identity store could not answer: nothing is converted this start, and the next start tries again (#2041). */
   private postponeConversion(why: string): void {
-    const reason = 'Notification recipients were not converted to identity @ids: identity store unavailable, conversion postponed to the next start (#2041)';
-    this.logger.warn(`${reason}: ${why}`);
-    this.markNeedsAttention(reason);
+    this.logger.warn(`Notification recipients were not converted to identity @ids: identity store unavailable, conversion postponed to the next start (#2041): ${why}`);
+    // #2354: the dashboard says it in plain words; the developer detail is in the line above.
+    this.markNeedsAttention('Some notifications still name their recipients the old way, because the contacts were not available when the site started. Restart the site to try again.');
   }
 
   /**
@@ -543,6 +544,38 @@ class NotificationManager extends BaseManager {
   }
 
   /**
+   * Delete every stored notification, expired or not, whose whole title is one of `titles` (#2468).
+   * A narrow tool for one job: the parser removes the old "MarkupParser Performance Alert: ..."
+   * notifications once their numbers are kept elsewhere, naming the three titles it used to write.
+   * It matches a title exactly, never a start of one, so another notification cannot be caught, and
+   * it refuses an empty list or an empty title, so it can never clear everything. It is not
+   * reachable from any route or screen.
+   * @param {readonly string[]} titles - The whole titles to delete; the list and each title must not be empty
+   * @returns {Promise<number>} Number of deleted notifications
+   */
+  async removeByTitles(titles: readonly string[]): Promise<number> {
+    if (!Array.isArray(titles) || titles.length === 0 || titles.some((t) => typeof t !== 'string' || t.length === 0)) {
+      throw new Error('removeByTitles needs a non-empty list of non-empty titles');
+    }
+    const wanted = new Set<string>(titles);
+    let removedCount = 0;
+
+    for (const [id, notification] of this.notifications.entries()) {
+      if (typeof notification.title === 'string' && wanted.has(notification.title)) {
+        this.notifications.delete(id);
+        removedCount++;
+      }
+    }
+
+    if (removedCount > 0) {
+      this.logger.info(`Removed ${removedCount} notifications with one of ${wanted.size} fixed titles`);
+      await this.saveNotifications();
+    }
+
+    return removedCount;
+  }
+
+  /**
    * Get notification statistics
    * @returns {NotificationStats} Statistics object
    */
@@ -590,9 +623,8 @@ class NotificationManager extends BaseManager {
       this.logger.warn('[NotificationManager] escalation.enabled=true but no from address configured — escalation emails will not send');
       return;
     }
-    this.logger.info('[NotificationManager] Email escalation active — levels: %s, role: %s',
-      configManager.getProperty('ngdpbase.notifications.escalation.levels', ['error']),
-      configManager.getProperty('ngdpbase.notifications.escalation.recipient-role', 'admin')
+    this.logger.info('[NotificationManager] Email escalation active — levels: %s, to: holders of admin-system',
+      configManager.getProperty('ngdpbase.notifications.escalation.levels', ['error'])
     );
   }
 
@@ -622,23 +654,29 @@ class NotificationManager extends BaseManager {
       return;
     }
 
-    const recipientRole = configManager.getProperty('ngdpbase.notifications.escalation.recipient-role', 'admin') as string;
     const userManager = this.engine?.getManager<UserManager>('UserManager');
     if (!userManager) return;
 
-    // #1179: an escalation fan-out is the system's act, not a person's — and
-    // search-user is a disclosive lookup, so the record says why it ran.
-    const recipients = await userManager.searchUsers('', { role: recipientRole }, scheduleContext(this.engine, `notification escalation: recipients holding ${recipientRole}`));
-    const withEmail = recipients.filter(u => u.email && u.email.includes('@'));
+    // #2196: the people an admin notice reaches, holders of admin-system asked
+    // of the PDP as notifyAdmins does, never a role name.
+    const admins = new Set((await this.engine?.getManager<PolicyDecisionPoint>('PolicyDecisionPoint')?.usersHolding('admin-system')) ?? []);
+    const withEmail = (await userManager.getUsers())
+      .filter(u => admins.has(u.username) && u.isActive !== false && u.email && u.email.includes('@'));
 
     if (withEmail.length === 0) {
-      this.logger.debug(`[NotificationManager] No ${recipientRole} users with email found for escalation`);
+      this.logger.debug('[NotificationManager] No holder of admin-system with an email address; nothing to escalate to');
       return;
     }
 
     const subject = `[${notification.level.toUpperCase()}] ${notification.title}`;
     const text = `${notification.title}\n\n${notification.message}\n\nLevel: ${notification.level}\nCreated: ${notification.createdAt.toISOString()}`;
-    const html = `<h2>${notification.title}</h2><p>${notification.message}</p><p><strong>Level:</strong> ${notification.level}<br><strong>Created:</strong> ${notification.createdAt.toISOString()}</p>`;
+    // Titles and messages can carry file names (#2191); escape with PluginManager's
+    // formatter (#1820, the one escapeHtml), then keep the line breaks. Its absence
+    // is a wiring fault, not a reason to send a value unescaped.
+    const formatters = this.engine?.getManager<{ formatters?: PluginFormatters }>('PluginManager')?.formatters;
+    if (!formatters) throw new Error('PluginManager is not available to escape the escalation email (#2191)');
+    const { escapeHtml } = formatters;
+    const html =`<h2>${escapeHtml(notification.title)}</h2><p>${escapeHtml(notification.message).replace(/\n/g, '<br>')}</p><p><strong>Level:</strong> ${notification.level}<br><strong>Created:</strong> ${notification.createdAt.toISOString()}</p>`;
 
     const sender = scheduleContext(this.engine, `notification escalation: email ${notification.level} notice`);
     for (const user of withEmail) {

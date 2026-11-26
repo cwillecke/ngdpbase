@@ -7,8 +7,6 @@
  *   POST /preferences       (updatePreferences)
  *   GET  /admin/backup      (adminBackupPage)
  *   POST /admin/backup/config (adminBackupConfig)
- *   POST /export/html/:page (exportPageHtml — error path)
- *   POST /export/markdown/:page (exportPageMarkdown — error path)
  */
 import express from 'express';
 import { ANONYMOUS_SUBJECT } from '../../managers/UserManager';
@@ -17,6 +15,8 @@ import path from 'path';
 import WikiRoutes, { signupRateLimiter } from '../WikiRoutes';
 import { UserCreateError } from '../../utils/userCreateError';
 import { readDoor } from './__fixtures__/pageReadDoor';
+import { PageWriteRefusedError } from '../../managers/PageManager';
+import { BackupFolderError } from '../../utils/backupFolder';
 
 vi.mock('../../utils/LocaleUtils', () => {
   const methods = {
@@ -144,10 +144,7 @@ const mockSearchManager = {
 
 const mockExportManager = {
   getExports: vi.fn(),
-  deleteExport: vi.fn(),
-  exportPageToHtml: vi.fn(),
-  saveExport: vi.fn(),
-  exportToMarkdown: vi.fn()
+  deleteExport: vi.fn()
 };
 
 // #1938: what the instance .env holds, byte for byte (no real secret).
@@ -160,6 +157,8 @@ const mockBackupManager = {
   getBackupHealth: vi.fn().mockResolvedValue(null), // #1563
   listBackups: vi.fn(),
   updateAutoBackupConfig: vi.fn(),
+  createBackup: vi.fn(),
+  backupArchive: vi.fn(), // #2492
   // #1723
   listStoredBackups: vi.fn(),
   isRestoreRunning: vi.fn(),
@@ -254,7 +253,9 @@ vi.mock('../../WikiEngine', () => {
           },
           TemplateManager: { getTemplates: vi.fn().mockResolvedValue([]) },
           VariableManager: { expandVariables: vi.fn().mockReturnValue('') },
-          SchemaManager: { getPerson: vi.fn().mockResolvedValue(null), getOrganization: vi.fn().mockResolvedValue(null) }
+          SchemaManager: { getPerson: vi.fn().mockResolvedValue(null), getOrganization: vi.fn().mockResolvedValue(null) },
+          // #1815: whose profile page it is — a stored author names the user by username here.
+          IdentityManager: { refersTo: vi.fn(async (_ctx: unknown, stored: unknown, username: string) => stored === username) }
         };
         return managers[name] ?? null;
       }),
@@ -334,9 +335,6 @@ function resetMocks() {
 
   mockExportManager.getExports.mockResolvedValue([]);
   mockExportManager.deleteExport.mockResolvedValue(undefined);
-  mockExportManager.exportPageToHtml.mockResolvedValue('<html>exported</html>');
-  mockExportManager.saveExport.mockResolvedValue('/tmp/test-export.html');
-  mockExportManager.exportToMarkdown.mockResolvedValue('# markdown');
 
   mockBackupManager.getAutoBackupStatus.mockResolvedValue({ enabled: false, time: '02:00', days: 'daily' });
   mockBackupManager.listBackups.mockResolvedValue([]);
@@ -817,6 +815,78 @@ describe('WikiRoutes — coverage batch 7', () => {
 
       // Old page is NOT deleted — the whole point of the demote.
       expect(mockPageManager.deletePage).not.toHaveBeenCalled();
+
+      // #1815 (decision 4): both saves are a system job through the door; the new page is the user's.
+      expect(newSave?.[3]).toMatchObject({ origin: 'boot' });
+      expect(newSave?.[3].username).not.toBe('adminuser');
+      expect(newSave?.[4]).toEqual({ createdFor: 'adminuser' });
+      expect(oldSave?.[3]).toBe(newSave?.[3]);
+    });
+
+    // Security review M2: the route's pageExists runs as the user, who may
+    // not see a page under the new name. The door refuses the system job's
+    // createdFor save of a page that exists (PageManager.writeDecision); here,
+    // that refusal ends the rename: an error, and the old page not demoted.
+    test('rename profile page: a new name taken by a page the user cannot see is refused, and nothing else is saved (#1815)', async () => {
+      const ownProfile = {
+        title: 'OldName',
+        uuid: 'old-profile-uuid',
+        content: '# Mine',
+        metadata: { title: 'OldName', uuid: 'old-profile-uuid', 'system-category': 'user-profile', author: 'adminuser' }
+      };
+      mockPageManager.getPage.mockImplementation((name: string) => Promise.resolve(name === 'OldName' ? ownProfile : null));
+      mockPageManager.pageExists.mockReturnValue(false);
+      const refusal: Error = new PageWriteRefusedError('Hidden Page', 'page-create');
+      mockPageManager.savePage.mockImplementation((name: string) =>
+        name === 'Hidden Page' ? Promise.reject(refusal) : Promise.resolve({ name }));
+
+      const res = await request(app)
+        .post('/profile')
+        .set('x-csrf-token', 'test-csrf-token')
+        .send({ profilePage: 'Hidden Page', originalProfilePage: 'OldName', renameProfilePage: 'on' });
+
+      expect(res.status).toBe(302);
+      expect(decodeURIComponent(res.headers.location)).toContain('page rename failed');
+      expect(mockPageManager.savePage).toHaveBeenCalledTimes(1);
+      expect(mockPageManager.savePage.mock.calls[0][4]).toEqual({ createdFor: 'adminuser' });
+    });
+
+    test('rename profile page: a page that is not the user\'s own profile is not renamed (#1815)', async () => {
+      const someoneElses = {
+        title: 'OldName',
+        uuid: 'other-uuid',
+        content: '# Not mine',
+        metadata: { title: 'OldName', uuid: 'other-uuid', 'system-category': 'user-profile', author: 'someoneelse' }
+      };
+      mockPageManager.getPage.mockImplementation((name: string) => Promise.resolve(name === 'OldName' ? someoneElses : null));
+      mockPageManager.pageExists.mockReturnValue(false);
+
+      const res = await request(app)
+        .post('/profile')
+        .set('x-csrf-token', 'test-csrf-token')
+        .send({ profilePage: 'NewName', originalProfilePage: 'OldName', renameProfilePage: 'on' });
+
+      expect(res.status).toBe(302);
+      expect(decodeURIComponent(res.headers.location)).toContain('not your profile page');
+      expect(mockPageManager.savePage).not.toHaveBeenCalled();
+    });
+
+    test('rename profile page: a page of the user\'s that is not a profile is not renamed (#1815)', async () => {
+      const ordinary = {
+        title: 'OldName',
+        uuid: 'ordinary-uuid',
+        content: '# Mine, but not a profile',
+        metadata: { title: 'OldName', uuid: 'ordinary-uuid', 'system-category': 'general', author: 'adminuser' }
+      };
+      mockPageManager.getPage.mockImplementation((name: string) => Promise.resolve(name === 'OldName' ? ordinary : null));
+      mockPageManager.pageExists.mockReturnValue(false);
+
+      await request(app)
+        .post('/profile')
+        .set('x-csrf-token', 'test-csrf-token')
+        .send({ profilePage: 'NewName', originalProfilePage: 'OldName', renameProfilePage: 'on' });
+
+      expect(mockPageManager.savePage).not.toHaveBeenCalled();
     });
   });
 
@@ -903,6 +973,99 @@ describe('WikiRoutes — coverage batch 7', () => {
         .set('x-csrf-token', 'test-csrf-token')
         .send({ autoBackup: 'on' });
       expect(res.status).toBe(403);
+    });
+  });
+
+  // ── #2492: an admin never sees a raw Node error from backups ────────────────
+
+  describe('no Node error text reaches the browser from the backup routes (#2492)', () => {
+    const RAW = /ENOENT|EACCES|EPERM|ENOTDIR|scandir|mkdir|no such file or directory|permission denied/i;
+    const rawError = () => Object.assign(new Error("ENOENT: no such file or directory, scandir '/Volumes/jims/data/backups'"), { code: 'ENOENT' });
+
+    test('Create and Download: a backup that fails sends the admin back to the Backup page with a plain message', async () => {
+      mockBackupManager.createBackup.mockRejectedValue(rawError());
+      const res = await request(app).post('/admin/backup/create').set('x-csrf-token', 'test-csrf-token');
+      expect(res.status).toBe(302);
+      const said = decodeURIComponent(res.headers.location);
+      expect(said).toMatch(/^\/admin\/backup\?error=\S/);
+      expect(said).not.toMatch(RAW);
+      expect(said).not.toContain('/Volumes/jims');
+      // What stays as it was.
+      expect(said).toMatch(/No backup was made/);
+      expect(said).toMatch(/earlier backups and the backup folder are unchanged/);
+    });
+
+    test('Save Configuration: a save that fails sends the admin back with a plain message', async () => {
+      mockBackupManager.updateAutoBackupConfig.mockRejectedValue(rawError());
+      const res = await request(app)
+        .post('/admin/backup/config')
+        .set('x-csrf-token', 'test-csrf-token')
+        .send({ autoBackup: 'on', directory: '/Volumes/jims/data/backups' });
+      expect(res.status).toBe(302);
+      expect(res.headers.location).toContain('error=');
+      expect(decodeURIComponent(res.headers.location)).not.toMatch(RAW);
+    });
+
+    test('a folder the site can reach is said as the backup code worded it, in both routes', async () => {
+      const plain = "The backup folder can't be reached by the site: /Volumes/jims/data/backups. Nothing was saved.";
+      mockBackupManager.createBackup.mockRejectedValue(new BackupFolderError(plain));
+      const created = await request(app).post('/admin/backup/create').set('x-csrf-token', 'test-csrf-token');
+      expect(created.status).toBe(302);
+      expect(decodeURIComponent(created.headers.location)).toBe(`/admin/backup?error=${plain} No backup was made. Your earlier backups and the backup folder are unchanged.`);
+      mockBackupManager.updateAutoBackupConfig.mockRejectedValue(new BackupFolderError(plain));
+      const saved = await request(app).post('/admin/backup/config').set('x-csrf-token', 'test-csrf-token').send({ section: 'folder', directory: '/Volumes/jims/data/backups' });
+      expect(decodeURIComponent(saved.headers.location)).toBe(`/admin/backup?error=${plain}`);
+    });
+
+    test('Create and Download: a backup that is made but cannot be sent says it was made, not that none was', async () => {
+      mockBackupManager.createBackup.mockResolvedValue('/b/2026-11-23T00-00-00-000Z-ngdpbase-backup.json.gz');
+      mockBackupManager.backupArchive.mockRejectedValue(Object.assign(new Error("ENOENT: no such file, open '/Volumes/jims/x'"), { code: 'ENOENT' }));
+      const res = await request(app).post('/admin/backup/create').set('x-csrf-token', 'test-csrf-token');
+      expect(res.status).toBe(302);
+      const said = decodeURIComponent(res.headers.location);
+      expect(said).toMatch(/The backup was made and kept in the backup folder, but the download could not be started/);
+      expect(said).not.toMatch(/No backup was made|ENOENT|\/Volumes\/jims/);
+    });
+
+    test('Create and Download: the message travels in the address, so the page escapes it and a folder path is never read as markup', async () => {
+      const path = '/mnt/<img src=x onerror=alert(1)>/backups';
+      mockBackupManager.createBackup.mockRejectedValue(new BackupFolderError(`The backup folder can't be reached by the site: ${path}.`));
+      const res = await request(app).post('/admin/backup/create').set('x-csrf-token', 'test-csrf-token');
+      expect(res.status).toBe(302);
+      expect(res.headers.location).not.toContain('<');
+      expect(decodeURIComponent(res.headers.location)).toContain(path);
+    });
+
+    test('Restore: a Node error from the restore is said in plain words, a refusal the manager wrote is kept', async () => {
+      mockBackupManager.startRestore.mockRejectedValue(rawError());
+      const raw = await request(app).post('/admin/backup/restore').set('x-csrf-token', 'test-csrf-token').send({ backup: 'b.json.gz', confirm: 'ngdpbase' });
+      expect(decodeURIComponent(raw.headers.location)).toMatch(/error=\S/);
+      expect(decodeURIComponent(raw.headers.location)).not.toMatch(RAW);
+      expect(decodeURIComponent(raw.headers.location)).not.toContain('/Volumes/jims');
+    });
+
+    test('Cancel restore: a Node error is said in plain words', async () => {
+      mockBackupManager.cancelStagedRestore.mockRejectedValue(rawError());
+      const res = await request(app).post('/admin/backup/restore/cancel').set('x-csrf-token', 'test-csrf-token').send({});
+      expect(decodeURIComponent(res.headers.location)).toMatch(/error=\S/);
+      expect(decodeURIComponent(res.headers.location)).not.toMatch(RAW);
+      expect(decodeURIComponent(res.headers.location)).not.toContain('/Volumes/jims');
+    });
+
+    test('the folder form says the folder is in use when backups are on, and that a restart is needed when they are not', async () => {
+      mockBackupManager.updateAutoBackupConfig.mockResolvedValue({ backupsLive: true });
+      const on = await request(app).post('/admin/backup/config').set('x-csrf-token', 'test-csrf-token').send({ section: 'folder', directory: '/app/data/backups' });
+      expect(decodeURIComponent(on.headers.location)).toBe('/admin/backup?success=Backup folder saved. Backups now go to it.');
+      mockBackupManager.updateAutoBackupConfig.mockResolvedValue({ backupsLive: false });
+      const off = await request(app).post('/admin/backup/config').set('x-csrf-token', 'test-csrf-token').send({ section: 'folder', directory: '/app/data/backups' });
+      const said = decodeURIComponent(off.headers.location);
+      expect(said).toMatch(/Backup folder saved\. Backups are switched off until the site is restarted/);
+      expect(said).not.toMatch(/Backups now go to it/);
+    });
+
+    test('the folder form saves only the folder', async () => {
+      await request(app).post('/admin/backup/config').set('x-csrf-token', 'test-csrf-token').send({ section: 'folder', directory: '/app/data/backups' });
+      expect(mockBackupManager.updateAutoBackupConfig).toHaveBeenCalledWith({ directory: '/app/data/backups' }, expect.anything());
     });
   });
 
@@ -1096,44 +1259,6 @@ describe('WikiRoutes — coverage batch 7', () => {
     test('a name that is not a stored backup is 404', async () => {
       const res = await request(app).get('/admin/backup/download/..%2F..%2Fetc%2Fpasswd');
       expect(res.status).toBe(404);
-    });
-  });
-
-  // ── POST /export/html/:page (exportPageHtml — error path) ───────────────────
-
-  describe('POST /export/html/:page (exportPageHtml)', () => {
-    test('returns 500 when exportPageToHtml throws', async () => {
-      mockExportManager.exportPageToHtml.mockRejectedValue(new Error('export failed'));
-      const res = await request(app)
-        .post('/export/html/TestPage')
-        .set('x-csrf-token', 'test-csrf-token');
-      expect(res.status).toBe(500);
-    });
-
-    test('returns 200 (download) when export succeeds', async () => {
-      const res = await request(app)
-        .post('/export/html/TestPage')
-        .set('x-csrf-token', 'test-csrf-token');
-      expect([200, 204]).toContain(res.status);
-    });
-  });
-
-  // ── POST /export/markdown/:page (exportPageMarkdown — error path) ────────────
-
-  describe('POST /export/markdown/:page (exportPageMarkdown)', () => {
-    test('returns 500 when exportToMarkdown throws', async () => {
-      mockExportManager.exportToMarkdown.mockRejectedValue(new Error('export failed'));
-      const res = await request(app)
-        .post('/export/markdown/TestPage')
-        .set('x-csrf-token', 'test-csrf-token');
-      expect(res.status).toBe(500);
-    });
-
-    test('returns 200 (download) when export succeeds', async () => {
-      const res = await request(app)
-        .post('/export/markdown/TestPage')
-        .set('x-csrf-token', 'test-csrf-token');
-      expect([200, 204]).toContain(res.status);
     });
   });
 });

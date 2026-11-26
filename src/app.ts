@@ -51,13 +51,14 @@ import { pageUrl } from './utils/pageUrl.js';
 import { jsonForScript } from './utils/jsonForScript.js';
 import { securityHeaders, cspModeOf, newCspNonce } from './utils/securityHeaders.js';
 import { checkSessionAccount, type AccountEndReason } from './utils/sessionAccount.js';
-import { effectiveIdleTimeoutMs, IDLE_STATUS_PATH } from './utils/sessionIdle.js';
+import { countsAsActivity, effectiveIdleTimeoutMs } from './utils/sessionIdle.js';
 import { anonymousSessionMs, checkSessionLimits, DEFAULT_ANONYMOUS_SESSION_MS, DEFAULT_SESSION_MAX_AGE_MS, sessionCapMs } from './utils/sessionLimits.js';
 import { throttlePerCopyWarning } from './utils/LoginThrottle.js';
 import { sweepOrphanedKeys } from './utils/privateStoreUnlock.js';
 import { endSession, type SessionEndReason } from './utils/sessionEnd.js';
 import type PageManager from './managers/PageManager.js';
 import type BackgroundJobManager from './managers/BackgroundJobManager.js';
+import type { StrongerSignInWays } from './managers/AuthManager.js';
 import { OIDC_INTERACTION_PREFIX, OIDC_MOUNT, type OidcManager } from './managers/OidcManager.js';
 import { registerOidcRoutes } from './routes/OidcRoutes.js';
 import { bearerProviderIds } from './utils/bearerProviders.js';
@@ -856,8 +857,7 @@ void (async (): Promise<void> => {
     aalCapFor?(username: string): Promise<1 | 2 | 3 | 0>;
     aalReachFor?(username: string): Promise<{ now: 1 | 2 | 3 | 0; ifEnrolled: 1 | 2 | 3 | 0 }>;
     rolesAwaitingEnrolment?(roles: readonly string[], reach: { now: number; ifEnrolled: number }): string[];
-    hasCredential?(username: string, kind: 'passkey'): boolean;
-    passkeyRelyingParty?(): unknown;
+    strongerSignInWays?(username: string): Promise<StrongerSignInWays>;
     subjectActingFor?(req: Request, self: NonNullable<Request['userContext']>): Promise<NonNullable<Request['userContext']>>;
     actingForChoices?(req: Request): { grants: unknown[] } | null;
     takeStepUpNotice?(req: Request): boolean;
@@ -884,7 +884,8 @@ void (async (): Promise<void> => {
 
     if (debugSession) {
       console.log('[SESSION-DEBUG] Session ID:', req.sessionID);
-      console.log('[SESSION-DEBUG] Session data:', JSON.stringify(req.session));
+      // The pending authenticator-app seed is sealed, but it is still not printed (#421).
+      console.log('[SESSION-DEBUG] Session data:', JSON.stringify(req.session, (k, v: unknown) => (k === 'totpEnrolment' ? '[redacted]' : v)));
       console.log('[SESSION-DEBUG] Session username:', req.session?.username);
     }
 
@@ -937,7 +938,7 @@ void (async (): Promise<void> => {
             : 'idle past ngdpbase.session.idle-timeout-minutes (#1546)');
         } else {
           if (verdict.stampSignedIn) req.session.signedInAt = now;
-          if (req.path !== IDLE_STATUS_PATH && verdict.touch) req.session.lastActivity = now;
+          if (countsAsActivity(req.path) && verdict.touch) req.session.lastActivity = now;
         }
       }
 
@@ -958,17 +959,21 @@ void (async (): Promise<void> => {
           // #1690: a role held below its level only because no factor is
           // enrolled — the person keeps it, and every page says to add one.
           const awaiting = reach ? authManagerForRoles?.rolesAwaitingEnrolment?.(sessionContext.roles ?? [], reach) ?? [] : [];
-          if (awaiting.length > 0) res.locals.aalEnrolNag = { roles: awaiting };
           // #2145: back from a fresh sign-in that could not redo the action; say it can be done now.
-          if (authManagerForRoles?.takeStepUpNotice?.(req)) res.locals.stepUpConfirmed = true;
-          const stepDown = authManagerForRoles?.rolesAtSignIn?.(sessionContext.roles ?? [], req.session.signIn?.aal ?? 1, aalCap);
-          if (stepDown && stepDown.steppedDown.length > 0) {
-            res.locals.aalStepDown = {
-              roles: stepDown.steppedDown,
-              hasPasskey: authManagerForRoles?.hasCredential?.(sessionContext.username, 'passkey') ?? false,
-              passkeysAvailable: Boolean(authManagerForRoles?.passkeyRelyingParty?.())
-            };
+          // #2360: read before the take clears it; only the fixed key the header knows is passed on.
+          const stepUpNote = req.session?.stepUpNote;
+          if (authManagerForRoles?.takeStepUpNotice?.(req)) {
+            res.locals.stepUpConfirmed = true;
+            if (stepUpNote === 'press-again') res.locals.stepUpNote = stepUpNote;
           }
+          const stepDown = authManagerForRoles?.rolesAtSignIn?.(sessionContext.roles ?? [], req.session.signIn?.aal ?? 1, aalCap);
+          // #2356: the banners name only what this account can add or use here,
+          // read for this request and this account, and only when one shows.
+          const ways = awaiting.length > 0 || (stepDown?.steppedDown.length ?? 0) > 0
+            ? await authManagerForRoles?.strongerSignInWays?.(sessionContext.username)
+            : undefined;
+          if (awaiting.length > 0) res.locals.aalEnrolNag = { roles: awaiting, ways };
+          if (stepDown && stepDown.steppedDown.length > 0) res.locals.aalStepDown = { roles: stepDown.steppedDown, ways };
           const self = {
             ...sessionContext,
             ...(stepDown ? { roles: stepDown.kept } : {}),
@@ -1087,6 +1092,8 @@ void (async (): Promise<void> => {
             ...subject,
             roles,
             ...(aalCap !== undefined ? { aalCap } : {}),
+            // #2287: a verified JWT that carries no level (not an agent token, no `aal`) has no `subject:aal`.
+            ...(!result.viaToken && result.aal === undefined ? { bearerWithoutLevel: true as const } : {}),
             ipAddress: req.ip,
             // #946: scopes ride on userContext so they reach both the ACL
             // scope gate and the save path (for via-token provenance) through
@@ -1245,6 +1252,12 @@ void (async (): Promise<void> => {
   //     Templates surface the token via getCommonTemplateData() as `csrfToken`;
   //     forms render `<input name="_csrf" value="<%= csrfToken %>">`;
   //     JS-driven fetches submit it via the `X-CSRF-Token` header.
+  // 6a'. The signed-out write gate (#2298): before the CSRF check and every route, so a
+  //      POST/PUT/PATCH/DELETE from someone not signed in gets one answer (sign-in redirect
+  //      or 401) whatever the route, unless it is on src/security/signedOutWrites.ts.
+  const { signedOutWriteGate } = await import('./middleware/signedOutWriteGate.js');
+  app.use(signedOutWriteGate(engine));
+
   const { csrfMiddleware } = await import('./middleware/csrf.js');
   app.use(csrfMiddleware);
 
@@ -1266,6 +1279,8 @@ void (async (): Promise<void> => {
   // same way (#1152), and is only known now that the add-ons have loaded.
   const reasonsBeforeAddons = new Set(engine.maintenance.reasons());
   await engine.initializeAddons();
+  // #2298: add-ons have declared their signed-out routes in register(); the list is closed.
+  (await import('./security/signedOutWrites.js')).sealSignedOutWrites();
   const addonBlocks = engine.maintenance.reasons().filter((r) => !reasonsBeforeAddons.has(r));
   // #1603: every document people are asked to accept, core's and the add-ons' just
   // registered, read once, so a missing one shows on the dashboard from start-up.
@@ -1273,6 +1288,18 @@ void (async (): Promise<void> => {
   if (addonBlocks.length > 0) {
     logger.error(`🚨 ${describeBlocked(addonBlocks)}`);
     logger.error('[startup] The instance is NOT serving content. Sign in at /admin for the notification that says how to fix it, then restart.');
+  }
+
+  // #1523 Q1: an enabled ngdpbase.auth.factors entry naming an id no provider
+  // could ever register (a typo) refuses the boot. Checked only now, so an id
+  // an add-on registers is known.
+  const unknownFactors = (engine.getManager('AuthManager') as { checkFactorIds?(): string[] } | null)
+    ?.checkFactorIds?.() ?? [];
+  if (unknownFactors.length > 0) {
+    console.error('🔥🔥🔥 FATAL: Refusing to start — ngdpbase.auth.factors names a sign-in provider that does not exist (#1523):');
+    for (const problem of unknownFactors) console.error(`  - ${problem}`);
+    console.error('Correct the entry\'s authproviderid in app-custom-config.json, or set "enabled": false on it, then restart.');
+    process.exit(1);
   }
 
   // #1523: every role's required-aal must be reachable by the sign-in factors
@@ -1286,7 +1313,7 @@ void (async (): Promise<void> => {
   if (unreachable.length > 0) {
     console.error('🔥🔥🔥 FATAL: Refusing to start — a role requires a sign-in level no available factor can reach (#1523):');
     for (const problem of unreachable) console.error(`  - ${problem}`);
-    console.error('Lower the role\'s required-aal, or enable a sign-in method that reaches it (a passkey, or the email link as a second factor), then restart.');
+    console.error('Lower the role\'s required-aal, or enable a sign-in method that reaches it (a passkey, with an https ngdpbase.application.base-url, or an authenticator app (TOTP) as a second factor, with NGDPBASE_CREDENTIALS_KEY set), then restart.');
     process.exit(1);
   }
 

@@ -1,7 +1,7 @@
 ---
 name: Private stores
 description: Developer and operator reference for private stores — layout, kinds, keys, access, pages, links, search, trash and files
-dateModified: 2026-10-25
+dateModified: 2026-11-22
 category: architecture
 relatedModules: [PageManager, AttachmentManager, SearchManager, PolicyInformationPoint, FileSystemProvider, VersioningFileProvider]
 ---
@@ -67,7 +67,7 @@ Every path is joined by a helper in the same module — `privateStoreRoot`, `pri
 
 ## Store kinds and the door
 
-A __store kind__ (a vault kind) is instance-wide; a user's directory under it is that user's container. Since [#1505](https://github.com/jwilleke/ngdpbase/issues/1505) a kind is a __system-category entry that declares a vault__, `storageLocation.privatestore` (see [system-category.md](system-category.md)); `ngdpbase.stores.{kind}` no longer defines kinds and nothing reads it. `storeKindFromConfig()` in `src/utils/privateStoreDoor.ts` returns, for a vault id:
+A __store kind__ (a vault kind) is instance-wide; a user's directory under it is that user's container. Since [#1505](https://github.com/jwilleke/ngdpbase/issues/1505) a kind is a __system-category entry that declares a vault__, `storageLocation.privatestore` (see [system-category.md](system-category.md)); `ngdpbase.stores.{kind}` no longer defines kinds and nothing reads it (a leftover `.owner` or `.encrypt` in the custom config is warned about at start and listed as needs-attention, [system-category.md](system-category.md#related-settings-that-are-not-per-system-category), #2246). `storeKindFromConfig()` in `src/utils/privateStoreDoor.ts` returns, for a vault id:
 
 - `id` — the vault id, the last folder of the entry's `privatestore` (`general` → `default`, `journal` → `journal`, `capture` → `capture`);
 - `encrypt` — the entry's `encrypt`, read strictly as a boolean (the string `"true"` is not a switch);
@@ -185,7 +185,7 @@ At startup `findPlaintextInSealedVaults` checks every sealed vault (sealed `stor
 
 ### Footnotes and comments
 
-A vault page's footnotes and comments are kept in its vault ([#1839](https://github.com/jwilleke/ngdpbase/issues/1839), operator 2026-10-16): `{store}/footnotes/{uuid}.json` and `{store}/comments/{uuid}/{id}.json`, read and written through the vault's store I/O. They are sealed exactly when its pages are, a locked vault refuses them for reads as well as writes, and a sealed kind's vault that hasn't been opened refuses them with `SealedVaultRefusedError`, as it refuses a save. A public page's stay where they were, in `ngdpbase.footnotes.storagedir` and `ngdpbase.comments.storagedir`.
+A vault page's footnotes and comments are kept in its vault ([#1839](https://github.com/jwilleke/ngdpbase/issues/1839), operator 2026-10-16): `{store}/footnotes/{uuid}.json` and `{store}/comments/{uuid}/{id}.json`, read and written through the vault's store I/O. They are sealed exactly when its pages are, a locked vault refuses them for reads as well as writes, and a sealed kind's vault that hasn't been opened refuses them with `SealedVaultRefusedError`, as it refuses a save. A public page's stay where they were, in `ngdpbase.footnotes.storagedir` and `ngdpbase.comments.storagedir`. A vault page's footnote never points at a shared source ([#2454](https://github.com/jwilleke/ngdpbase/issues/2454)): sources are shared across the site, so adding one to a vault page is refused, and a page that moves into a vault has its footnotes rewritten as page notes carrying the source's title and link, so nothing of the vault's footnotes names a source.
 
 `src/utils/pageNotes.ts` holds the rule. Where a page's notes are is decided by the page's __name__ (`pageNotesPath`): a vault page is in no shared index, so its uuid alone says nothing about where it is. `FootnoteManager` and `CommentManager` take the page as `{ name, uuid }` and the caller's context on every call.
 
@@ -259,11 +259,11 @@ The `PolicyInformationPoint` applies it in two places:
 
 ### What an administrator can and cannot see
 
-An administrator has no read, list, search, edit or upload access to another user's container, encrypted or not. Concretely:
+An administrator has no list, search or upload access to another user's container, and no access at all to an encrypted store. The one way in is at a door, to a vault that is not encrypted, when `ngdpbase.vaults.admin-access` is true (shipped true, [#2255](https://github.com/jwilleke/ngdpbase/issues/2255)): the `/vaults/…` page routes (`privatePageRoute()`, [#2413](https://github.com/jwilleke/ngdpbase/issues/2413)), the raw editor and the page door admit a holder of `admin-system` to read, change and delete its pages, and the page door records each access as `vault-admin-access`. With the key false, or for an encrypted vault, every non-owner is refused. Concretely:
 
 - no private page is in `page-index.json`, the shared search index, the link graph or the parse cache, so `/admin/deleted-pages`, site search and page lists have nothing to show
 - no private file is in `attachment-metadata.json`
-- `mayActInPrivateContainer` refuses every non-owner, so a direct URL is refused too
+- `mayActInPrivateContainer` refuses every non-owner, so a direct URL is refused too, except at a door for the administrator above (`mayEnterVaultAtDoor`)
 - for an encrypted store there is no key an administrator could hold: the KEK is wrapped by the owner's password and their 12 words
 
 Private page titles are kept out of logs and audit records by `src/utils/redactPrivateNames.ts`: a name in any of its three forms (plain, URL path, URL-encoded) keeps its owner and store and loses its title, so a line stays diagnosable without saying which page. Code that knows a page is private logs its uuid instead.
@@ -295,7 +295,7 @@ The routes, each behind `privatePageRoute()`:
 
 ### Titles and slugs
 
-A private title is unique __within its store__; a public title is unique among public pages. `FileSystemProvider.savePage` reads the destination store's own page index and refuses a clash with "A page with this title is already in use in this store" — a message that names no title, because it reaches the logs.
+A private title is unique __within its store__; a public title is unique among public pages. `FileSystemProvider.savePage` reads the destination store's own page index and refuses a clash with "A page with this title is already in use in this store" — a message that names no title, because it reaches the logs. A public clash is different: the save page says `A page called "<title>" already exists.` with the title linking to that page, and the editor's JSON reply carries the same text plus `conflictingPage` (`title`, `url`); the other page's id stays in the log only. The same goes for a new page, whose title gives the same slug as another page's: a title that differs only by case gets that text, and a different title with the same slug ("R&D Plans" and "R-D Plans") is told `That name is too close to the name of an existing page, "<title>".`, with the title linking to that page, and `conflictingPage` also carries `tooClose: true`.
 
 A private page's slug is `vaults--{owner}-{store}-{title-slug}` (`private--` until #1507; each vault's pages are re-saved once at boot to take the new form, `vault-slugs` in its `migrations.json`), made by `ValidationManager.generatePrivateSlug` and suffixed `-2`, `-3`… against the owner's own readable stores only (`privateSlugFor`). A locked store is not readable and not consulted, and nothing about another user is ever read.
 
@@ -477,17 +477,18 @@ It carries no `versions/`, `deleted/`, `pages-index.json`, `search-index.json`, 
 
 ### Importing a takeout
 
-`POST /my/takeout/import` ([#1472](https://github.com/jwilleke/ngdpbase/issues/1472)) takes a takeout back into one of the requester's own stores, on this instance or another. The door is `ImportManager.importOwnStoreTakeout`; `src/utils/privateStoreImport.ts` reads the takeout and `readZip` in `src/utils/zipArchive.ts` unpacks it, both in memory. Not `importPages`: that reads a server-side directory and converts every page.
+A takeout goes back into one of the requester's own stores, on this instance or another, on the import screen ([#2118](https://github.com/jwilleke/ngdpbase/issues/2118)). `/my/takeout` links to it (`/import?receiver=core.private-store`). The old `POST /my/takeout/import` route, `ImportManager.importOwnStoreTakeout` and `src/utils/privateStoreImport.ts` are gone ([#2187](https://github.com/jwilleke/ngdpbase/issues/2187)). The import engine does it: the shim `core.takeout` (`src/ice/shims/takeout.ts`) reads the takeout's layout from the zip the engine unpacks in memory, and the receiver `core.private-store` (`ImportManager.privateStoreReceiver`) writes it. Not `importPages`: that reads a server-side directory and converts every page.
 
-- Refused before any write when the store is not the requester's, does not exist (the default store always does), or is encrypted and locked in this session.
-- Files first, through `AttachmentManager.uploadAttachment` into the store; `/attachments/{oldId}` links in the pages are pointed at the ids the store holds, using `files-index.json`.
-- Pages through `PageManager.savePage`, uuid kept, so a sealed store encrypts on write.
-- Idempotent: a uuid already in the store is skipped (`unchanged`, or `changed-since-takeout` when the body differs — the live page wins); a uuid used elsewhere on the site is skipped as `uuid-elsewhere`, naming the page only when the requester may view it; a title held by a different page lands beside it as `Title (imported)`.
-- Every file comes in, even one whose pages were skipped; files no page now in the store links to are named in the importer's report and counted (never named) in the log and audit record (operator, 2026-09-25).
-- Each import saves its report as a private page in the target store, `{date time}-import-report` (e.g. `2026-09-25 11:40:12-import-report`): every page's outcome (linked), the files, the unlinked and the ignored. It is sealed exactly when the store is, so it names what the log and audit record may only count (operator, 2026-09-25). A re-import changes none of the imported content, but adds its own report page.
-- Capped by `ngdpbase.stores.import.maxsize` (256 MB), which bounds both the upload and what it unpacks to. Audited as `store-import`, with counts only.
+- Who may: the `account-security` permission, and only into the requester's own container. The screen offers the stores this session can write now, the default store included; an encrypted store that is locked is not offered, and an upload into one is refused before anything is written. A store the requester does not have is refused, not made.
+- Files go in through `FileManager.put` into the store; `/attachments/{oldId}` links in the pages are pointed at the ids the store holds, using `files-index.json`. A file a page links to is stored before the page. A zip kept in the store comes back as a file, whole.
+- Pages go in through `PageManager.savePage`, uuid kept, so a sealed store encrypts on write.
+- Importing the same takeout again changes nothing that is still there, and brings back a page or file deleted since (operator, 2026-10-30). A uuid already in the store is `duplicate`: unchanged, or changed since the download, and then the live page wins. A uuid used elsewhere on the site is `duplicate`, naming the page only when the requester may view it. A title held by a different page lands beside it as `Title (imported)`.
+- Every file comes in, even one whose pages were skipped. Files no page now in the store links to are counted in the log and audit record, never named there (operator, 2026-09-25).
+- Each run saves its report as a private page in the target store, `{date time}-import-report` (e.g. `2026-09-25 11:40:12-import-report`): every page's outcome (linked), the files, the unlinked and the ignored. It is sealed exactly when the store is, so it names what the log and audit record may only count (operator, 2026-09-25 and 2026-10-30). A re-import changes none of the imported content, but adds its own report page.
+- Confidential: an upload into this receiver runs during the request, with the request's key, and no page title or file name goes to a log, the import ledger or the audit record. The screen's recent-imports list shows a file of a sealed store by its fingerprint.
+- Limits: the files in one upload on the import screen add up to at most 256 MB as sent (`ngdpbase.import.engine.upload-max-bytes`), and a zip is unpacked up to `ngdpbase.import.engine.zip-max-depth` (3) deep. What the zips unpack to, and how many files they hold, are counted across the whole upload, the zips inside them included, and the upload is refused as a whole when either total is over its limit (each file's stated size and full name are counted before it is unpacked, and stay counted if the file or its archive then fails to read): 256 MB for a takeout (`ngdpbase.import.engine.takeout-zip-max-bytes`), and for every other import the engine's 256 MB (`ngdpbase.import.engine.zip-max-bytes`). A takeout may also hold 65,534 files in all (`ngdpbase.import.engine.takeout-zip-max-entries`) and files of 256 MB each (`ngdpbase.import.engine.takeout-max-file-bytes`); every other import keeps the engine's 10,000 files in all (`ngdpbase.import.engine.zip-max-entries`) and 100 MB a file (`ngdpbase.import.engine.max-file-bytes`). A file inside a zip over the file limit is not unpacked and is reported on its own; the rest of its zip is imported. Audited as `store-import`, with counts only, plus `owner`, `ownerUser`, `runId` and `leftOut`.
 
-It brings back pages and files, never history or trash, and not yet a takeout's footnotes and comments: they are listed as ignored.
+It brings back pages and files, never history or trash, and not yet a takeout's footnotes and comments: the run leaves them out.
 
 ---
 

@@ -498,7 +498,7 @@ audited.
 | `shared-folder-read` | A shared folder's page or file was opened (#2125): who, the folder and what. On by default: every read of a shared folder is recorded (#1775) | continue | yes |
 | `comment-delete` | Comment marked deleted; who removed it and whose it was (#1232) | continue | yes |
 | `vault-repair` | A vault page's leftovers moved into its vault (#1842): its shared-pool files (moved, or copied where other public pages use them) and its footnotes and comments from the public folders. Names the owner, vault and page uuid and the counts, never a title or file name. Run by the vault's owner, or for a vault that isn't sealed by someone holding admin-system | refuse | yes |
-| `footnote-edit` | A page's footnote list changed — action add, import, transfer, update or delete; page content written on someone's behalf (#1233) | continue | yes |
+| `footnote-edit` | A page's footnote list changed — action add, import, transfer, update or delete; page content written on someone's behalf (#1233) — or a shared footnote source was changed: action create (#2454) | continue | yes |
 | `page-link-rewrite` | Inbound links rewritten after a rename | continue | yes |
 | `token-revoke` | Agent token revoked | refuse | yes |
 | `proxy-revoke` | Proxy grant ended: revoked, or the account closed; user is the user represented, actor who ended it (#1762) | refuse | yes |
@@ -510,12 +510,14 @@ audited.
 | `recovery-words-export` | Recovery words still waiting to be confirmed were downloaded as a file or opened to print (#2144): who, which words (the shared folders' or a user's vault key), the set's id and how, never the words. Recorded before the words are sent, which cannot proceed without it | refuse | yes |
 | `shared-folder-key-create` | A shared folder's own key was made (#2124): which folder and who, never the key. Recorded before the key is saved, which cannot proceed without it | refuse | yes |
 | `shared-folder-create` | An administrator created a shared folder (#2125): which folder and who. Recorded before the folder is made, which cannot proceed without it | refuse | yes |
+| `shared-folder-access-change` | An administrator changed who may read and who may file in a shared folder on the Shared folders screen (#2126): which folder, who, and the roles before and after for each. Recorded once the folder's policies are written; a failed write is recorded as a failure, with the error, and a record that cannot be written puts the policies back | refuse | yes |
 | `proxy-switch` | A signed-in session started or stopped acting for someone under a proxy grant, or opens their private store: chosen, switched-back, ended because the grant no longer allows it (grant-ended, proxy-access-off), or vault-opened; user is the user represented, actor the user signed in (#1762) | continue | yes |
 | `authentication-success` | Sign-in succeeded | continue | yes |
 | `authentication-failed` | Sign-in failed | continue | yes |
 | `authentication-logout` | User signed out | continue | yes |
 | `authorization-deny` | Access denied | continue | yes |
 | `authorization-allow` | Access granted; emitter exists, nothing in production calls it | continue | yes |
+| `vault-admin-access` | An administrator read or changed a page inside another person's vault that is not encrypted (ngdpbase.vaults.admin-access, #2255): the administrator is the actor, and the vault's owner, the vault and the page are named | continue | yes |
 | `policy-evaluate` | Security policy evaluated; emitter exists, nothing in production calls it | continue | yes |
 | `security-event` | Security violation detected; the kind is in metadata.securityEventType | continue | yes |
 | `share-access` | Share link used; batched counts for keyword links, one record per page or file opened through a vault link (#1388) | continue | yes |
@@ -750,6 +752,17 @@ const page = await auditManager.searchEntriesAbout('jim', { limit: 50, offset: 0
 - `caller` (PermissionSubject): the request's subject. The PDP decides with it: `profile-manage` (every account holds it) when `caller.username` is `person`, `admin-system` for anyone else's. Under a proxy grant the subject's username is the user represented and the PDP bounds the answer by the grant. A refusal is `AuditQueryForbiddenError`.
 
 __Returns:__ the same page shape as `searchAuditLogs`. The database provider answers from indexed columns; the file provider from the records it holds in memory (the newest 10,000); a provider that cannot answer (the null provider) rejects rather than returning an empty page.
+
+#### authenticationRecord(id)
+
+One `authentication-success` record by its id ([#1523](https://github.com/jwilleke/ngdpbase/issues/1523)), for AuthManager's check of a remembered browser: its row names the record of the sign-in that remembered it.
+
+```javascript
+const record = await auditManager.authenticationRecord(device.auditId);
+// { id, user, loginMethod, amr } or null
+```
+
+__Returns:__ only those four fields, never the rest of the record, so it asks no caller. Null when there is no such record, it is not an `authentication-success`, or the provider cannot look one up. It reads through the provider's `findRecordById(id)`: the database provider by its unique `id` index (a queued record first); the file provider from its queue and memory, then the live log and its archives, newest first, parsing only a line that holds the id. The base provider, and so the null and cloud providers, answer null. `logAuthentication` returns `{ outcome, id }`, the id when the record was recorded, and writes a completed sign-in's `amr` into the record's `context`.
 
 #### getAuditStats(filters)
 

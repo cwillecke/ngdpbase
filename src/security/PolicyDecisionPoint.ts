@@ -43,13 +43,24 @@ interface StepUpDecider {
   liveProxyGrant?(grantId: string): { owner: string; proxy: string; permissions: string[] } | null;
 }
 import { permitsInVault } from '../utils/privateStoreAccess.js';
-import { formatPrivatePageName } from '../utils/privateStorePath.js';
+import { formatPrivatePageName, parsePrivatePageName } from '../utils/privateStorePath.js';
 import { RETIRED_PERMISSIONS, withRetiredExpanded } from '../utils/permissionCatalog.js';
 import { mixesProxyWithDelegation } from '../utils/proxyClaim.js';
-import { decisionSubject, type ActorContext } from '../context/ActorContext.js';
+import { actorOf, decisionSubject, isJobContext, type ActorContext } from '../context/ActorContext.js';
+import { systemContext } from '../context/bootActions.js';
+import { RESOURCE_MATCHERS } from '../managers/PolicyEvaluator.js';
+import { OwnedRecordError, ownerDeclarationProblem, type OwnedListAsk, type OwnedListDecision, type OwnedRecordAsk, type OwnedRecordFilter } from './ownedRecords.js';
+import { pageWriteAlternatives } from '../utils/permissionCatalog.js';
+import type { PageAttributes, SubjectFacts } from './PolicyInformationPoint.js';
+import { aalFactsOf } from '../utils/policyAttributes.js';
+import micromatch from 'micromatch';
+import { AUDIT_EVENT } from '../utils/auditEventNames.js';
+import { recordAuditEvent } from '../utils/auditEvents.js';
 
 export const POLICIES_KEY = 'ngdpbase.access.policies';
 export const POLICIES_ENABLED_KEY = 'ngdpbase.access.policies.enabled';
+/** Whether an administrator may enter another person's unencrypted vault (#2255). */
+export const VAULTS_ADMIN_ACCESS_KEY = 'ngdpbase.vaults.admin-access';
 
 /**
  * What `decide`, `permits` and `holds` take (#2022): the caller's own context
@@ -62,19 +73,38 @@ function isPolicy(obj: unknown): obj is Policy {
   return typeof obj === 'object' && obj !== null && 'id' in obj && typeof (obj as Policy).id === 'string';
 }
 
-/** The subject's current attributes are the PIP's (#1431 step 13). */
+/** The subject's current attributes are the PIP's (#1431 step 13), and so are a page's (#2255). */
 interface SubjectSourceLike {
   resolveSubjectNow(username: string, job?: string): Promise<{ username: string; roles: string[]; isAuthenticated: boolean }>;
   subjectFor(username: string): Promise<{ username: string; roles: string[]; isAuthenticated: boolean } | null>;
+  pageAttributes?(caller: unknown, pageName: string, knownMetadata?: Record<string, unknown> | null): Promise<PageAttributes>;
+  subjectAttribute?(subject: SubjectFacts, name: string): unknown;
+  environmentReader?(): (name: string) => unknown;
 }
+
+interface EvaluationLike { allowed: boolean; hasDecision?: boolean; reason?: string; policyName?: string | null; policyIds?: string[]; conditionNotMet?: string[] }
 
 interface PolicyEvaluatorLike {
   evaluateAccess(request: {
     pageName: string;
     action: string;
+    actions?: readonly string[];
     userContext: { username: string; roles: string[]; isAuthenticated: boolean };
     attributes?: Record<string, unknown>;
-  }): Promise<{ allowed: boolean; hasDecision?: boolean; reason?: string; policyName?: string | null }>;
+    readAttribute?: (name: string) => unknown;
+  }): Promise<EvaluationLike>;
+  evaluateDeclaredResource?(request: {
+    resourceType: string;
+    id: string;
+    action: string;
+    userContext?: { username: string; roles: string[]; isAuthenticated: boolean; job?: string };
+    readAttribute?: (name: string) => unknown;
+  }): Promise<EvaluationLike>;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
 }
 
 export class PolicyDecisionPoint extends BaseManager {
@@ -115,7 +145,8 @@ export class PolicyDecisionPoint extends BaseManager {
   }
 
   /**
-   * The policies in force right now, highest priority first.
+   * The policies in force right now, in configuration order. Order carries no
+   * meaning: the rule-combining algorithm is `deny-overrides` (#2330).
    *
    * - `ngdpbase.access.policies.enabled` false — its default when unset —
    *   means none;
@@ -137,8 +168,7 @@ export class PolicyDecisionPoint extends BaseManager {
         if (!p.actions?.some((a) => RETIRED_PERMISSIONS.has(a))) return p;
         this.warnRetiredOnce(p);
         return { ...p, actions: withRetiredExpanded(p.actions) };
-      })
-      .sort((a, b) => (b.priority || 0) - (a.priority || 0));
+      });
   }
 
   /**
@@ -156,8 +186,8 @@ export class PolicyDecisionPoint extends BaseManager {
    * What each role permits: role name → the actions its holders are granted.
    *
    * It mirrors the evaluator's ROLE matching — an allow policy naming a role
-   * grants its actions, a deny policy naming it takes them away, lower
-   * priority first so a higher-priority deny lands last and wins. It does not
+   * grants its actions, a deny policy naming it takes them away, whatever the
+   * order (deny-overrides, #2330). It does not
    * evaluate resource patterns or the ceilings, so it is a summary for a human
    * reading a table (the admin Security Policy Summary, a profile), never an
    * authorisation answer — that is {@link permits} with the caller's subject.
@@ -256,10 +286,11 @@ export class PolicyDecisionPoint extends BaseManager {
    * {@link permits}, which is "may it act now", and named so: an affordance
    * (show the reveal button, show the sign-in methods section) asks this, so a
    * person whose sign-in is not fresh still sees the way to the prompt that
-   * makes it fresh. A door never asks this.
+   * makes it fresh. A door never asks this. `on` asks it about a resource,
+   * as {@link decide} does (#2120: a vault page's export).
    */
-  async holds(subject: DecisionInput, action: string): Promise<boolean> {
-    return (await this.evaluate(subject, { action }, false)).permit;
+  async holds(subject: DecisionInput, action: string, on: Omit<DecisionRequest, 'action'> = {}): Promise<boolean> {
+    return (await this.evaluate(subject, { ...on, action }, false)).permit;
   }
 
   /**
@@ -407,7 +438,7 @@ export class PolicyDecisionPoint extends BaseManager {
 
     // #1762: a proxy claim is bounded first, and alone — never together with
     // a token or a share, which no legitimate request carries.
-    if (subject?.viaProxy) return this.proxyCeiling(subject, action);
+    if (subject?.viaProxy) return this.proxyCeiling(subject, request);
 
     const viaToken = subject?.viaToken;
     if (viaToken && !withRetiredExpanded(viaToken.scopes).includes(action)) {
@@ -415,7 +446,7 @@ export class PolicyDecisionPoint extends BaseManager {
         `[PDP] token ${viaToken.id} ("${viaToken.name}") lacks scope '${action}' ` +
         `(has: ${viaToken.scopes.join(',') || 'none'}) — denied`
       );
-      return { permit: false, applicable: true, reason: 'token_scope_deny' };
+      return { permit: false, applicable: true, reason: 'token_scope_deny', policyIds: [] };
     }
 
     const viaShare = subject?.viaShare;
@@ -427,15 +458,15 @@ export class PolicyDecisionPoint extends BaseManager {
       const coverage = request.resourceCoverage;
       if (coverage && !coverage(viaShare.resources)) {
         logger.info(`[PDP] share ${viaShare.id} does not cover ${request.resource?.type ?? 'resource'} '${request.resource?.id ?? ''}' — denied`);
-        return { permit: false, applicable: true, reason: 'share_resource_deny' };
+        return { permit: false, applicable: true, reason: 'share_resource_deny', policyIds: [] };
       }
       if (!viaShare.actions.includes(action)) {
         logger.info(`[PDP] share ${viaShare.id} does not delegate '${action}' (has: ${viaShare.actions.join(',') || 'none'}) — denied`);
-        return { permit: false, applicable: true, reason: 'share_action_deny' };
+        return { permit: false, applicable: true, reason: 'share_action_deny', policyIds: [] };
       }
       if (viaShare.expiresAt && Date.now() > Date.parse(viaShare.expiresAt)) {
         logger.info(`[PDP] share ${viaShare.id} expired ${viaShare.expiresAt} — denied`);
-        return { permit: false, applicable: true, reason: 'share_expired' };
+        return { permit: false, applicable: true, reason: 'share_expired', policyIds: [] };
       }
       // #1539: a vault link delegates what its issuer holds IN that vault.
       const sharedVault = vaultOfShare(viaShare.resources);
@@ -444,15 +475,15 @@ export class PolicyDecisionPoint extends BaseManager {
         : await this.userHoldsPermission(viaShare.issuer, action);
       if (!issuerHolds) {
         logger.info(`[PDP] share ${viaShare.id}: issuer ${viaShare.issuer} no longer holds '${action}' — denied`);
-        return { permit: false, applicable: true, reason: 'share_issuer_deny' };
+        return { permit: false, applicable: true, reason: 'share_issuer_deny', policyIds: [] };
       }
       // #1222: for a capability question the share IS the policy, and this is
       // an allow. A page question keeps going — a share visitor is an
       // anonymous visitor, and the page's own rules still have their say.
-      return { permit: true, applicable: true, reason: 'share' };
+      return { permit: true, applicable: true, reason: 'share', policyIds: [] };
     }
 
-    return viaToken ? { permit: true, applicable: true, reason: 'token_scope_ok' } : null;
+    return viaToken ? { permit: true, applicable: true, reason: 'token_scope_ok', policyIds: [] } : null;
   }
 
   /**
@@ -477,11 +508,12 @@ export class PolicyDecisionPoint extends BaseManager {
    * policy alone — because step-up is asked of this subject, with the actor's
    * own sign-in, once policy has said yes.
    */
-  private async proxyCeiling(subject: PermissionSubject | JobSubject, action: string): Promise<Decision> {
+  private async proxyCeiling(subject: PermissionSubject | JobSubject, request: DecisionRequest): Promise<Decision> {
+    const { action } = request;
     const claim = subject.viaProxy;
     const refuse = (reason: string, why: string): Decision => {
       logger.info(`[PDP] proxy grant ${claim?.grantId ?? '?'} (${claim?.actor ?? '?'} for ${subject.username}): ${why} — denied`);
-      return { permit: false, applicable: true, reason };
+      return { permit: false, applicable: true, reason, policyIds: [] };
     };
     if (!claim) return refuse('proxy_revoked', 'no claim');
     if (mixesProxyWithDelegation(subject)) return refuse('proxy_combined_deny', 'carries a token or share as well');
@@ -504,17 +536,34 @@ export class PolicyDecisionPoint extends BaseManager {
     if (!withRetiredExpanded(carried).includes(action)) {
       return refuse('proxy_scope_deny', `the grant does not carry '${action}'`);
     }
-    if (!(await this.actorHolds(claim.actor, action))) {
+    if (!(await this.actorHolds(claim.actor, request))) {
       return refuse('proxy_actor_deny', `${claim.actor} does not hold '${action}'`);
     }
-    return { permit: true, applicable: true, reason: 'proxy_scope_ok' };
+    return { permit: true, applicable: true, reason: 'proxy_scope_ok', policyIds: [] };
   }
 
-  /** Does the named actor HOLD `action` (policy alone, live)? Step-up is the proxy subject's question, not theirs. */
-  private async actorHolds(actor: string, action: string): Promise<boolean> {
+  /**
+   * Does the named actor HOLD the action (policy alone, live)? Step-up is the
+   * proxy subject's question, not theirs. Asked about the same page when the
+   * request names one (#2255), so an actor who may edit only some categories
+   * is asked about this page's.
+   *
+   * Inside a vault or a shared folder the actor is asked the bare capability,
+   * as before #2255 (#2267): the `vault` and `shared-folder` matchers assume
+   * the container rule proved the subject may be there, and for the actor it
+   * did not — the person represented passed it. Asked with the container, a
+   * reader actor would hold everything `vault-owner` holds in someone else's
+   * vault. The door (`permitsInVault`), the page door and the list filter all
+   * come through here, so they agree.
+   */
+  private async actorHolds(actor: string, request: DecisionRequest): Promise<boolean> {
     if (!actor || normalizeUsername(actor) === 'anonymous') return false;
     const subject = await this.informationPoint()?.subjectFor(actor);
-    return subject ? this.holds(subject, action) : false;
+    if (!subject) return false;
+    const { action, resource, attributes, pageMetadata } = request;
+    const inContainer = attributes?.vault !== undefined || attributes?.['shared-folder'] !== undefined ||
+      (resource?.type === 'page' && parsePrivatePageName(resource.id) !== null);
+    return inContainer ? this.holds(subject, action) : this.holds(subject, action, { resource, attributes, pageMetadata });
   }
 
   /**
@@ -553,13 +602,13 @@ export class PolicyDecisionPoint extends BaseManager {
     if (ceiling && !ceiling.permit) return ceiling;
     if (ceiling && ceiling.reason === 'share') {
       // #1635: a share is delegated, so it never satisfies a step-up permission.
-      return applyStepUp && this.stepUpRefuses(subject, action) ? { permit: false, applicable: true, reason: STEP_UP_REASON } : ceiling;
+      return applyStepUp && this.stepUpRefuses(subject, action) ? { permit: false, applicable: true, reason: STEP_UP_REASON, policyIds: [] } : ceiling;
     }
 
     const policyEvaluator = this.engine.getManager<PolicyEvaluatorLike>('PolicyEvaluator');
     if (!policyEvaluator) {
       logger.warn('[PDP] PolicyEvaluator not available, denying');
-      return { permit: false, applicable: false, reason: 'no_evaluator' };
+      return { permit: false, applicable: false, reason: 'no_evaluator', policyIds: [] };
     }
 
     let userContext: { username: string; roles: string[]; isAuthenticated: boolean };
@@ -570,7 +619,7 @@ export class PolicyDecisionPoint extends BaseManager {
       const pip = this.informationPoint();
       if (!pip) {
         logger.warn('[PDP] PolicyInformationPoint not available to resolve roles, denying');
-        return { permit: false, applicable: false, reason: 'no_information_point' };
+        return { permit: false, applicable: false, reason: 'no_information_point', policyIds: [] };
       }
       // #1999: a scheduled run names the job it acts as; the PIP decides who that is now.
       userContext = await (subject.job ? pip.resolveSubjectNow(subject.username, subject.job) : pip.resolveSubjectNow(subject.username));
@@ -589,25 +638,389 @@ export class PolicyDecisionPoint extends BaseManager {
     // translation lives here, in one line, until the evaluator moves to
     // resources — which is what lets assets and media stop inventing their own
     // paths. '*' is the capability form: the question is about the subject.
-    const result = await policyEvaluator.evaluateAccess({
-      pageName: request.resource?.id ?? '*',
-      action,
-      userContext,
-      attributes: request.attributes
-    });
+    const pageName = request.resource?.id ?? '*';
+    // #2255: a page write is granted as `page-<verb>` on the user categories
+    // and as `pushed-pages-<verb>` on the pushed ones; either is the right.
+    const actions = pageWriteAlternatives(action);
+    const pip = this.informationPoint();
+    // #2261: the resolved identity, and what bears on `subject:aal` copied from the subject asked about
+    // (a session's sign-in, a token's or a job's stored level), which the resolved context drops.
+    const facts = { ...aalFactsOf(subject), username: userContext.username, isAuthenticated: userContext.isAuthenticated };
+    // A subject attribute is read once per decision, however many policies name it.
+    const reads = new Map<string, unknown>();
+    const readSubject = (name: string): unknown => {
+      if (!reads.has(name)) reads.set(name, pip?.subjectAttribute?.(facts, name));
+      return reads.get(name);
+    };
+    // #2261: and the moment, read once per decision and shared by the page, the capability and the per-category asks.
+    const environment = pip?.environmentReader?.();
+    const readFacts = (name: string): unknown => (name.startsWith('environment:') ? environment?.(name) : readSubject(name));
+    let result: EvaluationLike;
+    if (request.resource?.type === 'page' && pageName !== '*') {
+      // #2255 (XACML): the PEP names the page; the PIP supplies what the
+      // policies read about it — its system-category and owner — from its id.
+      const page = await pip?.pageAttributes?.(input, pageName, request.pageMetadata);
+      result = await policyEvaluator.evaluateAccess({
+        pageName,
+        action,
+        actions,
+        userContext,
+        attributes: { ...request.attributes, ...page?.attributes },
+        readAttribute: (name) => (name.startsWith('resource:') ? page?.read(name.slice('resource:'.length)) : readFacts(name))
+      });
+    } else {
+      result = await policyEvaluator.evaluateAccess({ pageName, action, actions, userContext, attributes: request.attributes, readAttribute: readFacts });
+      // #2255: a page write asked with no page — a token's scope, a proxy
+      // grant, an affordance — holds when some category grants it.
+      if (!result.allowed && actions.length > 1 && !request.attributes) {
+        result = await this.onSomeCategory(policyEvaluator, userContext, action, actions, readFacts) ?? result;
+      }
+    }
     // `hasDecision` false means no policy spoke — NotApplicable, not a deny.
     // The page door has further tiers to try; a capability check has none, and
     // treats silence as a refusal, which is what `permit: false` says here.
     if (result.allowed && applyStepUp && this.stepUpRefuses(subject, action)) {
       // #1635: granted, but not fresh enough to act. Routes turn this reason
       // into the /auth/reauth prompt; a door just sees a refusal.
-      return { permit: false, applicable: true, reason: STEP_UP_REASON };
+      return { permit: false, applicable: true, reason: STEP_UP_REASON, policyIds: [] };
     }
     return {
       permit: result.allowed,
       applicable: result.hasDecision !== false,
-      reason: result.policyName ?? result.reason ?? (result.allowed ? 'policy_allow' : 'policy_deny')
+      reason: result.policyName ?? result.reason ?? (result.allowed ? 'policy_allow' : 'policy_deny'),
+      policyIds: result.policyIds ?? [],
+      ...(result.conditionNotMet?.length ? { conditionNotMet: result.conditionNotMet } : {})
     };
+  }
+
+  /**
+   * The first declared system category on which the policies permit a page
+   * write (#2255, decision 10), or null. Asked once per category, so a deny
+   * on one still wins there. Owner conditions are unknown here (no page), so
+   * a grant that needs the author does not count. Only enabled categories
+   * that are not bound to a location count (#2268): `shared` is a shared
+   * folder's, decided with the folder, and every account holds `vault-owner`,
+   * so counting it would give a reader every page write as a capability.
+   */
+  private async onSomeCategory(
+    evaluator: PolicyEvaluatorLike,
+    userContext: { username: string; roles: string[]; isAuthenticated: boolean },
+    action: string,
+    actions: readonly string[],
+    readFacts: (name: string) => unknown
+  ): Promise<EvaluationLike | null> {
+    for (const category of this.declaredCategories(true)) {
+      const r = await evaluator.evaluateAccess({
+        pageName: '*', action, actions, userContext,
+        attributes: { 'system-category': category },
+        readAttribute: (name) => (name.startsWith('resource:') ? undefined : readFacts(name))
+      });
+      if (r.allowed) return r;
+    }
+    return null;
+  }
+
+  /**
+   * Every system category the catalogue declares, core and add-ons, enabled
+   * or not, lowercased; with `inUse`, only those enabled and not bound to a
+   * shared folder (`storageLocation.sharedfolder`).
+   */
+  private declaredCategories(inUse = false): string[] {
+    const catalogue = this.engine.getManager<ConfigurationManager>('ConfigurationManager')?.getProperty('ngdpbase.system-category', {});
+    if (!catalogue || typeof catalogue !== 'object') return [];
+    return Object.entries(catalogue as Record<string, { label?: unknown; enabled?: unknown; storageLocation?: { sharedfolder?: unknown } }>)
+      .filter(([, entry]) => !inUse || (entry?.enabled !== false && entry?.storageLocation?.sharedfolder !== true))
+      .map(([key, entry]) => (typeof entry?.label === 'string' && entry.label ? entry.label : key).toLowerCase());
+  }
+
+  /**
+   * May an administrator enter `owner`'s vault (#2255,
+   * `ngdpbase.vaults.admin-access`)? Asked only after the container rule has
+   * refused someone who is not the owner. Yes when all hold:
+   *
+   * - the key is true, read now, on every request (shipped true);
+   * - the caller is a signed-in session or a job, not a share link, a proxy
+   *   or an agent token;
+   * - the caller holds `admin-system`;
+   * - the vault is not encrypted: an encrypted vault always needs its key,
+   *   whatever the key says, so it is not entered at all.
+   *
+   * `record` true (a door) writes `vault-admin-access` with the administrator
+   * as the actor and the owner, vault and page named; an affordance passes
+   * false and records nothing. Lists and search never ask this, so an
+   * administrator does not see other people's vault pages listed.
+   */
+  async adminMayEnterVault(ctx: ActorContext | null | undefined, owner: string, vault: string, resource: string, record = true): Promise<boolean> {
+    const configManager = this.engine.getManager<ConfigurationManager>('ConfigurationManager');
+    if (!ctx || configManager?.getProperty(VAULTS_ADMIN_ACCESS_KEY, false) !== true) return false;
+    if (!isJobContext(ctx) && (ctx.viaShare || ctx.viaProxy || ctx.viaToken)) return false;
+    if (!(await this.permits(ctx, 'admin-system'))) return false;
+    const shares = this.engine.getManager<{ isEncryptedVault?(owner: string, vault: string): Promise<boolean> }>('ShareManager');
+    // Not knowing is not unencrypted: without the answer, stay out.
+    const encrypted = shares?.isEncryptedVault ? await shares.isEncryptedVault(owner, vault).catch(() => true) : true;
+    if (encrypted) return false;
+    if (record) {
+      const who = actorOf(ctx);
+      await recordAuditEvent(
+        this.engine.getManager('AuditManager'),
+        {
+          eventType: AUDIT_EVENT.VAULT_ADMIN_ACCESS,
+          ...who,
+          action: 'vault-admin-access',
+          resource,
+          resourceType: 'page',
+          result: 'allow',
+          reason: `administrator inside ${owner}'s vault '${vault}' (ngdpbase.vaults.admin-access)`,
+          severity: 'medium',
+          metadata: { ...who.metadata, owner, vault }
+        },
+        (err) => logger.warn(`[PDP] audit of an administrator in ${owner}'s vault failed: ${err instanceof Error ? err.message : String(err)}`)
+      );
+    }
+    return true;
+  }
+
+  /**
+   * The declared system categories on which an allow policy grants `action`
+   * through the `system-category` resource type (#2255). The sitemap asks it
+   * with `pushed-pages-edit` to leave pushed pages out. A summary of the
+   * policies, never an answer to "may this subject".
+   */
+  /**
+   * May this subject act on one stored add-on record (#1823)?
+   *
+   * The manager passes attributes it read from the row. `owner` is the
+   * identity @id. A type that declares `owner` is allowed only when that @id
+   * is the subject's (the person a proxy grant represents, not the actor),
+   * and policy also allows the action. A role does not bypass the owner. A
+   * type with no `owner` is policy alone. A core type (`page`, `vault`, …)
+   * is not decided here. Missing data throws {@link OwnedRecordError}; the
+   * caller fails closed. This records nothing.
+   */
+  async decideOwnedRecord(input: DecisionInput, request: OwnedRecordAsk): Promise<Decision> {
+    // A policy glob cannot cover an id its own matcher rejects (empty, '.', '..', a line
+    // break), nor one with a path separator, so a deny on the type would not reach it. Test with
+    // the matcher and options PolicyEvaluator.namesDeclaredType uses (PR #2324 review, M2).
+    const id = request.resource.id;
+    if (typeof id !== 'string' || id.includes('/') || !micromatch.isMatch(id, '*', { dot: true }) || !micromatch.isMatch(id, '**', { dot: true })) throw new OwnedRecordError(`record id '${String(id)}' cannot be decided: it must be non-empty, contain no '/', no line break, and not be '.' or '..'`);
+    const prepared = await this.prepareOwned(input, request.action, request.resource.type);
+    if ('decision' in prepared) return prepared.decision;
+    const { subject, userContext } = prepared;
+    const entry = prepared.entry;
+    if (this.typeDeclaresOwner(entry)) {
+      const owner = this.storedOwner(request.resource.type, request.resource.attributes);
+      const mismatch = await this.ownerMismatch(userContext, owner);
+      if (mismatch) return mismatch;
+    }
+    const typeResult = await this.ownedTypeResult(request.resource.type, id, request.action, userContext, subject, request.resource.attributes ?? {});
+    if (typeResult.hasDecision && !typeResult.allowed) return this.decisionFrom(typeResult, false);
+    // Deny overrides allow across both forms: a deny written on `page *` or
+    // with no resources refuses a type allow too (PR #2324 review, M1).
+    const capability = await this.decide(input, { action: request.action });
+    if (!capability.permit && capability.applicable) return capability;
+    if (typeResult.hasDecision && typeResult.allowed) {
+      if (this.stepUpRefuses(subject, request.action)) return { permit: false, applicable: true, reason: STEP_UP_REASON, policyIds: [] };
+      return this.decisionFrom(typeResult, true);
+    }
+    return capability;
+  }
+
+  /**
+   * May this subject list a type, and which rows (#1823)?
+   *
+   * An allow for a type that declares `owner` carries one filter, `owner`
+   * equals the subject's identity @id. The manager binds that value; it is
+   * not SQL. An allow for a type with no owner carries an empty filter: policy
+   * alone, no row constraint. A refusal is `{ decision: 'deny' }`, never an
+   * empty filter and never an empty row set from this method. Missing data
+   * throws {@link OwnedRecordError}. This records nothing: the list is logged
+   * once by the manager that applies it.
+   */
+  async decideOwnedList(input: DecisionInput, request: OwnedListAsk): Promise<OwnedListDecision> {
+    const prepared = await this.prepareOwned(input, request.action, request.resource.type);
+    if ('decision' in prepared) return { decision: 'deny', reason: prepared.decision.reason, policyIds: prepared.decision.policyIds };
+    const { subject, userContext, entry } = prepared;
+    let ownerFilter: readonly OwnedRecordFilter[] = [];
+    if (this.typeDeclaresOwner(entry)) {
+      const who = await this.subjectOwnerId(userContext);
+      if (who.deny) return { decision: 'deny', reason: who.deny.reason, policyIds: who.deny.policyIds };
+      ownerFilter = [{ attribute: 'owner', operator: 'equals', values: [who.id] }];
+    }
+    const typeResult = await this.ownedTypeResult(request.resource.type, '*', request.action, userContext, subject, {});
+    if (typeResult.hasDecision && !typeResult.allowed) {
+      return { decision: 'deny', reason: typeResult.policyName ?? typeResult.reason ?? 'policy_deny', policyIds: typeResult.policyIds ?? [] };
+    }
+    // Deny overrides allow across both forms (PR #2324 review, M1).
+    const typeAllows = typeResult.hasDecision && typeResult.allowed;
+    const capability = await this.decide(input, { action: request.action });
+    if (!capability.permit && (capability.applicable || !typeAllows)) {
+      return { decision: 'deny', reason: capability.reason, policyIds: capability.policyIds };
+    }
+    if (typeAllows && this.stepUpRefuses(subject, request.action)) {
+      return { decision: 'deny', reason: STEP_UP_REASON, policyIds: [] };
+    }
+    return { decision: 'allow', filter: ownerFilter };
+  }
+
+  /**
+   * The ceilings, the declared type, and a reader for conditions. A ceiling
+   * denial is the whole answer. Anything that cannot be decided throws.
+   */
+  private async prepareOwned(
+    input: DecisionInput,
+    action: string,
+    type: string
+  ): Promise<{ subject: PermissionSubject | JobSubject | null; userContext: { username: string; roles: string[]; isAuthenticated: boolean; job?: string }; entry: { attributes?: Record<string, { type?: string }> } } | { decision: Decision }> {
+    if (typeof type !== 'string' || type === '') throw new OwnedRecordError('a record decision needs a resource type');
+    if (Object.hasOwn(RESOURCE_MATCHERS, type)) throw new OwnedRecordError(`resource type '${type}' is decided by its own door`);
+    const entry = this.ownedTypeEntry(type);
+    const subject = decisionSubject(input) ?? null;
+    // A share delegates pages and assets, never an add-on's records, and its
+    // resources say nothing about them (PR #2324 review, M4).
+    if (subject?.viaShare) return { decision: { permit: false, applicable: true, reason: 'share_resource_deny', policyIds: [] } };
+    const ceiling = await this.ceiling(subject, { action, resource: { type, id: '*' } });
+    if (ceiling && !ceiling.permit) return { decision: ceiling };
+    const userContext = await this.ownedUserContext(subject);
+    if ('decision' in userContext) return userContext;
+    return { subject, userContext: userContext.userContext, entry };
+  }
+
+  private ownedTypeEntry(type: string): { attributes?: Record<string, { type?: string }> } {
+    const types = this.engine.getManager<ConfigurationManager>('ConfigurationManager')?.getProperty('ngdpbase.access.resource-types', null);
+    const map = asRecord(types);
+    const entry = map ? asRecord(map[type]) : null;
+    if (!map || !Object.hasOwn(map, type) || !entry) {
+      throw new OwnedRecordError(`resource type '${type}' is not declared in ngdpbase.access.resource-types`);
+    }
+    if (entry.attributes === undefined) return {};
+    // A malformed owner declaration must not make an owner type policy-alone (PR #2324 review, M3).
+    const ownerProblem = ownerDeclarationProblem(type, entry);
+    if (ownerProblem) throw new OwnedRecordError(ownerProblem);
+    const declared = asRecord(entry.attributes);
+    if (!declared) throw new OwnedRecordError(`resource type '${type}' has attributes that cannot be read`);
+    const attributes: Record<string, { type?: string }> = {};
+    for (const name of Object.keys(declared)) {
+      const decl = asRecord(declared[name]);
+      if (decl && typeof decl.type === 'string') attributes[name] = { type: decl.type };
+    }
+    return { attributes };
+  }
+
+  private typeDeclaresOwner(entry: { attributes?: Record<string, { type?: string }> }): boolean {
+    const owner = entry.attributes?.owner;
+    if (!owner) return false;
+    if (owner.type !== 'identity') throw new OwnedRecordError('owner is declared but not as an identity @id');
+    return true;
+  }
+
+  /** The owner the manager read. Missing on an owner-typed record cannot be decided. */
+  private storedOwner(type: string, attributes: Record<string, unknown> | undefined): string {
+    const owner = attributes?.owner;
+    if (typeof owner !== 'string' || owner === '') {
+      throw new OwnedRecordError(`resource type '${type}' declares owner, and the stored row has none`);
+    }
+    return owner;
+  }
+
+  private async ownerMismatch(
+    userContext: { username: string; roles: string[]; isAuthenticated: boolean; job?: string },
+    owner: string
+  ): Promise<Decision | null> {
+    const who = await this.subjectOwnerId(userContext);
+    if (who.deny) return who.deny;
+    if (who.id === owner) return null;
+    return { permit: false, applicable: true, reason: 'not-the-owner', policyIds: [] };
+  }
+
+  /** The subject's identity @id, or a denial when nobody is signed in. A signed-in subject with no identity cannot be decided. */
+  private async subjectOwnerId(
+    userContext: { username: string; roles: string[]; isAuthenticated: boolean; job?: string }
+  ): Promise<{ id: string; deny?: undefined } | { id?: undefined; deny: Decision }> {
+    if (userContext.isAuthenticated !== true || typeof userContext.job === 'string' || userContext.username === '' || userContext.username === 'anonymous') {
+      return { deny: { permit: false, applicable: true, reason: 'not-the-owner', policyIds: [] } };
+    }
+    const identities = this.engine.getManager<{ identityIdOf?(ctx: ActorContext, username: string): Promise<string | null> }>('IdentityManager');
+    if (typeof identities?.identityIdOf !== 'function') {
+      throw new OwnedRecordError('IdentityManager is not available, so the owner cannot be decided');
+    }
+    const id = await identities.identityIdOf(systemContext(this.engine, 'decide an add-on record: the subject identity @id (#1823)'), userContext.username);
+    if (typeof id !== 'string' || id === '') {
+      throw new OwnedRecordError(`no identity @id for '${userContext.username}', so the owner cannot be decided`);
+    }
+    return { id };
+  }
+
+  private async ownedUserContext(
+    subject: PermissionSubject | JobSubject | null
+  ): Promise<{ userContext: { username: string; roles: string[]; isAuthenticated: boolean; job?: string } } | { decision: Decision }> {
+    if (typeof subject === 'object' && subject !== null && 'resolveRolesNow' in subject) {
+      const pip = this.informationPoint();
+      if (!pip) return { decision: { permit: false, applicable: false, reason: 'no_information_point', policyIds: [] } };
+      const resolved = await (subject.job ? pip.resolveSubjectNow(subject.username, subject.job) : pip.resolveSubjectNow(subject.username));
+      return { userContext: resolved };
+    }
+    if (subject) return { userContext: { username: subject.username, roles: subject.roles, isAuthenticated: subject.isAuthenticated } };
+    return { userContext: { ...ANONYMOUS_SUBJECT } };
+  }
+
+  /**
+   * Condition values (#1823). A `resource:` attribute is the value the manager
+   * read from the stored row, never a request field. Subject and environment
+   * attributes come from the PIP.
+   */
+  private ownedReader(
+    subject: PermissionSubject | JobSubject | null,
+    userContext: { username: string; roles: string[]; isAuthenticated: boolean },
+    stored: Record<string, unknown>
+  ): (name: string) => unknown {
+    const pip = this.informationPoint();
+    const facts = { ...aalFactsOf(subject), username: userContext.username, isAuthenticated: userContext.isAuthenticated };
+    const reads = new Map<string, unknown>();
+    const environment = pip?.environmentReader?.();
+    return (name: string): unknown => {
+      if (name.startsWith('resource:')) {
+        const key = name.slice('resource:'.length);
+        return Object.hasOwn(stored, key) ? stored[key] : undefined;
+      }
+      if (name.startsWith('environment:')) return environment?.(name);
+      if (!reads.has(name)) reads.set(name, pip?.subjectAttribute?.(facts, name));
+      return reads.get(name);
+    };
+  }
+
+  private async ownedTypeResult(
+    type: string,
+    id: string,
+    action: string,
+    userContext: { username: string; roles: string[]; isAuthenticated: boolean; job?: string },
+    subject: PermissionSubject | JobSubject | null,
+    stored: Record<string, unknown>
+  ): Promise<EvaluationLike> {
+    const evaluator = this.engine.getManager<PolicyEvaluatorLike>('PolicyEvaluator');
+    if (!evaluator?.evaluateDeclaredResource) throw new OwnedRecordError('PolicyEvaluator is not available, so the record cannot be decided');
+    return evaluator.evaluateDeclaredResource({
+      resourceType: type,
+      id,
+      action,
+      userContext,
+      readAttribute: this.ownedReader(subject, userContext, stored)
+    });
+  }
+
+  private decisionFrom(result: EvaluationLike, allowed: boolean): Decision {
+    return {
+      permit: allowed,
+      applicable: result.hasDecision !== false,
+      reason: result.policyName ?? result.reason ?? (allowed ? 'policy_allow' : 'policy_deny'),
+      policyIds: result.policyIds ?? [],
+      ...(result.conditionNotMet?.length ? { conditionNotMet: result.conditionNotMet } : {})
+    };
+  }
+
+  categoriesGranting(action: string): string[] {
+    const policies = this.policies().filter((p) => p.effect !== 'deny' && (p.actions ?? []).some((a) => a === action || a === '*'));
+    return this.declaredCategories().filter((category) => policies.some((p) =>
+      (p.resources ?? []).some((r) => r.type === 'system-category' && micromatch.isMatch(category, r.pattern))));
   }
 }
 

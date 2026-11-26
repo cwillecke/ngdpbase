@@ -4,7 +4,10 @@ import Ajv, { ValidateFunction, ErrorObject } from 'ajv';
 import addFormats from 'ajv-formats';
 import { WikiEngine } from '../types/WikiEngine.js';
 import type ConfigurationManager from './ConfigurationManager.js';
-import { declaredResourceTypes, SUBJECT_MATCHERS } from './PolicyEvaluator.js';
+import { combiningAlgorithmProblem, readDeclaredAsWritten, declaredEnvironmentAttributes, declaredSubjectAttributes, environmentAttributesProblems, subjectAttributesProblems } from '../utils/policyAttributes.js';
+import { readNarrowedWrites } from '../utils/pageWritePolicies.js';
+import { SENSITIVE_USER_FIELDS } from '../types/User.js';
+import { conditionAttributeSource, conditionProblems, declaredResourceTypes, SUBJECT_MATCHERS, VALUELESS_SUBJECT_TYPES } from './PolicyEvaluator.js';
 
 // CJS/ESM interop: Ajv lacks "exports" field; NodeNext treats default import as module namespace.
 // Cast to a constructable/callable type to work around NodeNext namespace typing restrictions.
@@ -19,7 +22,7 @@ const AjvCtor = Ajv as unknown as new (...args: unknown[]) => AjvLike;
 const applyFormats = addFormats as unknown as (ajv: AjvLike) => void;
 
 /**
- * Subject type: one the evaluator matches, `role` or `job` (#1999) —
+ * Subject type: one the evaluator matches, `role`, `job` (#1999), `authenticated` or `anyone` (#2261) —
  * `SUBJECT_MATCHERS` in PolicyEvaluator, not listed here. A policy naming any
  * other type would grant nothing, so it is refused.
  */
@@ -100,7 +103,6 @@ interface Policy {
   id: string;
   name: string;
   description?: string;
-  priority: number;
   effect: PolicyEffect;
   subjects: PolicySubject[];
   resources: PolicyResource[];
@@ -123,7 +125,7 @@ interface ValidationError {
  * Validation warning structure
  */
 interface ValidationWarning {
-  type: 'priority' | 'scope' | 'conditions' | 'conflict';
+  type: 'scope' | 'conditions' | 'conflict';
   field?: string;
   message: string;
   details?: unknown;
@@ -176,6 +178,14 @@ interface PolicySchema {
   type: string;
   required: string[];
   properties: Record<string, unknown>;
+}
+
+/** #2284: `authenticated` and `anyone` take neither a value nor a key; say which one to remove. */
+function valuelessSubjectProblem(subject: PolicySubject | null | undefined): string | null {
+  if (!subject || !VALUELESS_SUBJECT_TYPES.includes(subject.type)) return null;
+  if (subject.value !== undefined) return `'${subject.type}' takes no value; remove it`;
+  if (subject.key !== undefined) return `'${subject.type}' takes no key; remove it`;
+  return null;
 }
 
 /**
@@ -248,12 +258,6 @@ class PolicyValidator extends BaseManager {
             type: 'string',
             maxLength: 1000
           },
-          priority: {
-            type: 'number',
-            minimum: 0,
-            maximum: 1000,
-            default: 50
-          },
           effect: {
             type: 'string',
             enum: ['allow', 'deny']
@@ -277,7 +281,13 @@ class PolicyValidator extends BaseManager {
                   type: 'string'
                 }
               },
-              oneOf: [{ required: ['type', 'value'] }, { required: ['type', 'key', 'value'] }]
+              // #2261: `role` and `job` need a value; `authenticated` and `anyone` take none
+              // (a value on them is refused in validateBusinessLogic, with a message that says so).
+              oneOf: [
+                { required: ['type', 'value'], properties: { type: { not: { enum: VALUELESS_SUBJECT_TYPES } } } },
+                { required: ['type', 'key', 'value'], properties: { type: { not: { enum: VALUELESS_SUBJECT_TYPES } } } },
+                { properties: { type: { enum: VALUELESS_SUBJECT_TYPES } } }
+              ]
             }
           },
           resources: {
@@ -305,11 +315,13 @@ class PolicyValidator extends BaseManager {
           actions: {
             type: 'array',
             minItems: 1,
-            items: {
-              type: 'string',
-              enum: ['view', 'edit', 'delete', 'upload', 'download', 'admin', 'create', 'update']
-            }
+            // #2278: the actions are permission names (`page-edit`), not the old fixed verbs, so
+            // every shipped policy was refused by the enum that stood here.
+            items: { type: 'string', minLength: 1 }
           },
+          // #2255, #2261: the shape of the tree (operators, depth, types) is
+          // checked by conditionProblems, which can say what to change.
+          condition: { type: 'object' },
           conditions: {
             type: 'array',
             items: {
@@ -406,6 +418,94 @@ class PolicyValidator extends BaseManager {
   }
 
   /**
+   * The problems in a list of policies, each as `'<id>': <message>` (#2278):
+   * the schema's, unknown action names, then `conditionProblems`' (the boot warning's own messages).
+   * Used on save and on load in Admin → Configuration. Empty when all are fine.
+   *
+   * @param {unknown} policies - The value of `ngdpbase.access.policies`
+   * @returns {string[]} One line per problem
+   */
+  policyProblems(policies: unknown): string[] {
+    if (!Array.isArray(policies)) return ['the policies must be a list'];
+    // #2278: an action must be a defined permission (add-ons' included, the config layer merges
+    // them), else a mistyped deny never applies. `*` is the evaluator's wildcard.
+    const definitions = this.configManager?.getProperty('ngdpbase.permissions.definitions', null) as Record<string, unknown> | null;
+    if (!definitions || typeof definitions !== 'object' || Object.keys(definitions).length === 0) {
+      return ['the permission definitions (ngdpbase.permissions.definitions) could not be read, so the policies\' actions cannot be checked'];
+    }
+    const resourceTypes = this.configManager?.getProperty('ngdpbase.access.resource-types', null) as Record<string, { attributes?: Record<string, { type?: string }> }> | null;
+    const subjectAttributes = declaredSubjectAttributes(readDeclaredAsWritten(this.configManager, 'ngdpbase.access.subject-attributes'));
+    const environmentAttributes = declaredEnvironmentAttributes(readDeclaredAsWritten(this.configManager, 'ngdpbase.access.environment-attributes'));
+    return policies.flatMap((policy: unknown, index) => {
+      const id = typeof (policy as { id?: unknown } | null)?.id === 'string' ? (policy as { id: string }).id : `#${index + 1}`;
+      const schema = this.schemaValidatorCompiled && !this.schemaValidatorCompiled(policy)
+        ? this.formatSchemaErrors(this.schemaValidatorCompiled.errors || []).map((e) => `${e.field} ${e.message}`.trim())
+        : [];
+      const source = policy && typeof policy === 'object'
+        ? conditionAttributeSource((policy as { resources?: { type?: string }[] }).resources, resourceTypes)
+        : { attributes: resourceTypes?.page?.attributes ?? {}, label: 'page' };
+      const condition = policy && typeof policy === 'object' ? conditionProblems((policy as { condition?: unknown }).condition, source.attributes, subjectAttributes, environmentAttributes, source.label) : [];
+      const actions = Array.isArray((policy as { actions?: unknown } | null)?.actions) ? (policy as { actions: unknown[] }).actions : [];
+      const unknown = actions.filter((a) => typeof a === 'string' && a !== '*' && !Object.prototype.hasOwnProperty.call(definitions, a))
+        .map((a) => `action '${String(a)}' is not a defined permission; use a name from ngdpbase.permissions.definitions (add-on permissions included), or '*'`);
+      const subjects = Array.isArray((policy as { subjects?: unknown } | null)?.subjects) ? (policy as { subjects: unknown[] }).subjects : [];
+      const extra = subjects.map((sub) => valuelessSubjectProblem(sub as PolicySubject)).filter((m): m is string => !!m)
+        .map((m) => `subjects: ${m}`);
+      return [...schema, ...extra, ...unknown, ...condition].map((message) => `'${id}': ${message}`);
+    });
+  }
+
+  /**
+   * Problems in the removed page writes (`ngdpbase.access.narrowed-role-writes`): one plain-words message for
+   * each entry that is not a pair of a role and a write its shipped policy held, or for the whole value when
+   * it is not a list. Empty when it is fine or unset. A value that is not read narrows nothing, so it is
+   * refused on save rather than lifting a permission reduction without a sign.
+   */
+  narrowedWritesProblems(value: unknown): string[] {
+    return readNarrowedWrites(value).skipped;
+  }
+
+  /**
+   * The problems in the value of `ngdpbase.access.subject-attributes` (#2287):
+   * `id` and `aal` declared with another meaning (refused; the built-in is kept
+   * regardless), a bad type or source, a sensitive account field. For save and
+   * load in Admin → Configuration, and the boot warning. Empty when fine.
+   *
+   * @param {unknown} declared - The value of `ngdpbase.access.subject-attributes`
+   * @returns {string[]} One line per problem
+   */
+  subjectAttributeProblems(declared: unknown): string[] {
+    return subjectAttributesProblems(declared, SENSITIVE_USER_FIELDS);
+  }
+
+  /**
+   * The problems in the value of `ngdpbase.access.environment-attributes`
+   * (#2261): a type other than boolean, a source that is not `schedule:` or
+   * `config:`. Any configuration key may be read, so none is refused; no
+   * message holds a value. For save and load in Admin → Configuration, and the
+   * boot warning. Empty when fine.
+   *
+   * @param {unknown} declared - The value of `ngdpbase.access.environment-attributes`
+   * @returns {string[]} One line per problem
+   */
+  environmentAttributeProblems(declared: unknown): string[] {
+    return environmentAttributesProblems(declared);
+  }
+
+  /**
+   * The problems in the value of `ngdpbase.access.rule-combining-algorithm`
+   * (#2330): anything but `deny-overrides`. For save and load in Admin →
+   * Configuration; the boot check is the same sentence and stops the site.
+   *
+   * @param {unknown} value - The value of `ngdpbase.access.rule-combining-algorithm`
+   * @returns {string[]} One line per problem
+   */
+  combiningAlgorithmProblems(value: unknown): string[] {
+    const problem = combiningAlgorithmProblem(value);
+    return problem ? [problem] : [];
+  }
+
+  /**
    * Format JSON schema validation errors
    *
    * @param {ErrorObject[]} schemaErrors - Schema validation errors
@@ -433,7 +533,13 @@ class PolicyValidator extends BaseManager {
     // Check for duplicate subjects
     const subjectKeys = new Set<string>();
     policy.subjects.forEach((subject, index) => {
-      const key = `${subject.type}:${subject.value || subject.key}`;
+      const valueless = VALUELESS_SUBJECT_TYPES.includes(subject.type);
+      const extra = valuelessSubjectProblem(subject);
+      if (extra) {
+        errors.push({ type: 'business', field: `subjects[${index}]`, message: extra });
+      }
+      // #2284: a valueless type is one subject whatever extra fields it carries.
+      const key = valueless ? subject.type : `${subject.type}:${subject.value || subject.key || ''}`;
       if (subjectKeys.has(key)) {
         errors.push({
           type: 'business',
@@ -468,15 +574,6 @@ class PolicyValidator extends BaseManager {
       });
     }
 
-    // Validate priority range
-    if (policy.priority < 0 || policy.priority > 1000) {
-      errors.push({
-        type: 'business',
-        field: 'priority',
-        message: 'Priority must be between 0 and 1000'
-      });
-    }
-
     return errors;
   }
 
@@ -488,6 +585,15 @@ class PolicyValidator extends BaseManager {
    */
   validateSemantics(policy: Policy): ValidationError[] {
     const errors: ValidationError[] = [];
+
+    // #2255: a condition may read only declared attributes, of matching types.
+    const resourceTypes = this.configManager?.getProperty('ngdpbase.access.resource-types', null) as Record<string, { attributes?: Record<string, { type?: string }> }> | null;
+    const subjectAttributes = declaredSubjectAttributes(readDeclaredAsWritten(this.configManager, 'ngdpbase.access.subject-attributes'));
+    const environmentAttributes = declaredEnvironmentAttributes(readDeclaredAsWritten(this.configManager, 'ngdpbase.access.environment-attributes'));
+    const source = conditionAttributeSource(policy.resources, resourceTypes);
+    for (const message of conditionProblems((policy as { condition?: unknown }).condition, source.attributes, subjectAttributes, environmentAttributes, source.label)) {
+      errors.push({ type: 'semantic', field: 'condition', message });
+    }
 
     // Check for potentially conflicting conditions
     policy.conditions.forEach((condition, index) => {
@@ -536,21 +642,6 @@ class PolicyValidator extends BaseManager {
    */
   generateWarnings(policy: Policy): ValidationWarning[] {
     const warnings: ValidationWarning[] = [];
-
-    // Warn about very high or low priorities
-    if (policy.priority > 900) {
-      warnings.push({
-        type: 'priority',
-        message: 'Very high priority may override important security policies'
-      });
-    }
-
-    if (policy.priority < 10) {
-      warnings.push({
-        type: 'priority',
-        message: 'Very low priority may be overridden by other policies'
-      });
-    }
 
     // Warn about overly broad patterns
     policy.resources.forEach((resource, index) => {
@@ -644,34 +735,15 @@ class PolicyValidator extends BaseManager {
       const denyPolicies = group.filter((p) => p.effect === 'deny');
 
       if (allowPolicies.length > 0 && denyPolicies.length > 0) {
-        // Find highest priority policy
-        const highestPriority = Math.max(...group.map((p) => p.priority));
-        const highestPolicies = group.filter((p) => p.priority === highestPriority);
-
-        if (highestPolicies.length === 1) {
-          const winner = highestPolicies[0];
-          const losers = group.filter((p) => p.id !== winner.id);
-
-          warnings.push({
-            type: 'conflict',
-            message: `Policy ${winner.id} (${winner.effect}) overrides ${losers.map((p) => p.id).join(', ')} due to higher priority`,
-            details: {
-              winner: winner.id,
-              losers: losers.map((p) => p.id),
-              priority: winner.priority
-            }
-          });
-        } else {
-          errors.push({
-            type: 'conflict',
-            field: 'priority',
-            message: `Multiple policies with same highest priority: ${highestPolicies.map((p) => p.id).join(', ')}`,
-            details: {
-              policies: highestPolicies.map((p) => p.id),
-              priority: highestPriority
-            }
-          });
-        }
+        // Deny overrides (#2330): a matching deny wins, whatever the order.
+        warnings.push({
+          type: 'conflict',
+          message: `Deny ${denyPolicies.map((p) => p.id).join(', ')} overrides allow ${allowPolicies.map((p) => p.id).join(', ')}: any matching deny wins`,
+          details: {
+            winners: denyPolicies.map((p) => p.id),
+            losers: allowPolicies.map((p) => p.id)
+          }
+        });
       }
     });
 
@@ -784,6 +856,11 @@ class PolicyValidator extends BaseManager {
    * @returns {boolean} True if subjects match
    */
   subjectsMatch(s1: PolicySubject, s2: PolicySubject): boolean {
+    // #2284: `anyone` overlaps every subject; `authenticated` every one but anonymous.
+    if (s1.type === 'anyone' || s2.type === 'anyone') return true;
+    if (s1.type === 'authenticated' || s2.type === 'authenticated') {
+      return s1.type !== 'anonymous' && s2.type !== 'anonymous';
+    }
     if (s1.type !== s2.type) return false;
 
     switch (s1.type) {
@@ -795,6 +872,7 @@ class PolicyValidator extends BaseManager {
     case 'attribute':
       return s1.key === s2.key && s1.value === s2.value;
     case 'authenticated':
+    case 'anyone':
     case 'anonymous':
     case 'admin':
       return true; // These are global

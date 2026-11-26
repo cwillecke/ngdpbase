@@ -8,10 +8,27 @@ import {
   type EnvKeyMap,
   type PropertyDescription
 } from '../utils/configEnvKeys.js';
+import { randomBytes } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { WikiConfig } from '../types/Config.js';
 import logger from '../utils/logger.js';
-import BaseManager, { BackupData } from './BaseManager.js';
-import { configFilePaths, enabledEntries, installCompletePath, readConfigFilesSync } from '../utils/configFiles.js';
+import BaseManager, { BackupData, type ManagerStatus } from './BaseManager.js';
+import { configFilePaths, enabledEntries, installCompletePath, mergeArrays, readConfigFilesSync } from '../utils/configFiles.js';
+import {
+  migrateStoredPageWritePolicies,
+  NARROWED_WRITES_KEY,
+  narrowedRoleWrites,
+  narrowedWritesFromRecord,
+  clip,
+  readNarrowedWrites,
+  recordOfNarrowedWrites,
+  restoreNarrowedWrites,
+  withoutNarrowedWrites,
+  type AppliedNarrowing,
+  type NarrowedWrite
+} from '../utils/pageWritePolicies.js';
+import { legacyStoreKeys, legacyStoreKeysReason } from '../utils/legacyStoreKeys.js';
+import { backUpBeforeRewrite, clipText, stripPolicyPriority } from '../utils/upgradeLeftovers.js';
 import { mergeConfigWithAddons, type AddonDefaults } from '../utils/addonConfigLayer.js';
 import type { AddonDatabaseDeclaration } from '../utils/addonDatabaseRules.js';
 import type { WikiEngine } from '../types/WikiEngine.js';
@@ -29,6 +46,9 @@ import {
   splitAddonsPath,
   resolveAddonSlug
 } from '../utils/addonsPathResolver.js';
+
+/** The access policies setting, where the shipped role and category policies and a site's stored copies meet. */
+const POLICIES_KEY = 'ngdpbase.access.policies';
 
 interface ConfigManagerBackupData extends BackupData {
   customConfig: Partial<WikiConfig> | null;
@@ -74,6 +94,8 @@ class ConfigurationManager extends BaseManager {
   private defaultConfig: WikiConfig | null;
   private customConfig: Partial<WikiConfig> | null;
   private mergedConfig: WikiConfig | null;
+  /** #2279: counts every change to `mergedConfig`, so a reader may keep what it derived from a value until the next one. */
+  private revision = 0;
   /** #1638: shipped ⊕ enabled addons, before the operator's file — what the build declares. */
   private declaredConfig: WikiConfig | null;
   /** #1813: each enabled addon's own default-config.json, as folded into the merge. */
@@ -138,6 +160,7 @@ class ConfigurationManager extends BaseManager {
       this.assertContactPageNotLoop();
       this.assertContactRecipientWellFormed();
       this.assertConfiguredAddonsExist();
+      this.reportLegacyStoreKeys();
       logger.info(`ConfigurationManager initialized for environment: ${this.environment}`);
       logger.info(`Loaded configs: default + ${this.customConfig && Object.keys(this.customConfig).length > 0 ? 'custom' : 'no custom'}`);
     } catch (error) {
@@ -456,6 +479,17 @@ class ConfigurationManager extends BaseManager {
     // ngdpbase.filters.* namespace, same shape and for the same reason.
     this.migrateLegacyFilterNamespace();
 
+    // #2270: what the site removed from its stored role policies, read before the
+    // migration below rewrites them; applied to the category policies after the merge.
+    const detected = narrowedRoleWrites(this.customConfig?.[POLICIES_KEY]);
+
+    // #2255: a stored copy of a shipped role policy loses the page writes it
+    // held on every page; they now come from the category policies.
+    this.migrateStoredPageWritePolicies();
+
+    // #2466: the old `priority` on a stored rule changes nothing; take it out.
+    this.removePolicyPriorityFromCustomFile();
+
     // #1220: shipped ⊕ enabled addons' default-config.json ⊕ custom. The addon
     // layer sits beneath the operator's file, so an addon can add a permission
     // definition or a policy to the catalogs additively and the operator can
@@ -469,6 +503,8 @@ class ConfigurationManager extends BaseManager {
     const { merged, declared, addons, problems, refused, databases, siteCritical } = mergeConfigWithAddons(this.defaultConfig, this.customConfig, process.cwd(), this.instanceDataFolder);
     this.mergedConfig = merged;
     this.declaredConfig = declared;
+    this.stripPolicyPriorityFromMerged();
+    this.applyNarrowedRoleWrites(detected);
     this.addonLayers = addons;
     this.systemCategoryProblems = problems;
     this.refusedAddons = refused;
@@ -484,6 +520,212 @@ class ConfigurationManager extends BaseManager {
     if (this.environment === 'development' && !this.customConfig?.['ngdpbase.logging.level']) {
       this.mergedConfig['ngdpbase.logging.level'] = 'debug';
     }
+    this.revision++;
+  }
+
+  /**
+   * A number that changes whenever the configuration in force changes (#2279):
+   * a load or reload, a save, a reset, a restore, a runtime value an add-on
+   * sets. Equal numbers mean nothing was changed through this manager, so
+   * what a reader derived from `getProperty` then still holds. A value
+   * returned by `getProperty` must not be changed in place; that is the one
+   * change this cannot see.
+   */
+  getRevision(): number {
+    return this.revision;
+  }
+
+  /** What the #2255 page-write migration rewrote in memory, one sentence each; PolicyDecisionPoint reports it. */
+  pageWritePolicyMigration: string[] = [];
+  /** Each `pageWritePolicyMigration` line in plain words, for the needs-attention entry. */
+  pageWritePolicyMigrationShown: Record<string, string> = {};
+
+  /** Page writes the site removed from its stored role policies and the category policies leave out for it (#2270); the "After updating" item reads it. */
+  narrowedRoleWrites: AppliedNarrowing[] = [];
+
+  /**
+   * What the removed page writes (#2270) did to the site's own rules, and what could not be read of them; the
+   * "After updating" item reads it. Worked out again at every start and every save of the policy list or the
+   * pairs, so it stays until the site changes what causes it.
+   */
+  narrowingNotes: { ownRules: Array<{ id: string; role: string; actions: string[] }>; unreadable: string[] } = { ownRules: [], unreadable: [] };
+
+  /**
+   * #2270: what a site removed from its stored role policies, as recorded in its own setting
+   * (`NARROWED_WRITES_KEY`) plus `detected`, read from the file before the migration rewrote it. All of it is
+   * left out of every category policy in force, for that role only, so a policy added later, and one the site
+   * edits or deletes in Admin, cannot give it back. A newly detected narrowing is put in the in-memory custom
+   * layer, so the next save of the file, whichever setting it is for, records it; until then it is shown in
+   * Admin → After updating and logged, one warning per narrowed role policy.
+   */
+  private applyNarrowedRoleWrites(detected: NarrowedWrite[]): void {
+    this.narrowedRoleWrites = [];
+    this.narrowingNotes = { ownRules: [], unreadable: [] };
+    if (!this.mergedConfig) return;
+    const read = readNarrowedWrites(this.customConfig?.[NARROWED_WRITES_KEY]);
+    for (const reason of read.skipped) logger.warn(`[config] ${NARROWED_WRITES_KEY}: ${reason}. It is ignored, so it narrows nothing`);
+    const recorded = read.pairs;
+    const same = (a: NarrowedWrite, b: NarrowedWrite): boolean => a.role === b.role && a.action === b.action;
+    const fresh = detected.filter((n) => !recorded.some((r) => same(r, n)));
+    const all = [...recorded, ...fresh];
+    this.narrowingNotes.unreadable = read.skipped;
+    if (all.length === 0) return;
+    const { policies, applied } = withoutNarrowedWrites(this.mergedConfig[POLICIES_KEY], all, new Set());
+    this.mergedConfig[POLICIES_KEY] = policies;
+    this.noteOwnRules(applied, true);
+    if (fresh.length === 0) return;
+    const record = recordOfNarrowedWrites(all);
+    this.customConfig = this.customConfig ?? {};
+    this.customConfig[NARROWED_WRITES_KEY] = record;
+    this.mergedConfig[NARROWED_WRITES_KEY] = record;
+    this.narrowedRoleWrites = applied.filter((a) => fresh.some((n) => same(n, a)));
+    for (const policyId of new Set(this.narrowedRoleWrites.map((a) => a.policyId))) {
+      const mine = this.narrowedRoleWrites.filter((a) => a.policyId === policyId);
+      logger.warn(`[config] '${policyId}' in custom config lacks ${mine.map((a) => a.action).join(', ')}, which the shipped one had; the category policies no longer give ${mine[0].role} ${mine.length === 1 ? 'it' : 'them'} (${[...new Set(mine.flatMap((a) => a.from))].map(clip).join(', ')}). Save any setting in Admin → Configuration to record the change`);
+    }
+  }
+
+  /**
+   * #2270: the site's own rules, those in its custom policy list that differ from the declared (shipped and
+   * add-on) ones, that grant a write the site removed from a role. They are left out like the shipped ones;
+   * this notes each, so the site can see why a rule of its own does nothing. `log` writes one warning per rule.
+   */
+  private noteOwnRules(applied: AppliedNarrowing[], log: boolean): void {
+    const custom = this.customConfig?.[POLICIES_KEY];
+    const declared = this.declaredConfig?.[POLICIES_KEY];
+    const idOf = (p: unknown): unknown => (p && typeof p === 'object' ? (p as { id?: unknown }).id : undefined);
+    const ownIds = new Set(
+      (Array.isArray(custom) ? (custom as unknown[]) : [])
+        .filter((p) => typeof idOf(p) === 'string' && !(Array.isArray(declared) && (declared as unknown[]).some((d) => isDeepStrictEqual(d, p))))
+        .map((p) => idOf(p) as string)
+    );
+    const byRule = new Map<string, Map<string, Set<string>>>();
+    for (const a of applied) {
+      for (const id of a.from.filter((f) => ownIds.has(f))) {
+        const roles = byRule.get(id) ?? new Map<string, Set<string>>();
+        roles.set(a.role, (roles.get(a.role) ?? new Set<string>()).add(a.action));
+        byRule.set(id, roles);
+      }
+    }
+    this.narrowingNotes.ownRules = [...byRule].flatMap(([id, roles]) => [...roles].map(([role, actions]) => ({ id, role, actions: [...actions] })));
+    if (!log) return;
+    for (const id of byRule.keys()) {
+      const mine = this.narrowingNotes.ownRules.filter((r) => r.id === id);
+      logger.warn(`[config] The site's own rule '${clip(id)}' grants ${mine.map((r) => `${r.role} ${r.actions.join(', ')}`).join('; ')}, which the site removed from that role's rules, so it is left out. To give it back, take the pair out of the removed page writes in Admin → Configuration`);
+    }
+  }
+
+  /**
+   * #2255: before the merge, rewrite the custom layer's stored copies of the
+   * shipped role policies whose page writes moved to the category policies
+   * (`migrateStoredPageWritePolicies`). In memory only, like the other
+   * migrations here; one warning per policy changed.
+   */
+  private migrateStoredPageWritePolicies(): void {
+    const key = POLICIES_KEY;
+    if (!this.customConfig || !(key in this.customConfig)) return;
+    const { policies, report } = migrateStoredPageWritePolicies(this.customConfig[key]);
+    if (report.rewritten.length === 0) return;
+    this.customConfig[key] = policies;
+    this.pageWritePolicyMigration = report.rewritten;
+    this.pageWritePolicyMigrationShown = report.shown;
+    for (const line of report.rewritten) logger.warn(`[config] ${line}. Save the policy list in Admin → Configuration to store the change`);
+  }
+
+  /** The rules whose old `priority` the update removed from the site's own file (#2466), for the needs-attention entry. */
+  private priorityRulesRemoved: string[] = [];
+
+  /**
+   * #2466: the site's own policy rules in the custom file carry `priority`
+   * from before #2330, which changes nothing now. Take it out of the file and
+   * out of what the site reads, one log line per rule. The file is read afresh
+   * and only that key is changed, so nothing else in it is touched, and a copy
+   * of it as it was goes into `upgrade-backups` first. With no copy possible
+   * the file is left as it is and the next start tries again. A file with no
+   * `priority` is not opened for writing, so a second start changes nothing.
+   */
+  private removePolicyPriorityFromCustomFile(): void {
+    const key = POLICIES_KEY;
+    if (!this.customConfig || !(key in this.customConfig)) return;
+    const { policies, removed } = stripPolicyPriority(this.customConfig[key]);
+    if (removed.length === 0) return;
+    this.customConfig[key] = policies;
+    try {
+      const text = fs.readFileSync(this.customConfigPath, 'utf8');
+      const stored = JSON.parse(text) as Record<string, unknown>;
+      const fromFile = stripPolicyPriority(stored[key]);
+      if (fromFile.removed.length === 0) return;
+      stored[key] = fromFile.policies;
+      // Written whole to a file beside it first, so a full disk or a read-only folder shows before anything is copied, and the file is never half-written.
+      const temp = `${this.customConfigPath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+      let copy = '';
+      let made = false;
+      try {
+        // Created only if it is not there already, and flushed to disk before it replaces the file, so a crash leaves the old file or the whole new one.
+        const fd = fs.openSync(temp, 'wx', fs.statSync(this.customConfigPath).mode & 0o777);
+        made = true;
+        try {
+          fs.writeFileSync(fd, `${JSON.stringify(stored, null, 2)}\n`);
+          fs.fsyncSync(fd);
+        } finally {
+          fs.closeSync(fd);
+        }
+        copy = backUpBeforeRewrite(path.join(this.instanceDataFolder, 'upgrade-backups'), path.basename(this.customConfigPath), text);
+        fs.renameSync(temp, this.customConfigPath);
+      } catch (err) {
+        // The file is as it was, so a copy of it made a moment ago is not kept: a failing start would add one every time.
+        if (made) fs.rmSync(temp, { force: true });
+        if (copy) fs.rmSync(copy, { force: true });
+        throw err;
+      }
+      for (const id of fromFile.removed) logger.info(`[config] Removed the old priority from access rule '${clipText(id)}' in ${this.customConfigPath}; it changed nothing. The file as it was is saved as ${copy}`);
+      this.priorityRulesRemoved = fromFile.removed;
+    } catch (err) {
+      logger.warn(`[config] The old priority on ${removed.slice(0, 5).map((id) => `'${clipText(id)}'`).join(', ')}${removed.length > 5 ? ` and ${removed.length - 5} more` : ''} could not be removed from ${this.customConfigPath}, so the file is unchanged and this is tried again at the next start (it changes nothing): ${clipText(err)}`);
+    }
+  }
+
+  /** #2466: a rule from the default or an add-on's settings with a `priority`, dropped from what the site reads. Nothing is written. */
+  private stripPolicyPriorityFromMerged(): void {
+    if (!this.mergedConfig) return;
+    const { policies, removed } = stripPolicyPriority(this.mergedConfig[POLICIES_KEY]);
+    if (removed.length === 0) return;
+    this.mergedConfig[POLICIES_KEY] = policies;
+    // What the layers beneath hold, so a later save of the list does not bring the priority back.
+    if (this.declaredConfig) this.declaredConfig[POLICIES_KEY] = stripPolicyPriority(this.declaredConfig[POLICIES_KEY]).policies;
+    logger.info(`[config] Ignoring the old priority on access rule ${removed.slice(0, 5).map((id) => `'${clipText(id)}'`).join(', ')}${removed.length > 5 ? ` and ${removed.length - 5} more` : ''}; it changes nothing (#2466)`);
+  }
+
+  /**
+   * What this start changed that the administrator should know about (#2466),
+   * read live by `Engine.getDegradedManagers`. Empty when it changed nothing,
+   * so the next start shows none.
+   */
+  getAttentionItems(): ManagerStatus[] {
+    const names = this.priorityRulesRemoved;
+    if (names.length === 0) return [];
+    const one = names.length === 1;
+    return [{
+      state: 'degraded',
+      kind: 'attention',
+      reason: `The update cleaned up ${names.length} access ${one ? 'rule' : 'rules'}: it removed an old priority that never had any effect. Nothing about who can do what changed.`,
+      details: [
+        ...names.slice(0, 50).map((n) => `${clipText(n)}: removed an old priority that had no effect`),
+        ...(names.length > 50 ? [`and ${names.length - 50} more ${names.length - 50 === 1 ? 'rule' : 'rules'}`] : [])
+      ]
+    }];
+  }
+
+  /**
+   * #2246: `ngdpbase.stores.<kind>.owner|encrypt` in the custom config have
+   * been ignored since #1505. One warning per key, and one needs-attention
+   * entry naming them all. Nothing is changed, carried over or removed.
+   */
+  private reportLegacyStoreKeys(): void {
+    const found = legacyStoreKeys(this.customConfig, this.mergedConfig?.['ngdpbase.system-category']);
+    if (found.length === 0) return;
+    for (const f of found) logger.warn(`[config] ${f.message}`);
+    this.markNeedsAttention(legacyStoreKeysReason(found), found[0]?.key);
   }
 
   /**
@@ -691,6 +933,15 @@ class ConfigurationManager extends BaseManager {
   }
 
   /**
+   * `value` with its environment references resolved as `getProperty` would
+   * resolve it under `key`, for checking a value before it is saved (#2195).
+   * Throws, as `getProperty` would, on a bare `$VAR` that is not set.
+   */
+  resolveValueAs(key: string, value: unknown): unknown {
+    return this.resolveEnvRef(value, key);
+  }
+
+  /**
    * Resolve environment-variable references in a string config value.
    *
    * Two forms supported (#775):
@@ -862,15 +1113,55 @@ class ConfigurationManager extends BaseManager {
     // value with itself.
     const before = this.customConfig[key];
 
-    this.customConfig[key] = value;
+    // #2126: what is in force afterwards is what a restart would merge. A
+    // list merged by id keeps the shipped and add-on entries beneath the
+    // site's; `undefined` takes the key out of the custom file, so the layers
+    // beneath are in force again (an empty list would replace them all).
+    const declared = this.declaredConfig?.[key];
+    const mergedWith = (own: unknown): unknown => (Array.isArray(declared) && Array.isArray(own) ? mergeArrays(declared, own) : own);
+    // #2270: what the site removed is left out of the policies in force whenever either the policy list
+    // or the record of it changes, and is never stored in the policy list: a list posted back from the
+    // list in force is made into the list it was made from. All worked out here, before anything changes.
+    let stored: unknown = value;
+    let policiesInForce: unknown;
+    let applied: AppliedNarrowing[] | null = null;
+    if (key === POLICIES_KEY && value !== undefined) {
+      const pairs = narrowedWritesFromRecord(this.customConfig[NARROWED_WRITES_KEY]);
+      const own = this.customConfig[POLICIES_KEY];
+      stored = restoreNarrowedWrites(value, own === undefined ? declared : mergedWith(own), pairs);
+    }
+    let inForce: unknown = value === undefined ? declared : mergedWith(stored);
+    if (key === POLICIES_KEY) {
+      const narrowed = withoutNarrowedWrites(inForce, narrowedWritesFromRecord(this.customConfig[NARROWED_WRITES_KEY]), new Set());
+      inForce = narrowed.policies;
+      applied = narrowed.applied;
+    } else if (key === NARROWED_WRITES_KEY) {
+      const declaredPolicies = this.declaredConfig?.[POLICIES_KEY];
+      const own = this.customConfig[POLICIES_KEY];
+      const merged = Array.isArray(declaredPolicies) && Array.isArray(own) ? mergeArrays(declaredPolicies, own) : (own ?? declaredPolicies);
+      const narrowed = withoutNarrowedWrites(merged, narrowedWritesFromRecord(value), new Set());
+      policiesInForce = narrowed.policies;
+      applied = narrowed.applied;
+    }
+    if (stored === undefined) {
+      delete this.customConfig[key];
+    } else {
+      this.customConfig[key] = stored;
+    }
     if (this.mergedConfig) {
-      this.mergedConfig[key] = value;
+      this.mergedConfig[key] = inForce;
+      if (key === NARROWED_WRITES_KEY) this.mergedConfig[POLICIES_KEY] = policiesInForce;
+      this.revision++;
+    }
+    if (applied) {
+      this.narrowingNotes.unreadable = readNarrowedWrites(this.customConfig[NARROWED_WRITES_KEY]).skipped;
+      this.noteOwnRules(applied, true);
     }
 
     // Save to custom config file
     await this.saveCustomConfiguration();
 
-    await this.recordConfigChange(key, before, value, ctx);
+    await this.recordConfigChange(key, before, stored, ctx);
   }
 
   /**
@@ -928,6 +1219,7 @@ class ConfigurationManager extends BaseManager {
   setRuntimeProperty(key: string, value: unknown): void {
     if (this.mergedConfig) {
       this.mergedConfig[key] = value;
+      this.revision++;
     }
   }
 
@@ -947,6 +1239,8 @@ class ConfigurationManager extends BaseManager {
     };
 
     await fs.writeJson(this.customConfigPath, configToSave, { spaces: 2 });
+    // #2270: what a site removed from its role policies is in the file now; nothing is left to update.
+    this.narrowedRoleWrites = [];
     // #1751: cached renders that read configuration (policies, roles, values shown) re-render.
     await this.engine.getManager<{ bump(topic: string): Promise<string> }>('CacheManager')?.bump(CONFIG_DATA_TOPIC);
   }
@@ -1252,8 +1546,35 @@ class ConfigurationManager extends BaseManager {
    * );
    */
   getResolvedDataPath(key: string, defaultValue: string): string {
-    const value = this.getProperty(key, defaultValue) as string;
+    return this.resolveConfiguredPath(this.getProperty(key, defaultValue) as string);
+  }
 
+  /**
+   * Resolve a path as typed, the way the site reads the same text once it is
+   * stored: environment references first (`${SLOW_STORAGE}/backups`, as
+   * `getProperty` does), then `resolveConfiguredPath`. A value that is checked
+   * before it is saved (the backup folder, #2492) goes through this, so the
+   * folder checked is the folder `getResolvedDataPath` gives after a restart.
+   *
+   * @param {string} value - The path as typed
+   * @param {string} key - The configuration key it will be saved under; named in the error for an unset `$VAR`
+   * @returns {string} Resolved path
+   * @throws When the whole value is a bare `$VAR` and that variable is unset, as a read of the stored value would
+   */
+  resolveTypedPath(value: string, key: string): string {
+    return this.resolveConfiguredPath(this.resolveEnvRef(value, key) as string);
+  }
+
+  /**
+   * Resolve a path value as the site reads it from configuration.
+   *
+   * `getResolvedDataPath` is this applied to a stored setting; `resolveTypedPath`
+   * adds the environment step for text that has not been stored yet.
+   *
+   * @param {string} value - The path as typed or stored
+   * @returns {string} Resolved path, or the value as it is when it is not a data path
+   */
+  resolveConfiguredPath(value: string): string {
     // If the value still contains an unresolved ${VAR} placeholder (env var not set),
     // extract the path suffix and resolve it under instanceDataFolder to avoid
     // creating literal '${VAR}/...' directories in the cwd.
@@ -1477,6 +1798,9 @@ class ConfigurationManager extends BaseManager {
 
     this.customConfig = {};
     this.mergedConfig = { ...this.defaultConfig } as WikiConfig;
+    // #2270: the removed page writes are in the file that was just emptied, so the shipped rules apply again.
+    this.narrowingNotes = { ownRules: [], unreadable: [] };
+    this.revision++;
     await this.saveCustomConfiguration();
   }
 

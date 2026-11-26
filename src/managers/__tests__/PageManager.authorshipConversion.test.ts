@@ -35,6 +35,7 @@ import { vaultCategories } from '../../test-support/vaults';
 import { authorshipSite, type AuthorshipSite } from '../../test-support/authorshipSite';
 import { fakeIdentityManager } from '../../test-support/identities';
 import { systemContext } from '../../context/bootActions';
+import { allowingWriteDoor } from '../../__tests__/__fixtures__/pageWriteDoor';
 
 const JIM = 'urn:uuid:11111111-1111-4111-8111-111111111111';
 const ANN = 'urn:uuid:22222222-2222-4222-8222-222222222222';
@@ -47,6 +48,8 @@ async function legacySite(extraConfig: Record<string, unknown> = {}): Promise<{ 
     accounts: { jim: JIM, ann: ANN },
     config: { 'ngdpbase.system-category': vaultCategories(), ...extraConfig }
   });
+  // #1815: the write door's deciders, allowing; authorization is not the subject here.
+  for (const [name, decider] of Object.entries(allowingWriteDoor())) site.managers.set(name, decider);
   const identities = site.managers.get('IdentityManager');
   site.managers.delete('IdentityManager');
   const pm = site.pageManager;
@@ -340,7 +343,9 @@ describe('#2097 page authorship conversion', () => {
     expect(result).toMatchObject({ status: 'done', pagesSkipped: 1, skipErrors: ['EACCES'] });
     expect(matter(await fs.readFile(pageFile(site, uuids.b), 'utf8')).data.author).toBe('orphan:bob');
     const reasons = attention.mock.calls.map((c) => c[0]).join('\n');
-    expect(reasons).toContain('EACCES');
+    // #2354: plain words on the dashboard; the error class is in the log and in the result.
+    expect(reasons).toMatch(/^1 page could not be updated to name their authors the new way/);
+    expect(reasons).not.toContain('EACCES');
     expect(reasons).not.toContain(site.pagesDir);
     // Not recorded as complete: the next start visits every page again.
     const record = await fs.readJson(path.join(site.dir, 'site-migrations.json'));
@@ -370,7 +375,7 @@ describe('#2097 page authorship conversion', () => {
   });
 
   // Review fix 5. Sabotage: not passing convertPrincipal to the provider turned this red.
-  test('access lists: user entries convert, roles and add-on entries are kept, a deleted user is orphaned', async () => {
+  test('audience: user entries convert, roles and add-on entries are kept, a deleted user is orphaned; access is not read (#2255)', async () => {
     const file = pageFile(site, uuids.a);
     const parsed = matter(await fs.readFile(file, 'utf8'));
     await fs.writeFile(file, matter.stringify(parsed.content, { ...parsed.data, audience: ['jim', 'editor', 'bob', 'addon:phr'], access: { edit: ['bob', 'admin'] } }));
@@ -378,7 +383,16 @@ describe('#2097 page authorship conversion', () => {
     await restarted.convertAuthorship(SYS);
     const data = matter(await fs.readFile(file, 'utf8')).data;
     expect(data.audience).toEqual([JIM, 'editor', 'orphan:bob', 'addon:phr']);
-    expect(data.access).toEqual({ edit: ['orphan:bob', 'admin'] });
+    expect(data.access).toEqual({ edit: ['bob', 'admin'] });
+  });
+
+  test('an add-on author, addon:<slug>, is kept as it is, never orphaned (#2255)', async () => {
+    const file = pageFile(site, uuids.a);
+    const parsed = matter(await fs.readFile(file, 'utf8'));
+    await fs.writeFile(file, matter.stringify(parsed.content, { ...parsed.data, author: 'addon:calendar' }));
+    const restarted = await site.restart();
+    await restarted.convertAuthorship(SYS);
+    expect(matter(await fs.readFile(file, 'utf8')).data.author).toBe('addon:calendar');
   });
 
   // Sabotage: removing the catalogue guard in accessListConverter turned this red (every role orphaned).

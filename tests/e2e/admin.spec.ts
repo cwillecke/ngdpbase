@@ -114,7 +114,7 @@ test.describe('Admin Dashboard', () => {
     test('the dashboard links to the scheduled-jobs page, which renders', async ({ page }) => {
       // The link sits in the collapsed Add-ons section, beside Private Stores.
       await page.goto('/admin');
-      await expect(page.locator('a[href="/admin/jobs"]')).toHaveCount(1);
+      await expect(page.locator('main a[href="/admin/jobs"]')).toHaveCount(1);
       await page.goto('/admin/jobs');
       await expect(page.locator('h1')).toContainText('Scheduled Jobs');
       // #1721: core's maintenance jobs are listed on every site.
@@ -219,11 +219,11 @@ test.describe('Admin Dashboard', () => {
       await expect(btn).toContainText(/Clear anonymous/i);
     });
 
-    test('/api/sessions/clear-anonymous returns 403 for unauthenticated callers (#777)', async ({ browser }) => {
+    test('/api/sessions/clear-anonymous returns 401 for unauthenticated callers (#777, #2298)', async ({ browser }) => {
       const anonCtx = await browser.newContext({ storageState: undefined });
       const anonPage = await anonCtx.newPage();
       const resp = await anonPage.request.post('/api/sessions/clear-anonymous');
-      expect(resp.status()).toBe(403);
+      expect(resp.status()).toBe(401); // signed-out write gate (#2298)
       await anonCtx.close();
     });
 
@@ -245,11 +245,11 @@ test.describe('Admin Dashboard', () => {
       await expect(first).toHaveAttribute('data-target-self', /[01]/);
     });
 
-    test('/api/sessions/:id returns 403 for unauthenticated callers (#787)', async ({ browser }) => {
+    test('/api/sessions/:id returns 401 for unauthenticated callers (#787, #2298)', async ({ browser }) => {
       const anonCtx = await browser.newContext({ storageState: undefined });
       const anonPage = await anonCtx.newPage();
       const resp = await anonPage.request.delete('/api/sessions/any-id');
-      expect(resp.status()).toBe(403);
+      expect(resp.status()).toBe(401); // signed-out write gate (#2298)
       await anonCtx.close();
     });
   });

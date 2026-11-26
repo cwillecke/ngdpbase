@@ -14,7 +14,8 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PID_FILE="$SCRIPT_DIR/.ngdpbase.pid"
 
-# Source .env if present (shell exports and CLI args still override)
+# Source .env if present. Sourcing overwrites: a value in the file beats one
+# already exported in the shell or given on the command line.
 if [ -f "$SCRIPT_DIR/.env" ]; then
   set -a
   source "$SCRIPT_DIR/.env"
@@ -402,6 +403,214 @@ case "${1:-}" in
     fi
     ;;
 
+  update)
+    # "all" is this command, never a git ref. It discovers other PM2 checkouts
+    # and runs each one's own `update` (no "all" argument, so this does not recurse).
+    if [ "${2:-}" = "all" ]; then
+      # shellcheck source=scripts/update-all.sh
+      . "$SCRIPT_DIR/scripts/update-all.sh"
+      ngdp_update_all "${@:3}"
+      exit $?
+    fi
+    # Bring this checkout to the tip of master, or to <ref>, then install,
+    # build and restart it. Any failure after the checkout puts the previous
+    # commit back and starts that, so the instance is never left stopped.
+    UPDATE_REF="${2:-}"
+    UPDATE_ENV="${3:-}"
+    # A site with TLS configured serves https on PORT and answers plain http
+    # with a 301 to its public hostname (#1163), which may not resolve from
+    # here. So each poll asks over https first, without verifying the
+    # certificate (it is localhost, and only the status code is read), then
+    # over http. Redirects are never followed (#2241).
+    READY_HTTPS_URL="https://localhost:${PORT:-3000}/health/readiness"
+    READY_HTTP_URL="http://localhost:${PORT:-3000}/health/readiness"
+    READY_TIMEOUT="${UPDATE_READY_TIMEOUT:-120}"
+    cd "$SCRIPT_DIR" || exit 1
+
+    DIRTY=$(git status --porcelain)
+    if [ -n "$DIRTY" ]; then
+      echo "❌ Refusing to update: uncommitted changes in $SCRIPT_DIR"
+      echo "$DIRTY" | sed 's/^/     /'
+      exit 1
+    fi
+    # git status hides edits to files marked assume-unchanged (lowercase tag)
+    # or skip-worktree (S); a failed update's rollback would overwrite them.
+    if ! HIDDEN=$(git ls-files -v); then
+      echo "❌ Refusing to update: git ls-files failed in $SCRIPT_DIR"
+      exit 1
+    fi
+    HIDDEN=$(printf '%s\n' "$HIDDEN" | grep '^[a-zS] ' || true)
+    if [ -n "$HIDDEN" ]; then
+      echo "❌ Refusing to update: files hidden from git status (assume-unchanged or skip-worktree) in $SCRIPT_DIR"
+      echo "$HIDDEN" | cut -c3- | sed 's/^/     /'
+      echo "   Clear the flag with: git update-index --no-assume-unchanged --no-skip-worktree <file>"
+      exit 1
+    fi
+
+    _version() { node -p "require('./package.json').version" 2>/dev/null || echo "unknown"; }
+    OLD_SHA=$(git rev-parse HEAD)
+    OLD_BRANCH=$(git symbolic-ref -q --short HEAD || true)
+    OLD_VERSION=$(_version)
+    echo "🔄 Updating $APP_NAME from $OLD_VERSION (${OLD_SHA:0:7})..."
+
+    # npm install rewrites package-lock.json whenever it disagrees with
+    # package.json (#2519), which leaves the tree dirty and makes the next
+    # update refuse. The tree was clean when we started, so put the committed
+    # lockfile back after every install.
+    _npm_install() {
+      npm install
+      local rc=$?
+      git checkout -q -- package-lock.json 2>/dev/null || true
+      return $rc
+    }
+
+    # Back to the commit we started from: the branch at that commit, or a
+    # detached HEAD if we were not on a branch. -f drops the lockfile edits
+    # npm install may have made; the tree was clean when we started.
+    _checkout_old() {
+      if [ -n "$OLD_BRANCH" ]; then
+        git checkout -q -f "$OLD_BRANCH" && git reset -q --hard "$OLD_SHA"
+      else
+        git checkout -q -f "$OLD_SHA"
+      fi
+    }
+
+    # dist/.built-from holds the commit the current dist/ was built from. It is
+    # written only after a build succeeds and cleared before one starts, so a
+    # failed build, a missing dist/ or a build of another commit never matches
+    # (#2532). Without a match, update always installs and builds.
+    BUILD_STAMP="$SCRIPT_DIR/dist/.built-from"
+    _build() {
+      rm -f "$BUILD_STAMP"
+      npm run build || return 1
+      mkdir -p "$SCRIPT_DIR/dist" && git rev-parse HEAD > "$BUILD_STAMP"
+    }
+    # Online means PM2 lists this app as online. When the pm2 CLI and daemon
+    # disagree on version, `pm2 show` prints only a banner, so a process
+    # listening on the port counts as online too.
+    _site_online() {
+      local st
+      st=$(npx --no pm2 show "$APP_NAME" 2>/dev/null | _strip_ansi | grep -E "^\s*status" | awk '{print $NF}' || true)
+      [ "$st" = "online" ] && return 0
+      [ -z "$st" ] && [ -n "$(_port_pid)" ] && return 0
+      return 1
+    }
+    _build_is_current() {
+      [ -f "$BUILD_STAMP" ] && [ "$(cat "$BUILD_STAMP" 2>/dev/null)" = "$(git rev-parse HEAD)" ]
+    }
+
+    _restart() {
+      "$0" stop || return 1
+      sleep 2
+      if [ -n "$UPDATE_ENV" ]; then
+        "$0" start "$UPDATE_ENV"
+      else
+        "$0" start
+      fi
+    }
+
+    _wait_ready() {
+      echo "   Waiting for $READY_HTTPS_URL or $READY_HTTP_URL (up to ${READY_TIMEOUT}s)..."
+      local waited=0 https_code http_code
+      while [ "$waited" -lt "$READY_TIMEOUT" ]; do
+        https_code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "$READY_HTTPS_URL" 2>/dev/null || true)
+        if [ "$https_code" = "200" ]; then
+          echo "   Ready: $READY_HTTPS_URL"
+          return 0
+        fi
+        http_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$READY_HTTP_URL" 2>/dev/null || true)
+        if [ "$http_code" = "200" ]; then
+          echo "   Ready: $READY_HTTP_URL"
+          return 0
+        fi
+        sleep 2
+        waited=$((waited + 2))
+      done
+      echo "   Last readiness answer: https ${https_code:-none}, http ${http_code:-none}"
+      return 1
+    }
+
+    echo "📥 Fetching..."
+    if ! git fetch --tags origin; then
+      echo "❌ git fetch failed — nothing changed"
+      exit 1
+    fi
+    if [ -n "$UPDATE_REF" ]; then
+      if ! git checkout -q "$UPDATE_REF"; then
+        echo "❌ Cannot check out $UPDATE_REF — nothing changed"
+        exit 1
+      fi
+    else
+      if ! git checkout -q master || ! git pull -q --ff-only origin master; then
+        _checkout_old
+        echo "❌ master cannot be fast-forwarded (local commits, or not on master) — nothing changed"
+        echo "   Never forced. Resolve by hand, then run: ./server.sh update"
+        exit 1
+      fi
+    fi
+    NEW_SHA=$(git rev-parse HEAD)
+    NEW_VERSION=$(_version)
+
+    # Nothing was pulled and the built files are from this commit: there is
+    # nothing to install or build (#2532). A site that is online has nothing
+    # to restart either, so stop here. A site that is stopped (or left down by
+    # an earlier failure) is still started, as before.
+    BUILD_CURRENT=0
+    if [ "$NEW_SHA" = "$OLD_SHA" ] && _build_is_current; then
+      if _site_online; then
+        echo "✅ $APP_NAME is already at $NEW_VERSION (${NEW_SHA:0:7}), nothing to do"
+        # Internal to `update all`, which sets it to learn that this site was
+        # unchanged. Not a setting for people to use.
+        if [ -n "${NGDP_UPDATE_RESULT_FILE:-}" ]; then
+          echo unchanged > "$NGDP_UPDATE_RESULT_FILE" 2>/dev/null || true
+        fi
+        exit 0
+      fi
+      echo "ℹ️  $APP_NAME is already at $NEW_VERSION (${NEW_SHA:0:7}) but is not running. Starting it, no build needed."
+      BUILD_CURRENT=1
+    fi
+
+    FAILED=""
+    if [ "$BUILD_CURRENT" -eq 0 ]; then
+      echo "📦 Installing dependencies..."
+      if ! _npm_install; then
+        FAILED="npm install"
+      else
+        echo "🔨 Building..."
+        if ! _build; then
+          FAILED="npm run build"
+        fi
+      fi
+    fi
+    if [ -z "$FAILED" ]; then
+      echo "🚀 Restarting..."
+      if ! _restart; then
+        FAILED="server start"
+      elif ! _wait_ready; then
+        FAILED="readiness check"
+      fi
+    fi
+
+    if [ -z "$FAILED" ]; then
+      if [ "$BUILD_CURRENT" -eq 1 ]; then
+        echo "✅ Started: $NEW_VERSION (${NEW_SHA:0:7})"
+      else
+        echo "✅ Updated: $OLD_VERSION (${OLD_SHA:0:7}) → $NEW_VERSION (${NEW_SHA:0:7})"
+      fi
+      exit 0
+    fi
+
+    echo ""
+    echo "❌ Update to $NEW_VERSION (${NEW_SHA:0:7}) failed at: $FAILED"
+    echo "⏪ Rolling back to $OLD_VERSION (${OLD_SHA:0:7})..."
+    if _checkout_old && _npm_install && _build && _restart && _wait_ready; then
+      echo "⏪ Rolled back: running $OLD_VERSION (${OLD_SHA:0:7}) again. The update did NOT happen."
+      exit 1
+    fi
+    echo "❌ Rollback failed too. The instance may be down. Check: ./server.sh status"
+    exit 2
+    ;;
+
   status)
     echo "📊 ngdpbase Server Status"
     echo "========================"
@@ -588,7 +797,7 @@ case "${1:-}" in
   *)
     echo "ngdpbase Server Management"
     echo ""
-    echo "Usage: $0 {setup|start|stop|restart|status|logs|env|upgrade-pm2|unlock} [environment]"
+    echo "Usage: $0 {setup|start|stop|restart|update|status|logs|env|upgrade-pm2|unlock} [environment]"
     echo ""
     echo "Commands:"
     echo "  setup        - Fresh-clone setup: install deps, build, and start"
@@ -598,6 +807,18 @@ case "${1:-}" in
     echo "                 env: dev, prod (default: production)"
     echo "  stop         - Stop server gracefully (with force-kill fallback)"
     echo "  restart [env]- Restart server (full stop → start cycle)"
+    echo "  update [ref] [env]"
+    echo "               - Pull master (or check out ref), npm install, build, restart,"
+    echo "                 wait for /health/readiness (https, then http); rolls back to the old commit on failure"
+    echo "                 Refuses uncommitted changes, files marked assume-unchanged or"
+    echo "                 skip-worktree (so sparse checkouts too), and non-fast-forward pulls"
+    echo "  update all [--dry-run] [ref] [env]"
+    echo "               - Update each online ngdpbase checkout PM2 is running, by calling"
+    echo "                 that checkout's own ./server.sh update. Skips a checkout that is"
+    echo "                 not online, inside another repo, not yours, locked by git,"
+    echo "                 detached, not on master, dirty, has files hidden from git status,"
+    echo "                 ahead of origin/master, or when a git check or the fetch fails."
+    echo "                 'all' is not a git ref. See docs/SERVER-MANAGEMENT.md"
     echo "  status       - Show comprehensive server status"
     echo "                 • PID lock validity"
     echo "                 • PM2 process list"

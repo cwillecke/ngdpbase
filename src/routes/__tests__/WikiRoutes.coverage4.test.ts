@@ -8,10 +8,6 @@
  *   GET  /profile
  *   GET  /kiosk
  *   GET  /search
- *   GET  /export
- *   GET  /exports
- *   GET  /download/:filename
- *   DELETE /deleteExport/:filename
  *   GET  /history/:page
  *   GET  /diff/:page
  *   GET  /admin
@@ -163,10 +159,7 @@ const mockSearchManager = {
 
 const mockExportManager = {
   getExports: vi.fn(),
-  deleteExport: vi.fn(),
-  exportPageToHtml: vi.fn(),
-  saveExport: vi.fn(),
-  exportToMarkdown: vi.fn()
+  deleteExport: vi.fn()
 };
 
 const mockConfigManager = {
@@ -318,9 +311,6 @@ function resetMocks() {
 
   mockExportManager.getExports.mockResolvedValue([]);
   mockExportManager.deleteExport.mockResolvedValue(undefined);
-  mockExportManager.exportPageToHtml.mockResolvedValue('<html>exported</html>');
-  mockExportManager.saveExport.mockResolvedValue('/tmp/export.html');
-  mockExportManager.exportToMarkdown.mockResolvedValue('# markdown');
 
   mockPolicyInformationPoint.currentSubject.mockResolvedValue(adminUser);
   mockPolicyDecisionPoint.permits.mockImplementation(policyShaped);   // #1198: anonymous holds only the read trio
@@ -584,56 +574,9 @@ describe('WikiRoutes — coverage batch 4', () => {
     });
   });
 
-  // ── GET /export ──────────────────────────────────────────────────────────────
 
-  describe('GET /export', () => {
-    test('renders export page with list of pages', async () => {
-      const res = await request(app).get('/export');
-      expect(res.status).toBe(200);
-    });
-  });
 
-  // ── GET /exports ─────────────────────────────────────────────────────────────
 
-  describe('GET /exports', () => {
-    test('renders exports list page', async () => {
-      mockExportManager.getExports.mockResolvedValue([
-        { filename: 'export-2025.html', path: '/tmp/export.html' }
-      ]);
-      const res = await request(app).get('/exports');
-      expect(res.status).toBe(200);
-    });
-  });
-
-  // ── GET /download/:filename ──────────────────────────────────────────────────
-
-  describe('GET /download/:filename', () => {
-    test('returns 404 when export file not found', async () => {
-      mockExportManager.getExports.mockResolvedValue([]);
-      const res = await request(app).get('/download/nonexistent.html');
-      expect(res.status).toBe(404);
-    });
-  });
-
-  // ── DELETE /deleteExport/:filename ───────────────────────────────────────────
-
-  describe('DELETE /deleteExport/:filename', () => {
-    test('returns 204 on successful delete', async () => {
-      const res = await request(app)
-        .delete('/deleteExport/export-2025.html')
-        .set('x-csrf-token', 'test-csrf-token');
-      expect(res.status).toBe(204);
-      expect(mockExportManager.deleteExport).toHaveBeenCalledWith('export-2025.html');
-    });
-
-    test('returns 500 when deleteExport throws', async () => {
-      mockExportManager.deleteExport.mockRejectedValue(new Error('disk error'));
-      const res = await request(app)
-        .delete('/deleteExport/export-2025.html')
-        .set('x-csrf-token', 'test-csrf-token');
-      expect(res.status).toBe(500);
-    });
-  });
 
   // ── GET /history/:page ───────────────────────────────────────────────────────
 
@@ -683,7 +626,7 @@ describe('WikiRoutes — coverage batch 4', () => {
         compareVersions: vi.fn().mockResolvedValue({
           v1: { version: 1, content: 'old' },
           v2: { version: 2, content: 'new' },
-          diff: [{ type: 'added', value: 'new line' }]
+          diff: [[1, 'new line']]
         })
       };
       mockPageManager.pageExists.mockReturnValue(true);
@@ -713,8 +656,9 @@ describe('WikiRoutes — coverage batch 4', () => {
       const res = await request(own).get('/admin');
       expect(res.status).toBe(200);
       const dashboard = rendered.find((r) => r.view === 'admin-dashboard');
-      expect(dashboard?.data.degradedManagers).toEqual([down, failed]);
-      expect(dashboard?.data.attentionManagers).toEqual([reminder]);
+      expect(dashboard?.data.degradedManagers).toEqual([{ ...down, feature: 'Metrics' }, { ...failed, feature: 'Database' }]);
+      // #2348: each carries the plain feature name the view leads with.
+      expect(dashboard?.data.attentionManagers).toEqual([{ ...reminder, feature: 'Backups' }]);
     });
 
     test('returns 403 when a signed-in user lacks admin-read', async () => {

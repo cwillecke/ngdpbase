@@ -190,7 +190,8 @@ class ReviewManager extends BaseManager {
     if (!database.isEncrypted()) {
       this.unavailable = 'Requests for review can hold personal details, and the application database is not encrypted, so none are kept. ' +
         'Set NGDPBASE_DATABASE_KEY in <FAST_STORAGE>/.env and restart; an existing unencrypted database must be moved under the key first (a backup and restore).';
-      this.markNeedsAttention(this.unavailable);
+      // #2354: the dashboard says it in plain words; the setting and key to change are in the log line below.
+      this.markNeedsAttention('Requests for review are switched off, because they can hold personal details and the database is not encrypted. Ask whoever runs the server to set up an encryption key for the database; this is outside this page.');
       logger.warn(`[ReviewManager] ${this.unavailable}`);
       return;
     }
@@ -408,7 +409,7 @@ class ReviewManager extends BaseManager {
   /** Throws {@link ReviewRefusedError} unless `ctx` may decide a request with this permission. No context or no PDP refuses. */
   private async requireDecider(ctx: ActorContext, permission: string): Promise<void> {
     const pdp = this.decider();
-    if (!ctx || !pdp) throw new ReviewRefusedError(permission, { permit: false, applicable: false, reason: ctx ? 'no_decision_point' : 'no_context' });
+    if (!ctx || !pdp) throw new ReviewRefusedError(permission, { permit: false, applicable: false, reason: ctx ? 'no_decision_point' : 'no_context', policyIds: [] });
     const decision = await pdp.decide(ctx, { action: permission });
     if (!decision.permit) throw new ReviewRefusedError(permission, decision);
   }

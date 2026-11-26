@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
+import { openStatusCards } from './fixtures/helpers';
 
 /**
  * #1563 — backups never fail silently: a site with no recent good backup
@@ -14,18 +15,19 @@ test.describe('#1563 — backups not working is an outage on the dashboard', () 
   test.use({ storageState: './tests/e2e/.auth/user.json' });
   test.setTimeout(240_000);
 
-  const backupRow = (page: Page) => page.locator('#subsystems-down li', { hasText: 'BackupManager' });
+  const backupRow = (page: Page) => page.locator('#subsystems-down li[data-manager="BackupManager"]', { hasText: 'This site has no backup yet' });
 
-  test('no backup at all: Backup is listed as not working, "No good backup since: never"', async ({ page }) => {
+  test('no backup at all: Backup is listed as not working, "This site has no backup yet"', async ({ page }) => {
     await page.goto('/admin/backup');
+    await openStatusCards(page);
     const lastGood = page.locator('#backup-health [data-testid=backup-last-good]');
     await expect(lastGood).toBeVisible();
     test.skip(!/never/.test(await lastGood.innerText()), 'this instance already has a backup; run on a freshly seeded throwaway instance');
 
     await page.goto('/admin');
     await expect(page.locator('#subsystems-down')).toBeVisible();
-    await expect(backupRow(page)).toContainText('No good backup since: never');
-    await expect(backupRow(page)).toContainText('(degraded)');
+    await expect(backupRow(page)).toContainText('This site has no backup yet');
+    await expect(backupRow(page)).toContainText('Backups');
     // The dashboard's own backup lines say the same, with the next run and free space.
     await expect(page.locator('#backup-health [data-testid=backup-health-fault]')).toContainText('Backups are not working');
     await expect(page.locator('#backup-health [data-testid=backup-last-good]')).toContainText('never');
@@ -34,6 +36,7 @@ test.describe('#1563 — backups not working is an outage on the dashboard', () 
 
   test('a good backup clears it, and the dashboard shows when it was made', async ({ page }) => {
     await page.goto('/admin/backup');
+    await openStatusCards(page);
     const downloadPromise = page.waitForEvent('download', { timeout: 170_000 });
     await page.locator('form[action="/admin/backup/create"] button[type="submit"]').click();
     expect(await (await downloadPromise).failure()).toBeNull();

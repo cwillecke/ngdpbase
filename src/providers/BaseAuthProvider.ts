@@ -48,6 +48,8 @@ export interface AuthVerifyCredentials {
   password?: string;
   /** One-time token — used by MagicLinkAuthProvider */
   token?: string;
+  /** A six-digit authenticator-app code — used by TotpAuthProvider (#421). */
+  code?: string;
   /** The account chosen for a link to a shared address (#2073) — used by MagicLinkAuthProvider. */
   account?: string;
   /** OAuth `state` from the callback — used by OidcAuthProvider */
@@ -72,6 +74,8 @@ export interface ViaToken {
   name: string;
   /** Scope ceiling this token may act within */
   scopes: string[];
+  /** The assurance level stored with the token when it was made (#2261); absent on an older token. */
+  aal?: 1 | 2 | 3;
 }
 
 /**

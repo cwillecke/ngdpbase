@@ -57,7 +57,12 @@ const ENFORCEMENT_PATTERNS: RegExp[] = [
   // #1762 slice 2: the private-container rule reads vault-proxy from a proxy grant.
   /\bproxyCarries\(\s*[^,]+,\s*'([^']+)'/g,
   // #2125: a shared folder's door asks the PDP for shared-folder-read / -file on the folder.
-  /\bmayInFolder\(\s*\w+,\s*'([^']+)'/g
+  /\bmayInFolder\(\s*\w+,\s*'([^']+)'/g,
+  // #1979, #2120: ImportManager's receivers and export sources ask the PDP
+  // through their own `permits` (page-create, asset-upload, page-export).
+  /\bthis\.permits\(\s*\w+,\s*'([^']+)'/g,
+  // #2255: a page-scoped check names the permission first (page-public, the page writes).
+  /\bhasPermissionOn\(\s*'([^']+)'/g
 ];
 
 /**
@@ -74,6 +79,9 @@ const ENFORCEMENT_PATTERNS: RegExp[] = [
  */
 const ACTION_MAP_BLOCK = /const actionMap[^=]*=\s*\{([\s\S]*?)\};/;
 
+/** #2255: the pushed-pages twin of each page write (`src/utils/permissionCatalog.ts`). */
+const PUSHED_PAGE_WRITES_BLOCK = /const PUSHED_PAGE_WRITES[^=]*=\s*\{([\s\S]*?)\};/;
+
 /**
  * #1431: the page-action map moved to `src/security/pageActions.ts` and became
  * the only copy — it had been written out three times, once in a broken
@@ -87,26 +95,27 @@ const PAGE_ACTION_ALIASES_BLOCK = /PAGE_ACTION_ALIASES = \{([\s\S]*?)\} as const
  * cannot quietly become a place to hide new drift.
  */
 const KNOWN_UNENFORCED: Record<string, string> = {
-  // `page-export` is here for a reason worth reading before "fixing" it.
-  //
-  // Chasing it as an orphan found #1060: the export routes had no
-  // authorization check at all, so a private page was extractable by anyone
-  // who could name it. That is now gated on READ access — the same gate the
-  // view route uses.
-  //
-  // `page-export` itself was deliberately NOT made the gate. For a page the
-  // caller can already read, exporting returns words they are looking at on
-  // screen, so requiring a second permission is friction rather than
-  // protection. The read/export split would earn its keep against a bulk
-  // surface — `ExportManager.exportPagesToHtml` and `exportToMarkdown` both
-  // take arrays — but no route reaches either today. Enforce it on the bulk
-  // route when one is built, on the act that is actually different.
+  // #2521 (slice 2 of #2247): `share-manage-all` ships before anything asks it.
+  // The revoke route still decides a manager by `admin-system` (its checks do
+  // not change in this slice). Slice 4 moves the route's check to
+  // `share-manage-all`; until then the permission is held by administrators
+  // and gates nothing new. Remove this entry when a route asks
+  // `share-manage-all` (#2247).
+  'share-manage-all': 'not yet asked by any route: the manager screen and its check come in a later slice of #2247 (#2521)'
+  // `page-export` was here until #2120. Chasing it as an orphan found #1060:
+  // the export routes had no authorization check at all, so a private page was
+  // extractable by anyone who could name it. Those routes are gated on READ
+  // access, the same gate the view route uses, and only on that: for one page
+  // the caller can already read, a second permission is friction rather than
+  // protection. It was to be enforced on the surface that is actually
+  // different, and ICE's export engine is that surface (it will carry search
+  // results and add-on lists): its page source asks `page-export` beside the
+  // page door's read (operator, D5 in docs/planning/ice-planing.md).
   //
   // The other three #1059 orphans (asset-read, asset-delete, search-page) were
   // enforced in #1059: AttachmentManager.checkPermission became a real
   // UserManager.hasPermission check, asset-read gates attachment serve/thumb,
   // and search-page gates the search surfaces.
-  'page-export': 'ngdpbase#1059'
 };
 
 /**
@@ -147,7 +156,10 @@ function enforcedNames(): Set<string> {
       while ((m = pattern.exec(text)) !== null) found.add(m[1]);
     }
 
-    for (const block of [ACTION_MAP_BLOCK.exec(text), PAGE_ACTION_ALIASES_BLOCK.exec(text)]) {
+    // #2255: a page write is asked as page-<verb> and granted as page-<verb>
+    // or pushed-pages-<verb>, so the twins are enforced wherever the page
+    // writes are.
+    for (const block of [ACTION_MAP_BLOCK.exec(text), PAGE_ACTION_ALIASES_BLOCK.exec(text), PUSHED_PAGE_WRITES_BLOCK.exec(text)]) {
       if (!block) continue;
       for (const v of block[1].matchAll(/:\s*'([^']+)'/g)) found.add(v[1]);
     }

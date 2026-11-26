@@ -4,7 +4,7 @@
   currentUser: currentUser || null
 }) %>
 
-<div class="container">
+<div class="container" data-trail-skip>
   <div class="row justify-content-center">
     <div class="col-md-8">
       <div class="card border-danger">
@@ -16,7 +16,15 @@
         </div>
         <div class="card-body">
           <h5 class="card-title"><%= title || error %></h5>
-          <p class="card-text"><%= message %></p>
+          <% if (typeof conflictingPage !== 'undefined' && conflictingPage) { %>
+            <% if (conflictingPage.tooClose) { %>
+              <p class="card-text">That name is too close to the name of an existing page, "<a href="<%= conflictingPage.url %>"><%= conflictingPage.title %></a>".</p>
+            <% } else { %>
+              <p class="card-text">A page called "<a href="<%= conflictingPage.url %>"><%= conflictingPage.title %></a>" already exists.</p>
+            <% } %>
+          <% } else { %>
+            <p class="card-text"><%= message %></p>
+          <% } %>
 
           <% if (typeof details !== 'undefined' && details) { %>
             <p class="text-muted"><%= details %></p>

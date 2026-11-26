@@ -71,7 +71,7 @@ export const AUDIT_EVENT = {
   EMAILCHANGE_REQUEST: 'emailchange-request',
   /** Executive Hub read; not recorded, read volume */
   EXECUTIVE_READ: 'executive-read',
-  /** A page's footnote list changed — action add, import, transfer, update or delete; page content written on someone's behalf (#1233) */
+  /** A page's footnote list changed — action add, import, transfer, update or delete; page content written on someone's behalf (#1233) — or a shared footnote source was changed: action create (#2454) */
   FOOTNOTE_EDIT: 'footnote-edit',
   /** Identity record or organization created, changed, deleted or linked to an account (recorded as contact-manage before #2038); metadata names the kind (person or organization), the operation and the fields changed, never their values */
   IDENTITY_MANAGE: 'identity-manage',
@@ -179,6 +179,8 @@ export const AUDIT_EVENT = {
   SHARE_EXTEND: 'share-extend',
   /** Share link revoked; pairs with token-revoke */
   SHARE_REVOKE: 'share-revoke',
+  /** An administrator changed who may read and who may file in a shared folder on the Shared folders screen (#2126): which folder, who, and the roles before and after for each. Recorded once the folder's policies are written; a failed write is recorded as a failure, with the error, and a record that cannot be written puts the policies back */
+  SHARED_FOLDER_ACCESS_CHANGE: 'shared-folder-access-change',
   /** An administrator created a shared folder (#2125): which folder and who. Recorded before the folder is made, which cannot proceed without it */
   SHARED_FOLDER_CREATE: 'shared-folder-create',
   /** A shared folder's own key was made (#2124): which folder and who, never the key. Recorded before the key is saved, which cannot proceed without it */
@@ -231,6 +233,8 @@ export const AUDIT_EVENT = {
   USER_EDIT: 'user-edit',
   /** User profile read; not recorded, read volume */
   USER_READ: 'user-read',
+  /** An administrator read or changed a page inside another person's vault that is not encrypted (ngdpbase.vaults.admin-access, #2255): the administrator is the actor, and the vault's owner, the vault and the page are named */
+  VAULT_ADMIN_ACCESS: 'vault-admin-access',
   /** Not an action: read from a proxy grant at the vault door; the grant itself is recorded as proxy-grant */
   VAULT_PROXY: 'vault-proxy',
   /** A vault page's leftovers moved into its vault (#1842): its shared-pool files (moved, or copied where other public pages use them) and its footnotes and comments from the public folders. Names the owner, vault and page uuid and the counts, never a title or file name. Run by the vault's owner, or for a vault that isn't sealed by someone holding admin-system */

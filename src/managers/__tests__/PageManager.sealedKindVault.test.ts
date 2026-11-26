@@ -37,6 +37,7 @@ import {
 } from '../../utils/privateStoreCrypto';
 import { SealedVaultRefusedError } from '../../utils/privateStoreMeta';
 import { clearUnlockedPrivateStores, setUnlockedDek, unlockPrivateStores } from '../../utils/privateStoreUnlock';
+import { withWriteDoorAllowing } from '../../__tests__/__fixtures__/pageWriteDoor';
 
 const UUID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const MOLLY: ActorContext = { ...actor('molly'), privateStoreHandle: 'sid' };
@@ -76,14 +77,15 @@ describe('a sealed kind\'s vault is never written in the clear (#1834)', () => {
     const notificationManager = { notifyAdmins: vi.fn(async (n: Record<string, unknown>) => { notifications.push(n); return 'id'; }) };
     const searchManager = { updatePageInIndex: vi.fn(), removePageFromIndex: vi.fn() };
     let validation: unknown = null;
+    // The write door's deciders allow (#1815): this test is about sealing.
     const engine = {
-      getManager: vi.fn((name: string) => {
+      getManager: vi.fn(withWriteDoorAllowing((name: string) => {
         if (name === 'ConfigurationManager') return configManager;
         if (name === 'ValidationManager') return validation;
         if (name === 'SearchManager') return searchManager;
         if (name === 'NotificationManager') return notificationManager;
         return null;
-      })
+      }))
     };
     validation = new ValidationManager(engine);
     return engine;
@@ -189,13 +191,15 @@ describe('a sealed kind\'s vault is never written in the clear (#1834)', () => {
 
     const status = fresh.getManagerStatus();
     expect(status.state).toBe('degraded');
-    expect(status.reason).toContain('molly/phr (files but no store.json)');
-    expect(status.reason).toContain('bob/phr (store.json not sealed)');
-    expect(status.reason).not.toContain('carol');
-    expect(status.reason).not.toContain('dave');
+    // #2354: plain words on the dashboard; the owners and vaults are in the notice and the log.
+    expect(status.reason).toMatch(/^2 private vaults are marked as encrypted but hold files that are not/);
+    expect(status.reason).not.toContain('molly');
     expect(notifications).toHaveLength(1);
     expect(notifications[0]).toMatchObject({ level: 'error' });
-    expect(String(notifications[0].message)).toContain('molly/phr');
+    expect(String(notifications[0].message)).toContain('molly/phr (files but no store.json)');
+    expect(String(notifications[0].message)).toContain('bob/phr (store.json not sealed)');
+    expect(String(notifications[0].message)).not.toContain('carol');
+    expect(String(notifications[0].message)).not.toContain('dave');
 
     // Read only: no file moved, sealed, indexed or deleted.
     expect((await fs.readdir(leaked)).sort()).toEqual(before);
@@ -224,9 +228,14 @@ describe('a sealed kind\'s vault is never written in the clear (#1834)', () => {
 
     const status = fresh.getManagerStatus();
     expect(status.state).toBe('degraded');
-    expect(status.reason).toContain('molly/phr (2 file(s) in attachments, versions)');
-    expect(status.reason).not.toContain('notes');
+    expect(status.reason).toMatch(/^An encrypted private vault holds files that are not encrypted/);
+    // #2385: says what to do, and that it is done on the server: nothing in the app moves them, so there is no link.
+    expect(status.reason).toBe('An encrypted private vault holds files that are not encrypted. They were left as they are, and the vault still works. Move or remove those files on the server, outside this page. The notice sent to administrators names the vault and the files.');
+    expect(status.fixUrl).toBeUndefined();
+    expect(status.reason).not.toContain('molly');
     expect(notifications).toHaveLength(1);
+    expect(String(notifications[0].message)).toContain('molly/phr (2 file(s) in attachments, versions)');
+    expect(String(notifications[0].message)).not.toContain('notes');
     expect(String(notifications[0].message)).toContain('#1836');
     expect(await fs.readFile(path.join(history, 'content.md'), 'utf8')).toBe(before);
     expect(await fs.pathExists(path.join(root, 'attachments', 'scan.pdf'))).toBe(true);

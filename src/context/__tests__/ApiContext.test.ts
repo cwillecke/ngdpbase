@@ -267,6 +267,9 @@ describe('#1745 ApiContext#requirePermission() answers step-up with the way to r
     const authManager = {
       engine: null as unknown,
       askForFreshSignIn(...a: Parameters<AuthManager['askForFreshSignIn']>) { return AuthManager.prototype.askForFreshSignIn.apply(this as never, a); },
+      // #2154: a page's form POST is kept to be redone after the prompt.
+      stepUpReplays: new Map(),
+      keepStepUpReplay(...a: unknown[]) { return (AuthManager.prototype as unknown as { keepStepUpReplay: (...x: unknown[]) => unknown }).keepStepUpReplay.apply(this, a); },
       recordReauth(...a: Parameters<AuthManager['recordReauth']>) { return AuthManager.prototype.recordReauth.apply(this as never, a); }
     };
     const engine = {
@@ -294,7 +297,8 @@ describe('#1745 ApiContext#requirePermission() answers step-up with the way to r
     const err = await ctx.requirePermission('ledger-adjust').catch((e: unknown) => e) as ApiError;
     expect(err).toBeInstanceOf(ApiError);
     expect(err.status).toBe(403);
-    expect(err.reauth).toBe('/auth/reauth?next=%2Fview%2FBooks');
+    // #2193: a script's refusal names its own prompt.
+    expect(err.reauth).toMatch(/^\/auth\/reauth\?next=%2Fview%2FBooks&prompt=[0-9a-f]{32}$/);
     expect(err.message).toBe('A fresh sign-in is needed');
     expect(engine.audit).toHaveLength(1);
     expect(engine.audit[0]).toMatchObject({ eventType: 'reauth-prompt', resource: 'ledger-adjust' });
@@ -327,6 +331,9 @@ describe('#1431 ApiContext#enforceDeny() turns a deny decision into the refusal'
     const authManager = {
       engine: null as unknown,
       askForFreshSignIn: vi.fn(function (this: unknown, ...a: Parameters<AuthManager['askForFreshSignIn']>) { return AuthManager.prototype.askForFreshSignIn.apply(this, a); }),
+      // #2154: a page's form POST is kept to be redone after the prompt.
+      stepUpReplays: new Map(),
+      keepStepUpReplay(...a: unknown[]) { return (AuthManager.prototype as unknown as { keepStepUpReplay: (...x: unknown[]) => unknown }).keepStepUpReplay.apply(this, a); },
       recordReauth(...a: Parameters<AuthManager['recordReauth']>) { return AuthManager.prototype.recordReauth.apply(this as never, a); }
     };
     const engine = {
@@ -378,9 +385,20 @@ describe('#1431 ApiContext#enforceDeny() turns a deny decision into the refusal'
     expect(engine.authManager.askForFreshSignIn).toHaveBeenCalledWith(req, req.userContext, 'ledger-adjust', 'json');
     expect(err.status).toBe(403);
     expect(err.message).toBe('A fresh sign-in is needed');
-    expect(err.reauth).toBe('/auth/reauth?next=%2Fview%2FBooks');
+    // #2193: a script's refusal names its own prompt.
+    expect(err.reauth).toMatch(/^\/auth\/reauth\?next=%2Fview%2FBooks&prompt=[0-9a-f]{32}$/);
     expect(engine.audit).toHaveLength(1);
     expect(engine.audit[0]).toMatchObject({ eventType: 'reauth-prompt', resource: 'ledger-adjust' });
+  });
+
+  test('#2360: an add-on\'s plain form post gets the page prompt (no script prompt id); a script\'s request keeps its own', async () => {
+    const engine = engineWith();
+    const form = Object.assign(reqFor(tess), { headers: { accept: 'text/html,application/xhtml+xml' } });
+    const formErr = await ApiContext.from(form, engine).enforceDeny('ledger-adjust', deny('step-up')).catch((e: unknown) => e) as ApiError;
+    expect(formErr.reauth).toBe('/auth/reauth?next=%2Fview%2FBooks');
+    const script = Object.assign(reqFor(tess), { headers: { accept: 'application/json', 'x-requested-with': 'XMLHttpRequest' } });
+    const scriptErr = await ApiContext.from(script, engine).enforceDeny('ledger-adjust', deny('step-up')).catch((e: unknown) => e) as ApiError;
+    expect(scriptErr.reauth).toMatch(/&prompt=[0-9a-f]{32}$/);
   });
 
   test.each(['token_scope_deny', 'share_action_deny', 'proxy_scope_deny'])('a delegated-credential ceiling deny (%s) is a plain 403, never a reauth', async (reason) => {
@@ -399,6 +417,29 @@ describe('#1431 ApiContext#enforceDeny() turns a deny decision into the refusal'
     const err = await ctx.enforceDeny('ledger-adjust', deny('step-up')).catch((e: unknown) => e) as ApiError;
     expect(err.status).toBe(403);
     expect(err.reauth).toBeUndefined();
+  });
+
+  test('a record refusal is audited with the stored owner, and the actor under a proxy grant (#1823)', async () => {
+    const engine = engineWith();
+    const mom = { ...tess, username: 'mom', viaProxy: { kind: 'proxy', grantId: 'g1', actor: 'jim', scopes: ['phr-read'] } };
+    const ctx = ApiContext.from(reqFor(mom), engine);
+    const err = await ctx.enforceDeny('phr-read', { permit: false, applicable: true, reason: 'not-the-owner', policyIds: [] }, {
+      type: 'phr-record', id: 'm1', owner: 'urn:uuid:mom', ownerUser: 'mom'
+    }).catch((e: unknown) => e) as ApiError;
+    expect(err.status).toBe(403);
+    expect(engine.audit).toEqual([
+      expect.objectContaining({
+        eventType: 'authorization-deny',
+        user: 'mom',
+        actor: 'jim',
+        action: 'phr-read',
+        resource: 'm1',
+        resourceType: 'phr-record',
+        result: 'deny',
+        reason: 'not-the-owner',
+        metadata: expect.objectContaining({ owner: 'urn:uuid:mom', ownerUser: 'mom', delegated: 'proxy', proxyGrantId: 'g1' })
+      })
+    ]);
   });
 
   test('an allow decision is a programming error, never a silent pass', async () => {

@@ -231,6 +231,14 @@ export interface JobDefinition {
    */
   routine?: boolean;
   /**
+   * For a scheduled job with `persist: false` (#2467): still keep each run's
+   * outcome where a restart finds it, so the job's last run is not lost at a
+   * restart. Its slots and locks stay in memory, so nothing is caught up and
+   * the next run is still one interval after the start. Set by
+   * {@link BackgroundJobManager.registerMaintenance}.
+   */
+  keepLastRun?: boolean;
+  /**
    * The work to perform. Resolves with a JobResult.
    *
    * __`ctx` is mandatory (#631).__ Without it the actor this manager captured
@@ -388,7 +396,8 @@ class BackgroundJobManager extends BaseManager {
     if (unavailable) {
       this.held = 'The application database is not available, so no scheduled or hand-started job runs until a restart opens it — the critical notification about it says why and how to fix it (#1892)';
       logger.error(`[BackgroundJobManager] ${this.held}`);
-      this.markDegraded(this.held);
+      // #2354: the dashboard says it in plain words; the cause is the Database item.
+      this.markDegraded('No scheduled jobs are running, because the database is not available. Fix the database problem shown here, then restart the site.');
       return;
     }
     if (!this.stateProvider && configManager) {
@@ -456,13 +465,15 @@ class BackgroundJobManager extends BaseManager {
    * like any job, and can be run, paused or rescheduled from there.
    *
    * `everyMs` 0 or less registers the job without a schedule: it stops
-   * recurring, and can still be run by hand.
+   * recurring, and can still be run by hand. `keepLastRun` keeps the outcome
+   * of each scheduled run across a restart (#2467), and nothing else.
    */
-  registerMaintenance(spec: { id: string; displayName: string; everyMs: number; run: (ctx: JobRunContext) => Promise<string | void> }): void {
+  registerMaintenance(spec: { id: string; displayName: string; everyMs: number; keepLastRun?: boolean; run: (ctx: JobRunContext) => Promise<string | void> }): void {
     const def: JobDefinition = {
       id: spec.id,
       displayName: spec.displayName,
       routine: true,
+      ...(spec.keepLastRun ? { keepLastRun: true } : {}),
       run: async (_progress, ctx) => {
         const summary = await spec.run(ctx);
         return { success: true, summary: summary ?? undefined };
@@ -792,7 +803,7 @@ class BackgroundJobManager extends BaseManager {
       });
     }
     const latest = ended.reduce<LastJobRun | null>((best, r) => (!best || r.completedAt > best.completedAt || (r.completedAt === best.completedAt && r.startedAt > best.startedAt) ? r : best), null);
-    return { jobId, displayName: def.displayName, lastRun: latest, sinceStart: !provider || (job ? !job.persist : false) };
+    return { jobId, displayName: def.displayName, lastRun: latest, sinceStart: !provider || (job ? !job.persist && !def.keepLastRun : false) };
   }
 
   private async viewOf(job: ScheduledJob, withRuns: boolean): Promise<ScheduledJobView> {
@@ -988,6 +999,7 @@ class BackgroundJobManager extends BaseManager {
         if (heartbeat) clearInterval(heartbeat);
         await writer.flush();
         const completedAt = (run.completedAt ?? this.clock()).toISOString();
+        await this.keepLastRun(job, { ...record, status: run.status === 'completed' ? 'completed' : 'failed', completedAt, ...(run.status === 'completed' ? {} : { error: run.result?.error ?? 'failed' }) });
         if (run.status === 'completed') {
           const after = await this.loadState(job);
           await this.saveState(job, {
@@ -1006,6 +1018,16 @@ class BackgroundJobManager extends BaseManager {
       }
     }
     return outcome;
+  }
+
+  /** The outcome of a scheduled run of a `keepLastRun` job whose slots are in memory only (#2467). A write that fails is logged: the run itself is not undone. */
+  private async keepLastRun(job: ScheduledJob, record: JobRunRecord): Promise<void> {
+    if (job.persist || !job.def.keepLastRun || !this.stateProvider || !isFileSafeJobId(job.def.id)) return;
+    try {
+      await this.stateProvider.recordRun(job.def.id, record);
+    } catch (err) {
+      logger.error(`[BackgroundJobManager] '${job.def.id}' run ${record.runId} could not be kept for after a restart:`, err);
+    }
   }
 
   /**
@@ -1157,7 +1179,7 @@ class BackgroundJobManager extends BaseManager {
       const runId = randomUUID();
       const detail = `enqueue('${jobId}') was called without a JobContext — since #631 the second argument is who asked ` +
         '(a JobContext: username, origin, requestedAt; build one with jobContextFromRequest / scheduleContext / systemContext). Refused.';
-      logger.error(`[BackgroundJobManager] ${detail}\n${new Error('caller').stack ?? ''}`);
+      logger.error(`[BackgroundJobManager] ${detail}`, { stack: new Error('caller').stack });
       const refused: JobRun = {
         runId,
         jobId,
@@ -1196,7 +1218,7 @@ class BackgroundJobManager extends BaseManager {
 
     const def = this.jobs.get(jobId);
     if (!def) {
-      throw new Error(`BackgroundJobManager: unknown job '${jobId}'`);
+      throw new JobActionError(`There is no job named '${jobId}'.`, 404);
     }
 
     return this.startHandRun(def, requestedBy, null);
