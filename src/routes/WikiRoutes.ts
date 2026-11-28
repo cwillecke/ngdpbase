@@ -7120,6 +7120,11 @@ ${panes}
     }
   }
 
+  /** The roles step-up reads the level from: all of them, including any that stepped down for this sign-in (#2237). */
+  private stepUpRolesOf(user: Request['userContext']): string[] {
+    return Array.isArray(user.stepUpRoles) ? user.stepUpRoles as string[] : user.roles ?? [];
+  }
+
   /**
    * GET /auth/reauth — step-up's prompt (#1525). Offers what can reach the
    * level this person's roles require: a passkey when one is enrolled, the
@@ -7141,7 +7146,7 @@ ${panes}
     const next = safeRedirect(req.query.next ?? (req.body as { next?: unknown } | undefined)?.next);
     // #2193: a script's prompt, carried to the confirmation and to Cancel.
     const prompt = stepUpPromptId(req.query.prompt ?? (req.body as { prompt?: unknown } | undefined)?.prompt) ?? '';
-    const needsPasskey = (authManager?.requiredAalFor(user.roles ?? [], user.aalCap) ?? 0) >= 2;
+    const needsPasskey = (authManager?.requiredAalFor(this.stepUpRolesOf(user), user.aalCap) ?? 0) >= 2;
     // #2356: what this account may add or use here; a method its allowed sign-in methods exclude is never offered.
     const ways = await authManager?.strongerSignInWays(user.username);
     const hasPassword = ways?.password ?? false;
@@ -7203,7 +7208,7 @@ ${panes}
     const authManager = this.engine.getManager<AuthManager>('AuthManager');
     const body = (req.body ?? {}) as Record<string, unknown>;
     const code = typeof body.code === 'string' ? body.code.replace(/\s/g, '') : '';
-    const needsBoth = (authManager?.requiredAalFor(user.roles ?? [], user.aalCap) ?? 0) >= 2;
+    const needsBoth = (authManager?.requiredAalFor(this.stepUpRolesOf(user), user.aalCap) ?? 0) >= 2;
     const password = needsBoth ? (typeof body.password === 'string' ? body.password : '') : null;
     const method = needsBoth ? 'password and authenticator app' : 'authenticator app';
 
@@ -7262,7 +7267,7 @@ ${panes}
     if (!(await this.permitted(wikiContext, 'profile-manage', req, res, 'json'))) return;
     const user = wikiContext.userContext;
     const authManager = this.engine.getManager<AuthManager>('AuthManager');
-    const fresh = authManager?.signInFresh(user.signIn, user.roles ?? [], Boolean(user.viaToken || user.viaShare), undefined, user.aalCap) ?? false;
+    const fresh = authManager?.signInFresh(user.signIn, this.stepUpRolesOf(user), Boolean(user.viaToken || user.viaShare), undefined, user.aalCap) ?? false;
     res.set('Cache-Control', 'no-store');
     res.json({ fresh, prompt: authManager?.stepUpPromptState(req, req.query.prompt) ?? 'unknown' });
   }

@@ -2650,9 +2650,12 @@ class AuthManager extends BaseManager {
       return self;
     }
     const keyHandle = await this.openVaultCopy(req, grant, person, self.privateStoreHandle);
+    const held = this.rolesAtSignIn(represented.roles, self.signIn?.aal ?? 1, self.aalCap);
     return {
       ...represented,
-      roles: this.rolesAtSignIn(represented.roles, self.signIn?.aal ?? 1, self.aalCap).kept,
+      roles: held.kept,
+      // #2237: step-up reads the level from every role of the person represented.
+      ...(held.steppedDown.length > 0 ? { stepUpRoles: represented.roles } : {}),
       ...(self.aalCap !== undefined ? { aalCap: self.aalCap } : {}),
       ...(self.signIn ? { signIn: self.signIn } : {}),
       ipAddress: self.ipAddress,

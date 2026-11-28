@@ -209,6 +209,14 @@ export interface PermissionSubject {
    */
   aalCap?: import('../providers/BaseAuthProvider.js').Aal;
   /**
+   * The roles step-up reads the level from, when `roles` holds fewer because
+   * some stepped down for this session's sign-in (#2237). Without it, enrolling
+   * a second factor mid-session would lower the level step-up asks: the role
+   * that needs AAL2 steps down, and what is left needs only AAL1. Set where the
+   * request subject is built, beside `aalCap`; absent means `roles` is all.
+   */
+  stepUpRoles?: string[];
+  /**
    * Set by the bearer middleware on a subject authenticated by a JWT that
    * records no sign-in level (Authentik, #2287): its `subject:aal` is missing,
    * not AAL 1. Set from the verified result, never from a request field.

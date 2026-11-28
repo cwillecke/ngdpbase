@@ -313,7 +313,7 @@ export class PolicyDecisionPoint extends BaseManager {
     if (!subject || typeof subject !== 'object' || 'resolveRolesNow' in subject) return false;
     const auth = this.engine.getManager<StepUpDecider>('AuthManager');
     if (!auth?.stepUpNeeded) return false;
-    return auth.stepUpNeeded(action, subject.signIn, subject.roles ?? [], Boolean(subject.viaToken || subject.viaShare), undefined, subject.aalCap);
+    return auth.stepUpNeeded(action, subject.signIn, subject.stepUpRoles ?? subject.roles ?? [], Boolean(subject.viaToken || subject.viaShare), undefined, subject.aalCap);
   }
 
   /** Does the named issuer of a vault link still hold `action` inside that vault (#1539)? The vault rule, resolved live. */

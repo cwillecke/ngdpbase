@@ -978,6 +978,8 @@ void (async (): Promise<void> => {
             ...sessionContext,
             ...(stepDown ? { roles: stepDown.kept } : {}),
             ...(aalCap !== undefined ? { aalCap } : {}),
+            // #2237: step-up reads the level from every role, not only those that stayed.
+            ...(stepDown && stepDown.steppedDown.length > 0 ? { stepUpRoles: sessionContext.roles ?? [] } : {}),
             ipAddress: req.ip,
             ...(typeof privateStoreHandle === 'string' && privateStoreHandle ? { privateStoreHandle } : {}),
             // #1635: how and when this session signed in, so the PDP decides step-up at the door.
